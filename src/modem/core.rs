@@ -802,10 +802,19 @@ impl Modem {
 
     pub async fn get_phone_number(&self) -> io::Result<Option<String>> {
         // Set phonebook memory preference to SIM card before querying MSISDN.
-        // Ignore errors 鈥?non-critical and modem may already be set correctly.
+        // Ignore errors — non-critical and modem may already be set correctly.
         let _ = self.send_command_with_ok("AT$QCPBMPREF=1\r\n").await;
         self.get_modem_info("AT+CNUM\r\n", Self::parse_phone_number)
             .await
+    }
+
+    /// Write the user's own phone number into the SIM "Own Number" phonebook.
+    /// Sequence: AT+CPBS="ON" then AT+CPBW=1,"<phone_number>",145
+    pub async fn write_phone_number(&self, phone_number: &str) -> io::Result<()> {
+        self.send_command_with_ok("AT+CPBS=\"ON\"\r\n").await?;
+        self.send_command_with_ok(&format!("AT+CPBW=1,\"{}\",145\r\n", phone_number))
+            .await?;
+        Ok(())
     }
 
     fn parse_phone_number(response: &str) -> Option<String> {

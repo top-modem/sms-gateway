@@ -9,8 +9,9 @@
   import SimDashboard from "./pages/SimDashboard.svelte";
   import CallLogPage from "./pages/CallLogPage.svelte";
   import SimCardsPage from "./pages/SimCardsPage.svelte";
+  import SimSetPhonePage from "./pages/SimSetPhonePage.svelte";
 
-  /** @type {'sim' | 'messages' | 'calllog' | 'simcards'} */
+  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone'} */
   let currentPage = $state('sim');
   let filterSimId = $state(null);
 
@@ -34,6 +35,11 @@
     currentPage = 'simcards';
   }
 
+  function goToSetPhone(simId) {
+    filterSimId = simId;
+    currentPage = 'setphone';
+  }
+
   $effect(() => {
     if ($isAuthenticated) {
       initConversation();
@@ -55,6 +61,7 @@
               onNavigate={goToMessages}
               onNavigateCall={goToCallLog}
               onNavigateSim={goToSimCards}
+              onNavigateSetPhone={goToSetPhone}
             />
           </div>
 
@@ -71,6 +78,11 @@
         {:else if currentPage === 'simcards'}
           <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
             <SimCardsPage onBack={goToSim} filterSimId={filterSimId} />
+          </div>
+
+        {:else if currentPage === 'setphone'}
+          <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
+            <SimSetPhonePage onBack={goToSim} simId={filterSimId} />
           </div>
         {/if}
 

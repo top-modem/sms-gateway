@@ -146,6 +146,10 @@ pub async fn run_api(
             "/sims/{sim_id}/storage",
             put(set_sms_storage).with_state(modem_manager.clone()),
         )
+        .route(
+            "/sims/{sim_id}/phone",
+            post(set_sim_phone_number).with_state(modem_manager.clone()),
+        )
         // ── Voice call routes ─────────────────────────────────────────────
         .route(
             "/calls",
@@ -971,6 +975,78 @@ async fn get_sms_storage_status(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to get SMS storage status: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPhoneRequest {
+    phone_number: String,
+}
+
+async fn set_sim_phone_number(
+    Path(sim_id): Path<String>,
+    State(modem_manager): State<ModemManagerRef>,
+    Json(request): Json<SetPhoneRequest>,
+) -> Response {
+    let phone_number = request.phone_number.trim();
+    if phone_number.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Phone number is required"})),
+        )
+            .into_response();
+    }
+
+    // Basic sanity check: allow digits, plus, and common separators.
+    let normalized: String = phone_number
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .collect();
+    if normalized.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid phone number"})),
+        )
+            .into_response();
+    }
+
+    // 1. Write the number into the SIM card via AT commands.
+    if let Err(e) = modem_manager.set_sim_phone_number(&sim_id, &normalized).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to write phone number to SIM: {}", e)})),
+        )
+            .into_response();
+    }
+
+    // 2. Persist the number in the database and refresh the in-memory cache.
+    match SimCard::query_all().await {
+        Ok(sim_cards) => {
+            if let Some(mut sim_card) = sim_cards.into_iter().find(|s| s.id == sim_id) {
+                match sim_card.update_phone_number(Some(normalized.to_string())).await {
+                    Ok(_) => {
+                        modem_manager.update_sim_cache(sim_card.clone()).await;
+                        (StatusCode::OK, Json(sim_card)).into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("Failed to update phone number: {}", e)})),
+                    )
+                        .into_response(),
+                }
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "SIM card not found"})),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query SIM cards: {}", e)})),
         )
             .into_response(),
     }

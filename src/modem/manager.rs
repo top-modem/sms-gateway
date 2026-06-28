@@ -531,6 +531,20 @@ impl ModemManager {
         modem.get_sms_storage_status().await.map_err(Into::into)
     }
 
+    /// Write the user's own phone number into the SIM card and update the DB record.
+    pub async fn set_sim_phone_number(
+        &self,
+        sim_id: &str,
+        phone_number: &str,
+    ) -> anyhow::Result<()> {
+        let modem = self
+            .get_modem(sim_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
+
+        modem.write_phone_number(phone_number).await.map_err(Into::into)
+    }
+
     pub async fn get_sim_card_cached(&self, sim_id: &str) -> Option<SimCard> {
         self.sim_cards_cache.read().await.get(sim_id).cloned()
     }

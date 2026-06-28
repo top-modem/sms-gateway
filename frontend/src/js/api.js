@@ -120,6 +120,16 @@ class ApiClient {
         return FetchApi.put(`/api/sim-cards/${simId}/phone`, payload, {}, 'application/json');
     }
 
+    /**
+     * Write the phone number into the SIM card via AT commands and persist it in the DB.
+     * @param {string} simId - SIM card ID (ICCID)
+     * @param {string} phoneNumber - Phone number to write
+     */
+    async setSimPhoneNumber(simId, phoneNumber) {
+        const payload = { phone_number: phoneNumber };
+        return FetchApi.post(`/api/sims/${simId}/phone`, payload, {}, 'application/json');
+    }
+
     // ── Voice call methods ──────────────────────────────────────────────────
 
     async makeCall(simId, phone) {

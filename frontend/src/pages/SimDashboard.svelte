@@ -223,7 +223,7 @@
   // ── Logout ────────────────────────────────────────────────────────────────
   // uses logout() imported from auth store
 
-  let { onNavigate = () => {}, onNavigateCall = () => {}, onNavigateSim = () => {} } = $props();
+  let { onNavigate = () => {}, onNavigateCall = () => {}, onNavigateSim = () => {}, onNavigateSetPhone = () => {} } = $props();
 </script>
 
 <div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-zinc-950 text-sm font-sans">
@@ -436,8 +436,24 @@
                 </td>
 
                 <!-- Phone Number -->
-                <td class="px-3 py-2.5 font-mono text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {card.phone_number ?? info.phone_number ?? '—'}
+                <td class="px-3 py-2.5 whitespace-nowrap">
+                  <div class="flex items-center gap-2">
+                    <span class="font-mono text-gray-700 dark:text-gray-200">
+                      {card.phone_number ?? info.phone_number ?? '—'}
+                    </span>
+                    {#if hasSim}
+                      <button
+                        onclick={(e) => { e.stopPropagation(); onNavigateSetPhone(info.sim_id); }}
+                        class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium
+                               bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400
+                               hover:bg-blue-100 dark:hover:bg-blue-900/30 transition"
+                        title={$t('btn_set_phone_tooltip')}
+                      >
+                        <Icon icon="carbon:edit" class="w-3 h-3" />
+                        {card.phone_number || info.phone_number ? $t('btn_update_number') : $t('btn_get_number')}
+                      </button>
+                    {/if}
+                  </div>
                 </td>
 
                 <!-- Operator -->

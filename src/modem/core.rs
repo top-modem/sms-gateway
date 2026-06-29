@@ -693,6 +693,34 @@ impl Modem {
         };
 
         tokio::join!(webhook_future, db_future);
+
+        // ── Upload received SMS to 火狐狸 platform ────────────────
+        let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
+        if !sim_id.is_empty() {
+            if let Ok(cards) = SimCard::query_all().await {
+                if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
+                    if let (Some(country_id), Some(phone_num)) = (&card.country_code, &card.phone_number) {
+                        if let Ok(api_key) = crate::db::AppSetting::get("firefox_api_key").await {
+                            if let Some(api_key) = api_key {
+                                let client = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(10))
+                                    .build()
+                                    .unwrap_or_default();
+                                for sms in &sms_list {
+                                    if !sms.send {
+                                        let _ = crate::firefox_api::upload_sms(
+                                            &client, &api_key,
+                                            country_id, phone_num, &sms.message,
+                                        ).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 

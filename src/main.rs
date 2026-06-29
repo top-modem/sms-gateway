@@ -158,7 +158,7 @@ async fn recheck_fallback_worker(
     }
 }
 
-async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
+async fn firefox_poll_worker(_modem_manager: ModemManagerRef) {
     let poll_interval = tokio::time::Duration::from_secs(3);
     loop {
         tokio::time::sleep(poll_interval).await;

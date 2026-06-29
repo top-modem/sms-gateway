@@ -1283,6 +1283,19 @@ async fn firefox_delete_batch(Json(request): Json<FirefoxDeleteBatchRequest>) ->
     };
 
     let entries: Vec<(&str, &str)> = request.entries.iter().map(|e| (e.country_id.as_str(), e.phone_num.as_str())).collect();
+
+    // Clear local country_code for deleted phone numbers
+    if let Ok(cards) = SimCard::query_all().await {
+        for entry in &request.entries {
+            for card in &cards {
+                if card.phone_number.as_deref() == Some(&entry.phone_num) {
+                    let mut c = card.clone();
+                    let _ = c.update_country_code(None).await;
+                }
+            }
+        }
+    }
+
     match firefox_api::delete_phone_batch(&client, &api_key, &entries).await {
         Ok(results) => (StatusCode::OK, Json(json!({"message": "Delete completed", "results": results}))).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
@@ -1302,6 +1315,16 @@ async fn firefox_delete_country(Json(request): Json<FirefoxDeleteCountryRequest>
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "Country ID is required"}))).into_response();
     }
 
+    // Clear local country_code for all SIMs in this country
+    if let Ok(cards) = SimCard::query_all().await {
+        for card in &cards {
+            if card.country_code.as_deref() == Some(&country_id) {
+                let mut c = card.clone();
+                let _ = c.update_country_code(None).await;
+            }
+        }
+    }
+
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
         Err(e) => return e,
@@ -1316,6 +1339,16 @@ async fn firefox_delete_country(Json(request): Json<FirefoxDeleteCountryRequest>
 // ─── 8. PhoneDeleteAll ───────────────────────────────────────────────────
 
 async fn firefox_delete_all() -> Response {
+    // Clear local country_code for all SIMs
+    if let Ok(cards) = SimCard::query_all().await {
+        for card in &cards {
+            if card.country_code.is_some() {
+                let mut c = card.clone();
+                let _ = c.update_country_code(None).await;
+            }
+        }
+    }
+
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
         Err(e) => return e,

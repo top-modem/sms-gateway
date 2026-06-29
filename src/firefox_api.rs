@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const API_BASE: &str = "https://ks.firefox.fun/ksapidoc.aspx";
+const API_BASE: &str = "http://ks.firefox.fun/ksapi.ashx";
 
 /// Country list parsed from 火狐狸-API上卡协议文档.pdf.
 /// Format: (country_id, dial_prefix, display_name)

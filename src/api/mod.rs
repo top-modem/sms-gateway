@@ -159,6 +159,13 @@ pub async fn run_api(
             "/firefox/upload",
             post(firefox_upload).with_state(modem_manager.clone()),
         )
+        .route("/firefox/batch-status", post(firefox_batch_status))
+        .route("/firefox/delete-batch", post(firefox_delete_batch))
+        .route("/firefox/delete-country", post(firefox_delete_country))
+        .route("/firefox/delete-all", post(firefox_delete_all))
+        .route("/firefox/wait-list", get(firefox_wait_list))
+        .route("/firefox/result-list", post(firefox_result_list))
+        .route("/firefox/upload-sms", post(firefox_upload_sms))
         // ── Voice call routes ─────────────────────────────────────────────
         .route(
             "/calls",
@@ -1130,22 +1137,9 @@ async fn firefox_upload(
             .into_response();
     }
 
-    let api_key = match AppSetting::get("firefox_api_key").await {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Firefox API key not configured"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to read API key: {}", e)})),
-            )
-                .into_response();
-        }
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     // Resolve phone numbers for the selected SIMs.
@@ -1194,17 +1188,6 @@ async fn firefox_upload(
         }
     }
 
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to build HTTP client: {}", e)})),
-            )
-                .into_response();
-        }
-    };
-
     match firefox_api::upload_phone_batch(&client, &api_key, country_id, &phone_numbers).await {
         Ok(results) => {
             let batch_ids: Vec<String> = results
@@ -1227,6 +1210,184 @@ async fn firefox_upload(
             Json(json!({"error": format!("Upload failed: {}", e)})),
         )
             .into_response(),
+    }
+}
+
+// ─── Helper: read api key + build http client ────────────────────────────
+
+async fn get_firefox_client() -> Result<(String, reqwest::Client), Response> {
+    let api_key = AppSetting::get("firefox_api_key")
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to read API key: {}", e)}))).into_response()
+        })?
+        .ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": "Firefox API key not configured"}))).into_response()
+        })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to build HTTP client: {}", e)}))).into_response()
+        })?;
+
+    Ok((api_key, client))
+}
+
+// ─── 5. PhoneBatchResult ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FirefoxBatchStatusRequest {
+    batch_id: String,
+}
+
+async fn firefox_batch_status(Json(request): Json<FirefoxBatchStatusRequest>) -> Response {
+    let batch_id = request.batch_id.trim().to_string();
+    if batch_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Batch ID is required"}))).into_response();
+    }
+
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match firefox_api::query_batch_status(&client, &api_key, &batch_id).await {
+        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Query failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 6. PhoneDeleteBatch ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FirefoxDeleteBatchRequest {
+    entries: Vec<DeleteBatchEntry>,
+}
+
+#[derive(Deserialize)]
+struct DeleteBatchEntry {
+    country_id: String,
+    phone_num: String,
+}
+
+async fn firefox_delete_batch(Json(request): Json<FirefoxDeleteBatchRequest>) -> Response {
+    if request.entries.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "No entries provided"}))).into_response();
+    }
+
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let entries: Vec<(&str, &str)> = request.entries.iter().map(|e| (e.country_id.as_str(), e.phone_num.as_str())).collect();
+    match firefox_api::delete_phone_batch(&client, &api_key, &entries).await {
+        Ok(results) => (StatusCode::OK, Json(json!({"message": "Delete completed", "results": results}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 7. PhoneDeleteCountry ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FirefoxDeleteCountryRequest {
+    country_id: String,
+}
+
+async fn firefox_delete_country(Json(request): Json<FirefoxDeleteCountryRequest>) -> Response {
+    let country_id = request.country_id.trim().to_string();
+    if country_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Country ID is required"}))).into_response();
+    }
+
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match firefox_api::delete_phone_country(&client, &api_key, &country_id).await {
+        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 8. PhoneDeleteAll ───────────────────────────────────────────────────
+
+async fn firefox_delete_all() -> Response {
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match firefox_api::delete_phone_all(&client, &api_key).await {
+        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 9. GetWaitPhoneList ─────────────────────────────────────────────────
+
+async fn firefox_wait_list() -> Response {
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match firefox_api::get_wait_phone_list(&client, &api_key).await {
+        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Query failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 10. GetResultPhoneList ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FirefoxResultListRequest {
+    country_id: String,
+    phone_num: String,
+    item_id: String,
+}
+
+async fn firefox_result_list(Json(request): Json<FirefoxResultListRequest>) -> Response {
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match firefox_api::get_result_phone_list(&client, &api_key, &request.country_id, &request.phone_num, &request.item_id).await {
+        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Query failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 11. UploadSms ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FirefoxUploadSmsRequest {
+    country_id: String,
+    phone_num: String,
+    sms_content: String,
+}
+
+async fn firefox_upload_sms(Json(request): Json<FirefoxUploadSmsRequest>) -> Response {
+    let country_id = request.country_id.trim().to_string();
+    let phone_num = request.phone_num.trim().to_string();
+    let sms_content = request.sms_content.trim().to_string();
+
+    if country_id.is_empty() || phone_num.is_empty() || sms_content.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "country_id, phone_num, and sms_content are required"}))).into_response();
+    }
+
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match firefox_api::upload_sms(&client, &api_key, &country_id, &phone_num, &sms_content).await {
+        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Upload SMS failed: {}", e)}))).into_response(),
     }
 }
 

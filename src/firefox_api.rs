@@ -146,22 +146,64 @@ pub fn countries() -> Vec<CountryInfo> {
         .collect()
 }
 
-#[derive(Debug, Serialize)]
-#[allow(non_snake_case)]
-struct PhoneAddBatchRequest<'a> {
-    act: &'static str,
-    PhoneList: Vec<PhoneEntry<'a>>,
+// ─── Shared request helper ───────────────────────────────────────────────
+
+async fn do_post<T: Serialize, R: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    api_key: &str,
+    payload: &T,
+) -> Result<R> {
+    let url = format!("{}?key={}", API_BASE, api_key);
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(payload)
+        .send()
+        .await
+        .context("Failed to send request to 火狐狸 platform")?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("Failed to read 火狐狸 platform response")?;
+
+    if !status.is_success() {
+        anyhow::bail!("火狐狸 platform returned HTTP {}: {}", status, text);
+    }
+
+    serde_json::from_str(&text)
+        .with_context(|| format!("Failed to parse 火狐狸 response: {}", text))
 }
 
-#[derive(Debug, Serialize)]
-#[allow(non_snake_case)]
-struct PhoneEntry<'a> {
-    Country_ID: &'a str,
-    Phone_Num: &'a str,
-    Phone_ComName: &'a str,
-    Provi_Name: &'a str,
-    City_Name: &'a str,
+async fn do_get<R: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    api_key: &str,
+    query: &[(&str, &str)],
+) -> Result<R> {
+    let url = format!("{}?key={}", API_BASE, api_key);
+    let response = client
+        .get(&url)
+        .query(query)
+        .send()
+        .await
+        .context("Failed to send GET request to 火狐狸 platform")?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("Failed to read 火狐狸 platform response")?;
+
+    if !status.is_success() {
+        anyhow::bail!("火狐狸 platform returned HTTP {}: {}", status, text);
+    }
+
+    serde_json::from_str(&text)
+        .with_context(|| format!("Failed to parse 火狐狸 response: {}", text))
 }
+
+// ─── Shared response type (code + data) ─────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ApiResponse {
@@ -169,8 +211,26 @@ pub struct ApiResponse {
     pub data: Option<String>,
 }
 
-/// Upload a batch of phone numbers to the 火狐狸 platform.
-/// The platform limits each batch to 50 entries.
+// ─── 1. PhoneAddBatch ───────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[allow(non_snake_case)]
+struct PhoneAddBatchRequest<'a> {
+    act: &'static str,
+    PhoneList: Vec<PhoneAddEntry<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(non_snake_case)]
+struct PhoneAddEntry<'a> {
+    Country_ID: &'a str,
+    Phone_Num: &'a str,
+    Phone_ComName: &'a str,
+    Provi_Name: &'a str,
+    City_Name: &'a str,
+}
+
+/// Upload a batch of phone numbers to the 火狐狸 platform (max 50 per batch).
 pub async fn upload_phone_batch(
     client: &reqwest::Client,
     api_key: &str,
@@ -178,13 +238,12 @@ pub async fn upload_phone_batch(
     phone_numbers: &[String],
 ) -> Result<Vec<ApiResponse>> {
     const BATCH_SIZE: usize = 50;
-
     let mut results = Vec::new();
 
     for chunk in phone_numbers.chunks(BATCH_SIZE) {
-        let phone_list: Vec<PhoneEntry> = chunk
+        let phone_list: Vec<PhoneAddEntry> = chunk
             .iter()
-            .map(|num| PhoneEntry {
+            .map(|num| PhoneAddEntry {
                 Country_ID: country_id,
                 Phone_Num: num,
                 Phone_ComName: "",
@@ -197,30 +256,232 @@ pub async fn upload_phone_batch(
             act: "PhoneAddBatch",
             PhoneList: phone_list,
         };
+        let resp: ApiResponse = do_post(client, api_key, &payload).await?;
+        results.push(resp);
+    }
+    Ok(results)
+}
 
-        let url = format!("{}?key={}", API_BASE, api_key);
-        let response = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .context("Failed to send request to 火狐狸 platform")?;
+// ─── 2. PhoneDeleteBatch ────────────────────────────────────────────────
 
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .context("Failed to read 火狐狸 platform response")?;
+#[derive(Debug, Serialize)]
+#[allow(non_snake_case)]
+struct PhoneDeleteBatchRequest<'a> {
+    act: &'static str,
+    PhoneList: Vec<PhoneDeleteEntry<'a>>,
+}
 
-        if !status.is_success() {
-            anyhow::bail!("火狐狸 platform returned HTTP {}: {}", status, text);
-        }
+#[derive(Debug, Serialize)]
+#[allow(non_snake_case)]
+struct PhoneDeleteEntry<'a> {
+    Country_ID: &'a str,
+    Phone_Num: &'a str,
+}
 
-        let parsed: ApiResponse = serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse 火狐狸 response: {}", text))?;
-        results.push(parsed);
+/// Delete uploaded phone numbers from the platform (max 100 per batch).
+pub async fn delete_phone_batch(
+    client: &reqwest::Client,
+    api_key: &str,
+    entries: &[(&str, &str)], // (country_id, phone_num) pairs
+) -> Result<Vec<ApiResponse>> {
+    const BATCH_SIZE: usize = 100;
+    let mut results = Vec::new();
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let phone_list: Vec<PhoneDeleteEntry> = chunk
+            .iter()
+            .map(|(country_id, phone_num)| PhoneDeleteEntry {
+                Country_ID: country_id,
+                Phone_Num: phone_num,
+            })
+            .collect();
+
+        let payload = PhoneDeleteBatchRequest {
+            act: "PhoneDeleteBatch",
+            PhoneList: phone_list,
+        };
+        let resp: ApiResponse = do_post(client, api_key, &payload).await?;
+        results.push(resp);
+    }
+    Ok(results)
+}
+
+// ─── 3. PhoneDeleteCountry ──────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct PhoneDeleteCountryRequest {
+    act: &'static str,
+    #[serde(rename = "Country_ID")]
+    country_id: String,
+}
+
+/// Delete all uploaded phone numbers for a given country.
+pub async fn delete_phone_country(
+    client: &reqwest::Client,
+    api_key: &str,
+    country_id: &str,
+) -> Result<ApiResponse> {
+    let payload = PhoneDeleteCountryRequest {
+        act: "PhoneDeleteCountry",
+        country_id: country_id.to_string(),
+    };
+    do_post(client, api_key, &payload).await
+}
+
+// ─── 4. PhoneDeleteAll ──────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct PhoneDeleteAllRequest {
+    act: &'static str,
+}
+
+/// Delete all uploaded phone numbers from the platform.
+pub async fn delete_phone_all(
+    client: &reqwest::Client,
+    api_key: &str,
+) -> Result<ApiResponse> {
+    let payload = PhoneDeleteAllRequest { act: "PhoneDeleteAll" };
+    do_post(client, api_key, &payload).await
+}
+
+// ─── 5. PhoneBatchResult ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BatchPhoneStatusItem {
+    #[serde(rename = "Phone_Status")]
+    pub phone_status: Option<String>,
+    #[serde(rename = "Phone_Num")]
+    pub phone_num: Option<String>,
+    #[serde(rename = "Phone_Msg")]
+    pub phone_msg: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BatchStatusResponse {
+    pub code: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Query batch upload status. Phone_Status: "1"=success, "0"=fail, "5"=uploading.
+pub async fn query_batch_status(
+    client: &reqwest::Client,
+    api_key: &str,
+    batch_id: &str,
+) -> Result<BatchStatusResponse> {
+    #[derive(Debug, Serialize)]
+    struct Request {
+        act: &'static str,
+        #[serde(rename = "BatchID")]
+        batch_id: String,
     }
 
-    Ok(results)
+    let payload = Request {
+        act: "PhoneBatchResult",
+        batch_id: batch_id.to_string(),
+    };
+    do_post(client, api_key, &payload).await
+}
+
+// ─── 6. GetWaitPhoneList ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WaitPhoneItem {
+    #[serde(rename = "Item_ID")]
+    pub item_id: Option<String>,
+    #[serde(rename = "Phone_GetTime")]
+    pub phone_get_time: Option<String>,
+    #[serde(rename = "Phone_Num")]
+    pub phone_num: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WaitPhoneListResponse {
+    pub code: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Get the list of phone numbers waiting for SMS on the platform.
+pub async fn get_wait_phone_list(
+    client: &reqwest::Client,
+    api_key: &str,
+) -> Result<WaitPhoneListResponse> {
+    do_get(client, api_key, &[("act", "GetWaitPhoneList")]).await
+}
+
+// ─── 7. GetResultPhoneList ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResultPhoneItem {
+    #[serde(rename = "Item_ID")]
+    pub item_id: Option<String>,
+    #[serde(rename = "Phone_GetTime")]
+    pub phone_get_time: Option<String>,
+    #[serde(rename = "Phone_Num")]
+    pub phone_num: Option<String>,
+    #[serde(rename = "Phone_IsRet")]
+    pub phone_is_ret: Option<String>,
+    #[serde(rename = "Phone_RetTime")]
+    pub phone_ret_time: Option<String>,
+    #[serde(rename = "Phone_Remark")]
+    pub phone_remark: Option<String>,
+    #[serde(rename = "Phone_RemarkTime")]
+    pub phone_remark_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResultPhoneListResponse {
+    pub code: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Query SMS result for a specific phone number / item on the platform.
+pub async fn get_result_phone_list(
+    client: &reqwest::Client,
+    api_key: &str,
+    country_id: &str,
+    phone_num: &str,
+    item_id: &str,
+) -> Result<ResultPhoneListResponse> {
+    do_get(
+        client,
+        api_key,
+        &[
+            ("act", "GetResultPhoneList"),
+            ("Country_ID", country_id),
+            ("Phone_Num", phone_num),
+            ("Item_ID", item_id),
+        ],
+    )
+    .await
+}
+
+// ─── 8. UploadSms ───────────────────────────────────────────────────────
+
+/// Upload a received SMS back to the 火狐狸 platform.
+pub async fn upload_sms(
+    client: &reqwest::Client,
+    api_key: &str,
+    country_id: &str,
+    phone_num: &str,
+    sms_content: &str,
+) -> Result<ApiResponse> {
+    #[derive(Debug, Serialize)]
+    #[allow(non_snake_case)]
+    struct UploadSmsRequest {
+        act: &'static str,
+        Country_ID: String,
+        Phone_Num: String,
+        Phone_SmsContent: String,
+    }
+
+    let payload = UploadSmsRequest {
+        act: "UploadSms",
+        Country_ID: country_id.to_string(),
+        Phone_Num: phone_num.to_string(),
+        Phone_SmsContent: sms_content.to_string(),
+    };
+    do_post(client, api_key, &payload).await
 }

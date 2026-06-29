@@ -164,7 +164,7 @@ pub async fn run_api(
         .route("/firefox/delete-country", post(firefox_delete_country))
         .route("/firefox/delete-all", post(firefox_delete_all))
         .route("/firefox/wait-list", get(firefox_wait_list))
-        .route("/firefox/result-list", post(firefox_result_list))
+        .route("/firefox/result-list", get(firefox_result_list))
         .route("/firefox/upload-sms", post(firefox_upload_sms))
         // ── Voice call routes ─────────────────────────────────────────────
         .route(
@@ -1350,7 +1350,7 @@ struct FirefoxResultListRequest {
     item_id: String,
 }
 
-async fn firefox_result_list(Json(request): Json<FirefoxResultListRequest>) -> Response {
+async fn firefox_result_list(Query(request): Query<FirefoxResultListRequest>) -> Response {
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
         Err(e) => return e,

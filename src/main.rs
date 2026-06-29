@@ -110,6 +110,8 @@ async fn main() {
         transcribe_cfg,
     ));
 
+    tokio::spawn(firefox_poll_worker(modem_manager.clone()));
+
     if let Ok(_) = api::run_api(
         modem_manager.clone(),
         &config.settings.server_host,
@@ -153,6 +155,49 @@ async fn recheck_fallback_worker(
         modem_manager
             .recheck_fallback_modems(&sms_storage_map, sse_manager.clone(), webhook_manager.clone(), transcribe_cfg.clone())
             .await;
+    }
+}
+
+async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
+    let poll_interval = tokio::time::Duration::from_secs(3);
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let api_key = match db::AppSetting::get("firefox_api_key").await {
+            Ok(Some(key)) => key,
+            _ => continue,
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("[火狐狸轮询] 创建 HTTP 客户端失败: {}", e);
+                continue;
+            }
+        };
+
+        match firefox_api::get_wait_phone_list(&client, &api_key).await {
+            Ok(resp) => {
+                let count = resp.data.as_ref().and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
+                if count > 0 {
+                    if let Some(items) = resp.data.as_ref().and_then(|d| d.as_array()) {
+                        for item in items {
+                            let phone_num = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("?");
+                            let item_id = item.get("Item_ID").and_then(|v| v.as_str()).unwrap_or("?");
+                            log::info!("[火狐狸轮询] 等待短信 - 号码: {}, Item_ID: {}", phone_num, item_id);
+                        }
+                    }
+                } else {
+                    log::debug!("[火狐狸轮询] 无待处理号码");
+                }
+            }
+            Err(e) => {
+                log::warn!("[火狐狸轮询] 获取等待列表失败: {}", e);
+            }
+        }
     }
 }
 

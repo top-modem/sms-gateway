@@ -332,7 +332,7 @@
                 <span class="text-gray-400 font-semibold">#</span>
               {/if}
             </th>
-            {#each [$t('col_com_port'),$t('col_module'),$t('col_signal'),$t('col_network_status'),$t('col_phone_number'),$t('col_operator'),$t('col_country'),$t('col_sms'),'IMSI','ICCID','IMEI'] as col}
+            {#each [$t('col_com_port'),$t('col_module'),$t('col_signal'),$t('col_network_status'),$t('col_phone_number'),$t('col_operator'),$t('col_country'),$t('col_platform'),$t('col_sms'),'IMSI','ICCID','IMEI'] as col}
               <th class="px-3 py-2.5 text-left font-semibold text-gray-600 dark:text-gray-300
                          border-b border-gray-200 dark:border-zinc-700 whitespace-nowrap">
                 {col}
@@ -359,7 +359,7 @@
             {/each}
           {:else if rows.length === 0}
             <tr>
-              <td colspan="12" class="px-6 py-12 text-center text-gray-400">
+              <td colspan="13" class="px-6 py-12 text-center text-gray-400">
                 <Icon icon="carbon:sim-card" class="w-8 h-8 mx-auto mb-2 opacity-40" />
                 <p>{$t('no_sim_cards')}</p>
               </td>
@@ -474,6 +474,18 @@
                 <!-- Country -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
                   {getMccCountry(card.imsi, $lang)}
+                </td>
+
+                <!-- Platform status -->
+                <td class="px-3 py-2.5 whitespace-nowrap">
+                  {#if card.country_code}
+                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
+                      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                      {$t('platform_connected')}
+                    </span>
+                  {:else}
+                    <span class="text-gray-400 dark:text-gray-500 text-xs">{$t('platform_not_connected')}</span>
+                  {/if}
                 </td>
 
                 <!-- SMS recv / sent -->

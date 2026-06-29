@@ -97,6 +97,7 @@ pub struct SimCard {
     pub imsi: Option<String>,
     pub phone_number: Option<String>, // Phone number from SIM
     pub alias: Option<String>,        // User-defined alias
+    pub country_code: Option<String>, // 火狐狸 platform country code
     // Note: port_path removed - SIM to port mapping is runtime only
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -623,7 +624,7 @@ impl SimCard {
     ) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let mut query = String::from(
-            "SELECT id, imsi, phone_number, alias, created_at, updated_at FROM sim_cards WHERE 1=1",
+            "SELECT id, imsi, phone_number, alias, country_code, created_at, updated_at FROM sim_cards WHERE 1=1",
         );
         let mut binds = Vec::new();
 
@@ -652,7 +653,21 @@ impl SimCard {
         Ok(query_builder.fetch_all(pool).await?)
     }
 
-    /// 2. 更新手机号
+    /// 2. 更新国家代码（火狐狸平台）
+    pub async fn update_country_code(&mut self, country_code: Option<String>) -> Result<()> {
+        let pool = get_pool()?;
+        self.country_code = country_code.clone();
+        sqlx::query(
+            "UPDATE sim_cards SET country_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(&country_code)
+        .bind(&self.id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 3. 更新手机号
     pub async fn update_phone_number(&mut self, phone_number: Option<String>) -> Result<()> {
         let pool = get_pool()?;
         self.phone_number = phone_number.clone();
@@ -666,7 +681,7 @@ impl SimCard {
         Ok(())
     }
 
-    /// 3. 更新别名
+    /// 4. 更新别名
     pub async fn update_alias(&mut self, alias: Option<String>) -> Result<()> {
         let pool = get_pool()?;
         self.alias = alias.clone();
@@ -678,7 +693,7 @@ impl SimCard {
         Ok(())
     }
 
-    /// 4. 删除
+    /// 5. 删除
     pub async fn delete(&self) -> Result<bool> {
         let pool = get_pool()?;
         let result = sqlx::query("DELETE FROM sim_cards WHERE id = ?")
@@ -688,7 +703,7 @@ impl SimCard {
         Ok(result.rows_affected() > 0)
     }
 
-    /// 5. 新增 - 批量插入
+    /// 6. 新增 - 批量插入
     pub async fn bulk_insert(sim_cards: &[Self]) -> Result<()> {
         if sim_cards.is_empty() {
             return Ok(());
@@ -699,13 +714,14 @@ impl SimCard {
 
         for chunk in sim_cards.chunks(MAX_BATCH_SIZE) {
             let mut query_builder = QueryBuilder::new(
-                "INSERT INTO sim_cards (id, imsi, phone_number, alias, created_at, updated_at) ",
+                "INSERT INTO sim_cards (id, imsi, phone_number, alias, country_code, created_at, updated_at) ",
             );
             query_builder.push_values(chunk, |mut b, sim_card| {
                 b.push_bind(&sim_card.id)
                     .push_bind(&sim_card.imsi)
                     .push_bind(&sim_card.phone_number)
                     .push_bind(&sim_card.alias)
+                    .push_bind(&sim_card.country_code)
                     .push_bind(sim_card.created_at)
                     .push_bind(sim_card.updated_at);
             });
@@ -716,16 +732,16 @@ impl SimCard {
         Ok(())
     }
 
-    /// 5. 新增 - 单条插入（调用批量插入）
+    /// 7. 新增 - 单条插入（调用批量插入）
     pub async fn insert(&self) -> Result<()> {
         Self::bulk_insert(std::slice::from_ref(self)).await
     }
 
-    /// 6. 查询全部
+    /// 8. 查询全部
     pub async fn query_all() -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let sim_cards = sqlx::query_as::<_, SimCard>(
-            "SELECT id, imsi, phone_number, alias, created_at, updated_at FROM sim_cards ORDER BY created_at"
+            "SELECT id, imsi, phone_number, alias, country_code, created_at, updated_at FROM sim_cards ORDER BY created_at"
         )
         .fetch_all(pool)
         .await?;
@@ -755,7 +771,7 @@ impl SimCard {
 
         let pool = get_pool()?;
         let mut query_builder = QueryBuilder::new(
-            "SELECT id, imsi, phone_number, alias, created_at, updated_at FROM sim_cards WHERE id IN ("
+            "SELECT id, imsi, phone_number, alias, country_code, created_at, updated_at FROM sim_cards WHERE id IN ("
         );
         let mut separated = query_builder.separated(", ");
         for id in ids {
@@ -801,11 +817,46 @@ impl SimCard {
             imsi,
             phone_number,
             alias: None,
+            country_code: None,
             created_at: now,
             updated_at: now,
         };
         sim_card.insert().await?;
         Ok(sim_card)
+    }
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct AppSetting {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+impl AppSetting {
+    pub async fn get(key: &str) -> Result<Option<String>> {
+        let pool = get_pool()?;
+        let value: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM app_settings WHERE key = ?",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+        Ok(value.map(|v| v.0))
+    }
+
+    pub async fn set(key: &str, value: Option<&str>) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            r#"
+            INSERT INTO app_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 }
 

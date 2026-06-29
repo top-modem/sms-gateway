@@ -14,6 +14,7 @@ mod api;
 mod config;
 mod db;
 mod decode;
+mod firefox_api;
 mod modem;
 mod transcribe;
 #[cfg(test)]

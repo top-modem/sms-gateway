@@ -10,8 +10,9 @@
   import CallLogPage from "./pages/CallLogPage.svelte";
   import SimCardsPage from "./pages/SimCardsPage.svelte";
   import SimSetPhonePage from "./pages/SimSetPhonePage.svelte";
+  import PlatformConnectPage from "./pages/PlatformConnectPage.svelte";
 
-  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone'} */
+  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone' | 'platform'} */
   let currentPage = $state('sim');
   let filterSimId = $state(null);
 
@@ -40,6 +41,10 @@
     currentPage = 'setphone';
   }
 
+  function goToPlatform() {
+    currentPage = 'platform';
+  }
+
   $effect(() => {
     if ($isAuthenticated) {
       initConversation();
@@ -62,6 +67,7 @@
               onNavigateCall={goToCallLog}
               onNavigateSim={goToSimCards}
               onNavigateSetPhone={goToSetPhone}
+              onNavigatePlatform={goToPlatform}
             />
           </div>
 
@@ -83,6 +89,11 @@
         {:else if currentPage === 'setphone'}
           <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
             <SimSetPhonePage onBack={goToSim} simId={filterSimId} />
+          </div>
+
+        {:else if currentPage === 'platform'}
+          <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
+            <PlatformConnectPage onBack={goToSim} />
           </div>
         {/if}
 

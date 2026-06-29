@@ -130,6 +130,39 @@ class ApiClient {
         return FetchApi.post(`/api/sims/${simId}/phone`, payload, {}, 'application/json');
     }
 
+    // ── 火狐狸 platform integration ─────────────────────────────────────────
+
+    /**
+     * Get the stored 火狐狸 platform API key.
+     */
+    async getFirefoxApiKey() {
+        return FetchApi.get('/api/settings/firefox-api-key');
+    }
+
+    /**
+     * Save the 火狐狸 platform API key.
+     * @param {string} apiKey
+     */
+    async setFirefoxApiKey(apiKey) {
+        return FetchApi.put('/api/settings/firefox-api-key', { api_key: apiKey }, {}, 'application/json');
+    }
+
+    /**
+     * Get the list of supported country codes for the 火狐狸 platform.
+     */
+    async getFirefoxCountries() {
+        return FetchApi.get('/api/firefox/countries');
+    }
+
+    /**
+     * Upload selected SIM phone numbers to the 火狐狸 platform.
+     * @param {string[]} simIds
+     * @param {string} countryId
+     */
+    async uploadToFirefox(simIds, countryId) {
+        return FetchApi.post('/api/firefox/upload', { sim_ids: simIds, country_id: countryId }, {}, 'application/json');
+    }
+
     // ── Voice call methods ──────────────────────────────────────────────────
 
     async makeCall(simId, phone) {

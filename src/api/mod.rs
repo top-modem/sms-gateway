@@ -19,7 +19,8 @@ pub use sse_manager::{CallEvent, SseManager};
 
 use crate::{
     config::SmsStorage,
-    db::{Call, Contact, Conversation, SimCard, Sms},
+    db::{AppSetting, Call, Contact, Conversation, SimCard, Sms},
+    firefox_api,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
     ModemManagerRef,
 };
@@ -149,6 +150,14 @@ pub async fn run_api(
         .route(
             "/sims/{sim_id}/phone",
             post(set_sim_phone_number).with_state(modem_manager.clone()),
+        )
+        // ── 火狐狸 platform integration routes ─────────────────────────────
+        .route("/settings/firefox-api-key", get(get_firefox_api_key))
+        .route("/settings/firefox-api-key", put(set_firefox_api_key))
+        .route("/firefox/countries", get(get_firefox_countries))
+        .route(
+            "/firefox/upload",
+            post(firefox_upload).with_state(modem_manager.clone()),
         )
         // ── Voice call routes ─────────────────────────────────────────────
         .route(
@@ -1047,6 +1056,175 @@ async fn set_sim_phone_number(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to query SIM cards: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+// ─── 火狐狸 platform integration handlers ─────────────────────────────────────
+
+async fn get_firefox_api_key() -> Response {
+    match AppSetting::get("firefox_api_key").await {
+        Ok(value) => (StatusCode::OK, Json(json!({ "api_key": value }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to read API key: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetFirefoxApiKeyRequest {
+    api_key: String,
+}
+
+async fn set_firefox_api_key(Json(request): Json<SetFirefoxApiKeyRequest>) -> Response {
+    let api_key = request.api_key.trim();
+    if api_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "API key is required"})),
+        )
+            .into_response();
+    }
+
+    match AppSetting::set("firefox_api_key", Some(api_key)).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"message": "API key saved"}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to save API key: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_firefox_countries() -> Response {
+    (StatusCode::OK, Json(json!(firefox_api::countries()))).into_response()
+}
+
+#[derive(Deserialize)]
+struct FirefoxUploadRequest {
+    sim_ids: Vec<String>,
+    country_id: String,
+}
+
+async fn firefox_upload(
+    State(modem_manager): State<ModemManagerRef>,
+    Json(request): Json<FirefoxUploadRequest>,
+) -> Response {
+    if request.sim_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "No SIM cards selected"})),
+        )
+            .into_response();
+    }
+
+    let country_id = request.country_id.trim();
+    if country_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Country code is required"})),
+        )
+            .into_response();
+    }
+
+    let api_key = match AppSetting::get("firefox_api_key").await {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Firefox API key not configured"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to read API key: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    // Resolve phone numbers for the selected SIMs.
+    let sim_cards = match SimCard::query_all().await {
+        Ok(cards) => cards,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to query SIM cards: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut phone_numbers = Vec::new();
+    let mut sim_ids_to_update = Vec::new();
+    for sim_id in &request.sim_ids {
+        if let Some(card) = sim_cards.iter().find(|c| &c.id == sim_id) {
+            if let Some(phone) = card.phone_number.as_deref().filter(|p| !p.is_empty()) {
+                // Normalize: keep only digits and plus sign.
+                let normalized: String = phone.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+                if !normalized.is_empty() {
+                    phone_numbers.push(normalized);
+                    sim_ids_to_update.push(sim_id.clone());
+                    continue;
+                }
+            }
+        }
+    }
+
+    if phone_numbers.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "None of the selected SIM cards have a valid phone number"})),
+        )
+            .into_response();
+    }
+
+    // Persist the selected country code on each uploaded SIM.
+    for sim_id in &sim_ids_to_update {
+        if let Some(mut card) = sim_cards.iter().find(|c| &c.id == sim_id).cloned() {
+            if let Err(e) = card.update_country_code(Some(country_id.to_string())).await {
+                log::warn!("Failed to update country_code for {}: {}", sim_id, e);
+            }
+            modem_manager.update_sim_cache(card).await;
+        }
+    }
+
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to build HTTP client: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    match firefox_api::upload_phone_batch(&client, &api_key, country_id, &phone_numbers).await {
+        Ok(results) => {
+            let batch_ids: Vec<String> = results
+                .iter()
+                .filter_map(|r| r.data.clone())
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "message": "Upload completed",
+                    "uploaded_count": phone_numbers.len(),
+                    "batch_ids": batch_ids,
+                    "results": results,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Upload failed: {}", e)})),
         )
             .into_response(),
     }

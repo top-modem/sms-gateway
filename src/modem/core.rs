@@ -505,7 +505,7 @@ impl Modem {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Response channel closed"))?
     }
 
-    async fn send_command(&self, command: &str) -> io::Result<String> {
+    pub async fn send_command(&self, command: &str) -> io::Result<String> {
         self.send_command_priority(command, 5).await
     }
 

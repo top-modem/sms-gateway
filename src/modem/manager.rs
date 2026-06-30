@@ -509,6 +509,22 @@ impl ModemManager {
         modem.get_temperature_info().await.map_err(Into::into)
     }
 
+    pub async fn get_modem_by_com_port(&self, com_port: &str) -> Option<Arc<Modem>> {
+        let modems = self.modems.read().await;
+        modems
+            .values()
+            .find(|m| m.com_port == com_port)
+            .cloned()
+    }
+
+    pub async fn send_at_command(&self, com_port: &str, command: &str) -> anyhow::Result<String> {
+        let modem = self
+            .get_modem_by_com_port(com_port)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Modem not found on port: {}", com_port))?;
+        modem.send_command(command).await.map_err(Into::into)
+    }
+
     pub async fn set_sms_storage(
         &self,
         sim_id: &str,

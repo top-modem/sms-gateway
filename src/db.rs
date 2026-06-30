@@ -477,6 +477,23 @@ impl Sms {
         Ok(sms_list)
     }
 
+    pub async fn find_latest_incoming_by_sim_id(sim_id: &str) -> Result<Option<Self>> {
+        let pool = get_pool()?;
+        let sms = sqlx::query_as(
+            r#"
+            SELECT id, contact_id, timestamp, message, sim_id, send, status
+            FROM sms
+            WHERE sim_id = ? AND send = 0
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(sim_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(sms)
+    }
+
     pub async fn _update_status(&self, status: SmsStatus) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(
@@ -1104,8 +1121,16 @@ pub async fn db_init() -> Result<()> {
     };
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(10)
         .connect(db_path)
+        .await?;
+
+    // Enable WAL mode for concurrent reads + writes, set busy timeout to 5s
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA busy_timeout=5000")
+        .execute(&pool)
         .await?;
 
     migrate!("./migrations").run(&pool).await?;

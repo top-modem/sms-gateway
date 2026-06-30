@@ -120,6 +120,10 @@ pub async fn run_api(
             "/sims/{sim_id}/refresh",
             get(refresh_sim_sms).with_state(modem_manager.clone()),
         )
+        .route(
+            "/at/{com_port}",
+            post(send_at_command_handler).with_state(modem_manager.clone()),
+        )
         .route("/contacts", get(get_contacts))
         .route("/contacts", post(create_contact))
         .route("/contacts/{id}", delete(delete_contact_by_id))
@@ -558,6 +562,22 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
     });
 
     (StatusCode::OK, Json(details)).into_response()
+}
+
+#[derive(Deserialize)]
+struct AtCommandRequest {
+    command: String,
+}
+
+async fn send_at_command_handler(
+    Path(com_port): Path<String>,
+    State(modem_manager): State<ModemManagerRef>,
+    Json(body): Json<AtCommandRequest>,
+) -> Response {
+    match modem_manager.send_at_command(&com_port, &body.command).await {
+        Ok(response) => (StatusCode::OK, Json(json!({"response": response}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+    }
 }
 
 async fn refresh_sim_sms(

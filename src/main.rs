@@ -186,8 +186,41 @@ async fn firefox_poll_worker(_modem_manager: ModemManagerRef) {
                     if let Some(items) = resp.data.as_ref().and_then(|d| d.as_array()) {
                         for item in items {
                             let phone_num = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("?");
-                            let item_id = item.get("Item_ID").and_then(|v| v.as_str()).unwrap_or("?");
-                            log::info!("[火狐狸轮询] 等待短信 - 号码: {}, Item_ID: {}", phone_num, item_id);
+                            let country_id = item.get("Country_ID").and_then(|v| v.as_str()).unwrap_or("?");
+                            let item_id = item.get("Item_ID").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+                            log::info!("[火狐狸轮询] 等待短信 - 号码: {}, Country: {}, Item_ID: {}", phone_num, country_id, item_id);
+
+                            if item_id != "?" && phone_num != "?" && country_id != "?" {
+                                // Query the result to get SMS content
+                                match firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
+                                    Ok(result_resp) => {
+                                        if let Some(data) = result_resp.data {
+                                            if let Some(arr) = data.as_array() {
+                                                for result_item in arr {
+                                                    if let Some(content) = result_item.get("Phone_SmsContent").and_then(|v| v.as_str()) {
+                                                        if !content.is_empty() {
+                                                            log::info!("[火狐狸轮询] 获取到短信内容, 上传中 - 号码: {}, Item_ID: {}", phone_num, item_id);
+                                                            match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await {
+                                                                Ok(upload_resp) => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                                                Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
+                                                            }
+                                                        }
+                                                    }
+                                                    // Check if the task is released
+                                                    let is_ret = result_item.get("Phone_IsRet").and_then(|v| v.as_str()).unwrap_or("false");
+                                                    let remark = result_item.get("Phone_Remark").and_then(|v| v.as_str()).unwrap_or("");
+                                                    if is_ret == "True" || is_ret == "true" || !remark.is_empty() {
+                                                        if !remark.is_empty() {
+                                                            log::info!("[火狐狸轮询] 任务已释放 - 号码: {}, Item_ID: {}, 备注: {}", phone_num, item_id, remark);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => log::warn!("[火狐狸轮询] 查询结果失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
+                                }
+                            }
                         }
                     }
                 } else {

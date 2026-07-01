@@ -1,0 +1,479 @@
+<script>
+  import { onMount, onDestroy } from 'svelte';
+  import Icon from '@iconify/svelte';
+  import { apiClient } from '../js/api.js';
+  import { t } from '../js/i18n.js';
+
+  let { onBack = () => {} } = $props();
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let activeTab = $state('import'); // 'import' | 'call' | 'sms' | 'ussd'
+  let sims = $state([]);
+  let simCards = $state([]);
+  let loading = $state(true);
+  let error = $state('');
+
+  // Import tab
+  let fileInput = $state(null);
+  let importText = $state('');
+  let importPreview = $state([]);
+  let importRunning = $state(false);
+
+  // Exchange tabs
+  let exchangeRunning = $state(false);
+
+  // USSD tab
+  let ussdCode = $state('*100#');
+  let ussdRunning = $state(false);
+
+  // Status polling
+  let statusTask = $state(null);
+  let taskStatus = $state({ running: false, task_type: '', total: 0, done: 0, current: '', errors: [], results: [] });
+
+  // ── Data fetching ──────────────────────────────────────────────────────────
+  async function fetchData() {
+    loading = true;
+    error = '';
+    try {
+      const [infoRes, cardsRes] = await Promise.all([
+        apiClient.getAllSimsInfo(),
+        apiClient.getAllSimCards(),
+      ]);
+      const infos = Array.isArray(infoRes) ? infoRes : (infoRes?.data ?? []);
+      const cards = Array.isArray(cardsRes) ? cardsRes : (cardsRes?.data ?? []);
+      simCards = cards;
+
+      const cardMap = Object.fromEntries(cards.map(c => [c.id, c]));
+      sims = infos
+        .filter(info => info.has_sim !== false && info.sim_id && !info.sim_id.startsWith('fallback_sim_'))
+        .map(info => {
+          const card = cardMap[info.sim_id] ?? {};
+          return {
+            ...info,
+            phone_number: card.phone_number ?? info.phone_number ?? null,
+          };
+        })
+        .sort((a, b) => comIndex(a.com_port) - comIndex(b.com_port));
+    } catch (e) {
+      error = e?.message ?? $t('err_load_sim');
+    } finally {
+      loading = false;
+    }
+  }
+
+  function comIndex(port) {
+    const n = parseInt((port ?? '').replace(/^COM/i, ''), 10);
+    return isNaN(n) ? Infinity : n;
+  }
+
+  // ── Status polling ─────────────────────────────────────────────────────────
+  async function pollStatus() {
+    try {
+      const res = await apiClient.getPhoneNumberStatus();
+      taskStatus = res?.data ?? res ?? taskStatus;
+      const running = taskStatus.running;
+
+      if (activeTab === 'import') importRunning = running && taskStatus.task_type === 'import';
+      if (activeTab === 'call') exchangeRunning = running && taskStatus.task_type === 'call';
+      if (activeTab === 'sms') exchangeRunning = running && taskStatus.task_type === 'sms';
+      if (activeTab === 'ussd') ussdRunning = running && taskStatus.task_type === 'ussd';
+
+      if (running) {
+        statusTask = setTimeout(pollStatus, 1500);
+      } else {
+        // Refresh SIM list when task finishes
+        fetchData();
+      }
+    } catch (e) {
+      statusTask = setTimeout(pollStatus, 3000);
+    }
+  }
+
+  function startPolling() {
+    if (statusTask) clearTimeout(statusTask);
+    pollStatus();
+  }
+
+  // ── Import tab ─────────────────────────────────────────────────────────────
+  function parseImportText(text) {
+    const lines = text.split(/\r?\n/).filter(l => l.trim());
+    return lines.map(line => {
+      const parts = line.split(',').map(s => s.trim());
+      return { iccid: parts[0] ?? '', msisdn: parts[1] ?? '' };
+    }).filter(e => e.iccid && e.msisdn);
+  }
+
+  function updatePreview() {
+    importPreview = parseImportText(importText).map(entry => {
+      const matched = sims.find(s => s.sim_id === entry.iccid);
+      return {
+        ...entry,
+        com_port: matched?.com_port ?? '-',
+        status: matched ? $t('phone_import_status_ready') : '未匹配',
+      };
+    });
+  }
+
+  function handleFileSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      importText = ev.target.result;
+      updatePreview();
+    };
+    reader.readAsText(file);
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      importText = ev.target.result;
+      updatePreview();
+    };
+    reader.readAsText(file);
+  }
+
+  async function startImport() {
+    const entries = parseImportText(importText);
+    if (entries.length === 0) return;
+    importRunning = true;
+    try {
+      await apiClient.importPhoneNumbers(entries);
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+      importRunning = false;
+    }
+  }
+
+  // ── Exchange tabs ──────────────────────────────────────────────────────────
+  async function startCallExchange() {
+    if (!hasSourceNumber()) {
+      error = $t('phone_exchange_no_source');
+      return;
+    }
+    exchangeRunning = true;
+    try {
+      await apiClient.startCallExchange();
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+      exchangeRunning = false;
+    }
+  }
+
+  async function startSmsExchange() {
+    if (!hasSourceNumber()) {
+      error = $t('phone_exchange_no_source');
+      return;
+    }
+    exchangeRunning = true;
+    try {
+      await apiClient.startSmsExchange();
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+      exchangeRunning = false;
+    }
+  }
+
+  function hasSourceNumber() {
+    return sims.some(s => s.phone_number);
+  }
+
+  // ── USSD tab ───────────────────────────────────────────────────────────────
+  async function sendUssdBatch() {
+    if (!ussdCode.trim()) {
+      error = $t('err_no_ussd_code');
+      return;
+    }
+    ussdRunning = true;
+    try {
+      await apiClient.sendUssdBatch(ussdCode.trim());
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+      ussdRunning = false;
+    }
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function formatPhone(p) {
+    if (!p) return $t('phone_result_empty');
+    return p;
+  }
+
+  function statusClass(status) {
+    switch (status) {
+      case 'success': return 'text-green-600 dark:text-green-400';
+      case 'failed': return 'text-red-600 dark:text-red-400';
+      case 'skipped': return 'text-yellow-600 dark:text-yellow-400';
+      default: return 'text-gray-500 dark:text-gray-400';
+    }
+  }
+
+  onMount(fetchData);
+  onDestroy(() => {
+    if (statusTask) clearTimeout(statusTask);
+  });
+</script>
+
+<div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-zinc-950 text-sm font-sans">
+  <!-- ── Header ─────────────────────────────────────────────────────────────── -->
+  <header class="flex items-center gap-3 px-4 py-3 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800 shadow-sm">
+    <button onclick={onBack} class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-zinc-800 transition">
+      <Icon icon="carbon:arrow-left" class="w-5 h-5 text-gray-600 dark:text-gray-300" />
+    </button>
+    <Icon icon="carbon:phone-voice" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+    <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('phone_number_title')}</h1>
+  </header>
+
+  <!-- ── Tabs ───────────────────────────────────────────────────────────────── -->
+  <div class="px-4 pt-4 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800">
+    <div class="flex gap-1 overflow-x-auto">
+      {#each [
+        { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },
+        { id: 'call', label: $t('phone_tab_call'), icon: 'carbon:phone-outgoing' },
+        { id: 'sms', label: $t('phone_tab_sms'), icon: 'carbon:send-alt' },
+        { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
+      ] as tab}
+        <button
+          onclick={() => { activeTab = tab.id; error = ''; }}
+          class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 transition
+                 {activeTab === tab.id
+                   ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                   : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'}"
+        >
+          <Icon icon={tab.icon} class="w-4 h-4" />
+          {tab.label}
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <!-- ── Content ────────────────────────────────────────────────────────────── -->
+  <div class="flex-1 overflow-auto p-4 sm:p-6">
+    {#if loading}
+      <div class="animate-pulse space-y-4 max-w-4xl mx-auto">
+        <div class="h-8 bg-gray-200 dark:bg-zinc-800 rounded w-1/3"></div>
+        <div class="h-32 bg-gray-200 dark:bg-zinc-800 rounded"></div>
+      </div>
+    {:else}
+      <div class="max-w-5xl mx-auto space-y-4">
+        {#if error}
+          <div class="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 text-sm flex items-start gap-2">
+            <Icon icon="carbon:warning" class="w-5 h-5 flex-shrink-0" />
+            <span>{error}</span>
+          </div>
+        {/if}
+
+        <!-- Import -->
+        {#if activeTab === 'import'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            <p class="text-gray-600 dark:text-gray-400 text-sm">{$t('phone_import_hint')}</p>
+
+            <div
+              role="button"
+              tabindex="0"
+              ondragover={(e) => e.preventDefault()}
+              ondrop={handleDrop}
+              onclick={() => fileInput?.click()}
+              onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') fileInput?.click(); }}
+              class="border-2 border-dashed border-gray-300 dark:border-zinc-700 rounded-xl p-8 text-center cursor-pointer hover:border-blue-400 dark:hover:border-blue-500 transition"
+            >
+              <Icon icon="carbon:cloud-upload" class="w-8 h-8 mx-auto text-gray-400 dark:text-gray-500 mb-2" />
+              <p class="text-gray-600 dark:text-gray-400">{$t('phone_import_file_hint')}</p>
+              <input bind:this={fileInput} type="file" accept=".txt,.csv" class="hidden" onchange={handleFileSelect} />
+            </div>
+
+            <textarea
+              bind:value={importText}
+              oninput={updatePreview}
+              placeholder="89441000304692509546,07770065802&#10;89441000304698110844,07770065803"
+              rows="6"
+              class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+            ></textarea>
+
+            {#if importPreview.length > 0}
+              <div>
+                <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{$t('phone_import_preview')}</h3>
+                <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800">
+                  <table class="min-w-full text-sm">
+                    <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
+                      <tr>
+                        <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_iccid')}</th>
+                        <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_msisdn')}</th>
+                        <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_com')}</th>
+                        <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_status')}</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                      {#each importPreview as row}
+                        <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                          <td class="px-3 py-2 font-mono text-xs">{row.iccid}</td>
+                          <td class="px-3 py-2 font-mono text-xs">{row.msisdn}</td>
+                          <td class="px-3 py-2">{row.com_port}</td>
+                          <td class="px-3 py-2">{row.status}</td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            {/if}
+
+            <div class="flex items-center justify-between">
+              <div class="text-sm text-gray-500 dark:text-gray-400">
+                {#if taskStatus.running && taskStatus.task_type === 'import'}
+                  {$t('import_progress', { done: taskStatus.done, total: taskStatus.total })}
+                {/if}
+              </div>
+              <button
+                onclick={startImport}
+                disabled={importRunning || importPreview.length === 0}
+                class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                {#if importRunning}
+                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                {:else}
+                  <Icon icon="carbon:document-import" class="w-4 h-4" />
+                {/if}
+                {$t('btn_start_import')}
+              </button>
+            </div>
+          </div>
+
+        <!-- Call / SMS exchange -->
+        {:else if activeTab === 'call' || activeTab === 'sms'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            <div class="p-3 rounded-lg bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 text-sm flex items-start gap-2">
+              <Icon icon="carbon:information" class="w-5 h-5 flex-shrink-0" />
+              <span>{$t('phone_exchange_hint')}</span>
+            </div>
+
+            <!-- SIM list -->
+            <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800">
+              <table class="min-w-full text-sm">
+                <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
+                  <tr>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_com')}</th>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_iccid')}</th>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_current_phone')}</th>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_status')}</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                  {#each sims as sim}
+                    <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                      <td class="px-3 py-2 font-medium">{sim.com_port}</td>
+                      <td class="px-3 py-2 font-mono text-xs">{sim.sim_id}</td>
+                      <td class="px-3 py-2">{formatPhone(sim.phone_number)}</td>
+                      <td class="px-3 py-2">
+                        {#if sim.phone_number}
+                          <span class="text-green-600 dark:text-green-400">{$t('phone_status_has_number')}</span>
+                        {:else}
+                          <span class="text-gray-500 dark:text-gray-400">{$t('phone_status_no_number')}</span>
+                        {/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+
+            {#if taskStatus.running && (taskStatus.task_type === 'call' || taskStatus.task_type === 'sms')}
+              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
+                {$t('exchange_progress', { done: taskStatus.done, total: taskStatus.total, current: taskStatus.current })}
+              </div>
+            {/if}
+
+            <div class="flex justify-end">
+              <button
+                onclick={activeTab === 'call' ? startCallExchange : startSmsExchange}
+                disabled={exchangeRunning}
+                class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                {#if exchangeRunning}
+                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                {:else}
+                  <Icon icon={activeTab === 'call' ? 'carbon:phone-outgoing' : 'carbon:send-alt'} class="w-4 h-4" />
+                {/if}
+                {activeTab === 'call' ? $t('btn_start_call_exchange') : $t('btn_start_sms_exchange')}
+              </button>
+            </div>
+          </div>
+
+        <!-- USSD -->
+        {:else if activeTab === 'ussd'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+              <div class="sm:col-span-2">
+                <label for="ussdCode" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{$t('ussd_code_label')}</label>
+                <input
+                  id="ussdCode"
+                  type="text"
+                  bind:value={ussdCode}
+                  placeholder={$t('ussd_code_hint')}
+                  class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                />
+              </div>
+              <button
+                onclick={sendUssdBatch}
+                disabled={ussdRunning}
+                class="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                {#if ussdRunning}
+                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                {:else}
+                  <Icon icon="carbon:send" class="w-4 h-4" />
+                {/if}
+                {$t('btn_send_ussd')}
+              </button>
+            </div>
+
+            {#if taskStatus.running && taskStatus.task_type === 'ussd'}
+              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
+                {$t('ussd_progress', { done: taskStatus.done, total: taskStatus.total })}
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        <!-- Shared results -->
+        {#if taskStatus.results.length > 0}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm">
+            <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3">{$t('phone_col_status')}</h3>
+            <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800 max-h-96 overflow-y-auto">
+              <table class="min-w-full text-sm">
+                <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 sticky top-0">
+                  <tr>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_com')}</th>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_iccid')}</th>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_current_phone')}</th>
+                    <th class="px-3 py-2 text-left font-medium">{$t('phone_col_status')}</th>
+                    <th class="px-3 py-2 text-left font-medium">Message</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                  {#each taskStatus.results as r}
+                    <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                      <td class="px-3 py-2">{r.com_port || '-'}</td>
+                      <td class="px-3 py-2 font-mono text-xs">{r.sim_id}</td>
+                      <td class="px-3 py-2">{formatPhone(r.phone_number)}</td>
+                      <td class="px-3 py-2 {statusClass(r.status)}">{r.status}</td>
+                      <td class="px-3 py-2 text-gray-600 dark:text-gray-400">{r.message}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
+  </div>
+</div>

@@ -182,6 +182,28 @@ class ApiClient {
         if (simId) params.sim_id = simId;
         return FetchApi.get('/api/calls', params);
     }
+
+    // ── Phone number management ─────────────────────────────────────────────
+
+    async importPhoneNumbers(entries) {
+        return FetchApi.post('/api/phone-numbers/import', { entries });
+    }
+
+    async startCallExchange() {
+        return FetchApi.post('/api/phone-numbers/call-exchange');
+    }
+
+    async startSmsExchange() {
+        return FetchApi.post('/api/phone-numbers/sms-exchange');
+    }
+
+    async sendUssdBatch(code) {
+        return FetchApi.post('/api/phone-numbers/ussd', { code });
+    }
+
+    async getPhoneNumberStatus() {
+        return FetchApi.get('/api/phone-numbers/status');
+    }
 }
 
 // Export as a singleton

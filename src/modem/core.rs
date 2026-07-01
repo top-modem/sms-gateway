@@ -1036,6 +1036,41 @@ impl Modem {
         Ok(())
     }
 
+    /// Send a USSD code and wait for the response.
+    /// Returns the decoded response text.
+    pub async fn send_ussd(&self, code: &str) -> io::Result<String> {
+        let command = format!("AT+CUSD=1,\"{}\"\r\n", code);
+        let response = self.send_command_with_ok(&command).await?;
+
+        let ussd_response = response
+            .lines()
+            .find(|line| line.starts_with("+CUSD:"))
+            .map(|line| {
+                let after_prefix = line.strip_prefix("+CUSD:").unwrap_or(line);
+                let parts: Vec<&str> = after_prefix.split(',').collect();
+                if parts.len() >= 2 {
+                    let raw = parts[1].trim().trim_matches('"');
+                    if raw.chars().all(|c| c.is_ascii_hexdigit()) && raw.len() % 4 == 0 && raw.len() >= 4 {
+                        ucs2_hex_to_string(raw)
+                    } else {
+                        raw.to_string()
+                    }
+                } else {
+                    String::new()
+                }
+            })
+            .unwrap_or_default();
+
+        Ok(ussd_response)
+    }
+
+    /// Query CLCC and extract the caller's phone number from an incoming call.
+    /// Returns None if no incoming call with a number is found.
+    pub async fn read_clcc_caller_number(&self) -> io::Result<Option<String>> {
+        let response = self.query_clcc().await?;
+        Ok(parse_clcc_incoming_number(&response))
+    }
+
     /// Delete all files from modem UFS to free space before a new recording.
     pub async fn delete_files(&self) -> io::Result<()> {
         self.send_command_with_ok("AT+QFDEL=\"*\"\r\n").await?;
@@ -1133,4 +1168,35 @@ impl Modem {
         let number = &rest[start..start + end];
         if number.is_empty() { None } else { Some(number.to_string()) }
     }
+}
+
+/// Decode a UCS2 hex string (e.g. "00410042" → "AB").
+fn ucs2_hex_to_string(hex: &str) -> String {
+    (0..hex.len())
+        .step_by(4)
+        .filter_map(|i| u32::from_str_radix(&hex[i..i + 4], 16).ok())
+        .filter_map(char::from_u32)
+        .collect()
+}
+
+/// Parse the raw AT+CLCC response and return the caller's phone number from an incoming call.
+/// Looks for mobile-terminated calls (dir=1) regardless of status.
+fn parse_clcc_incoming_number(response: &str) -> Option<String> {
+    for line in response.lines() {
+        let line = line.trim();
+        if !line.starts_with("+CLCC:") {
+            continue;
+        }
+        let parts: Vec<&str> = line[6..].split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 7 {
+            let dir = parts[1].parse::<i32>().unwrap_or(-1);
+            if dir == 1 {
+                let number = parts[5].trim_matches('"').to_string();
+                if !number.is_empty() {
+                    return Some(number);
+                }
+            }
+        }
+    }
+    None
 }

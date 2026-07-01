@@ -1,5 +1,5 @@
 use fancy_regex::Regex;
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, sync::OnceLock, time::Duration};
 
 use axum::{
     extract::{Path, Query, State},
@@ -22,8 +22,11 @@ use crate::{
     db::{AppSetting, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
+    phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
     ModemManagerRef,
 };
+
+static PHONE_NUMBER_TASK: OnceLock<TaskHandle> = OnceLock::new();
 
 /// Combined state for call routes that need both modem access and SSE broadcast.
 #[derive(Clone)]
@@ -155,6 +158,24 @@ pub async fn run_api(
             "/sims/{sim_id}/phone",
             post(set_sim_phone_number).with_state(modem_manager.clone()),
         )
+        // ── Phone number management routes ──────────────────────────────────────
+        .route(
+            "/phone-numbers/import",
+            post(phone_numbers_import).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/phone-numbers/call-exchange",
+            post(phone_numbers_call_exchange).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/phone-numbers/sms-exchange",
+            post(phone_numbers_sms_exchange).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/phone-numbers/ussd",
+            post(phone_numbers_ussd).with_state(modem_manager.clone()),
+        )
+        .route("/phone-numbers/status", get(phone_numbers_status))
         // ── 火狐狸 platform integration routes ─────────────────────────────
         .route("/settings/firefox-api-key", get(get_firefox_api_key))
         .route("/settings/firefox-api-key", put(set_firefox_api_key))
@@ -595,6 +616,78 @@ async fn refresh_sim_sms(
 
 async fn check() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct PhoneNumberImportEntry {
+    iccid: String,
+    msisdn: String,
+}
+
+#[derive(Deserialize)]
+struct PhoneNumberImportRequest {
+    entries: Vec<PhoneNumberImportEntry>,
+}
+
+#[derive(Deserialize)]
+struct PhoneNumberUssdRequest {
+    code: String,
+}
+
+fn get_phone_number_task() -> &'static TaskHandle {
+    PHONE_NUMBER_TASK.get_or_init(new_task_handle)
+}
+
+async fn phone_numbers_import(
+    State(mm): State<ModemManagerRef>,
+    Json(payload): Json<PhoneNumberImportRequest>,
+) -> Response {
+    let entries: Vec<(String, String)> = payload
+        .entries
+        .into_iter()
+        .map(|e| (e.iccid, e.msisdn))
+        .collect();
+
+    let task = get_phone_number_task().clone();
+    tokio::spawn(import_phone_numbers(mm, task, entries));
+
+    (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_call_exchange(State(mm): State<ModemManagerRef>) -> Response {
+    let task = get_phone_number_task().clone();
+    tokio::spawn(call_exchange(mm, task));
+    (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_sms_exchange(State(mm): State<ModemManagerRef>) -> Response {
+    let task = get_phone_number_task().clone();
+    tokio::spawn(sms_exchange(mm, task));
+    (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_ussd(
+    State(mm): State<ModemManagerRef>,
+    Json(payload): Json<PhoneNumberUssdRequest>,
+) -> Response {
+    let task = get_phone_number_task().clone();
+    let code = payload.code;
+    tokio::spawn(ussd_batch(mm, task, code));
+    (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_status() -> Response {
+    let task = get_phone_number_task().read().await;
+    let task_clone = PhoneNumberTask {
+        running: task.running,
+        task_type: task.task_type.clone(),
+        total: task.total,
+        done: task.done,
+        current: task.current.clone(),
+        errors: task.errors.clone(),
+        results: task.results.clone(),
+    };
+    Json(task_clone).into_response()
 }
 
 async fn get_contacts() -> Json<Vec<Contact>> {

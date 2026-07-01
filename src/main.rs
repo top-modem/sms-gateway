@@ -16,6 +16,7 @@ mod db;
 mod decode;
 mod firefox_api;
 mod modem;
+mod phone_number;
 mod transcribe;
 #[cfg(test)]
 mod tests;

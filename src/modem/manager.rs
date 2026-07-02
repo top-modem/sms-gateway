@@ -603,11 +603,33 @@ impl ModemManager {
 
     /// Find the sim_id (ICCID) that matches a given SIM phone number.
     /// Searches the in-memory cache, so the SIM must have been seen at least once.
+    /// Normalizes both numbers before comparing (removes leading '+' and any
+    /// non-digits, then tries both with and without a leading 0).
     pub async fn find_sim_id_by_phone_number(&self, phone_number: &str) -> Option<String> {
+        fn normalize(p: &str) -> Vec<String> {
+            let digits: String = p.chars().filter(|c| c.is_ascii_digit()).collect();
+            let mut variants = vec![];
+            // Short form without country code / leading 0
+            if !digits.is_empty() {
+                variants.push(digits.clone());
+            }
+            // With leading 0
+            if !digits.starts_with('0') {
+                variants.push(format!("0{}", digits));
+            }
+            // Without leading 0
+            if digits.starts_with('0') {
+                variants.push(digits.trim_start_matches('0').to_string());
+            }
+            variants
+        }
+
+        let target_variants = normalize(phone_number);
         let cache = self.sim_cards_cache.read().await;
         cache.iter().find_map(|(sim_id, sim_card)| {
             sim_card.phone_number.as_deref().and_then(|p| {
-                if p == phone_number {
+                let stored_variants = normalize(p);
+                if target_variants.iter().any(|t| stored_variants.contains(t)) {
                     Some(sim_id.clone())
                 } else {
                     None

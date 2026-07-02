@@ -25,6 +25,10 @@
   let uploadResult = $state(null);
   let uploadError = $state('');
 
+  let deleting = $state(false);
+  let deleteResult = $state('');
+  let deleteError = $state('');
+
   // ── Data fetching ──────────────────────────────────────────────────────────
   async function fetchData() {
     loading = true;
@@ -103,6 +107,22 @@
       keyError = e?.data?.error ?? e?.message ?? $t('err_key_save_failed');
     } finally {
       savingKey = false;
+    }
+  }
+
+  async function handleDelete() {
+    deleteResult = '';
+    deleteError = '';
+    if (!confirm($t('delete_platform_confirm'))) return;
+
+    deleting = true;
+    try {
+      await apiClient.deleteAllFromPlatform();
+      deleteResult = $t('msg_delete_success');
+    } catch (e) {
+      deleteError = e?.data?.error ?? e?.message ?? $t('err_delete_failed');
+    } finally {
+      deleting = false;
     }
   }
 
@@ -229,20 +249,36 @@
                 {/each}
               </select>
             </div>
-            <button
-              onclick={handleUpload}
-              disabled={uploading || selected.size === 0}
-              class="px-5 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium
-                     disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
-            >
-              {#if uploading}
-                <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
-                {$t('uploading')}
-              {:else}
-                <Icon icon="carbon:cloud-upload" class="w-4 h-4" />
-                {$t('btn_upload_platform')}
-              {/if}
-            </button>
+              <div class="flex gap-2">
+                <button
+                  onclick={handleUpload}
+                  disabled={uploading || selected.size === 0}
+                  class="px-5 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium
+                         disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+                >
+                  {#if uploading}
+                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                    {$t('uploading')}
+                  {:else}
+                    <Icon icon="carbon:cloud-upload" class="w-4 h-4" />
+                    {$t('btn_upload_platform')}
+                  {/if}
+                </button>
+                <button
+                  onclick={handleDelete}
+                  disabled={deleting}
+                  class="px-5 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium
+                         disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+                >
+                  {#if deleting}
+                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                    {$t('deleting')}
+                  {:else}
+                    <Icon icon="carbon:delete" class="w-4 h-4" />
+                    {$t('btn_delete_from_platform')}
+                  {/if}
+                </button>
+              </div>
           </div>
 
           {#if uploadResult}
@@ -257,6 +293,18 @@
             <div class="mb-4 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-lg p-3 flex items-start gap-2">
               <Icon icon="carbon:warning" class="w-4 h-4 shrink-0 mt-0.5" />
               <span>{uploadError}</span>
+            </div>
+          {/if}
+
+          {#if deleteResult}
+            <div class="mb-4 text-xs text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20 rounded-lg p-3">
+              {deleteResult}
+            </div>
+          {/if}
+          {#if deleteError}
+            <div class="mb-4 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-lg p-3 flex items-start gap-2">
+              <Icon icon="carbon:warning" class="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{deleteError}</span>
             </div>
           {/if}
 

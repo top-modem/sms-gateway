@@ -204,6 +204,15 @@ class ApiClient {
     async getPhoneNumberStatus() {
         return FetchApi.get('/api/phone-numbers/status');
     }
+
+    // ── Firefox platform delete ──────────────────────────────────────────
+
+    /**
+     * Delete all phone numbers from the 火狐狸 platform.
+     */
+    async deleteAllFromPlatform() {
+        return FetchApi.post('/api/firefox/delete-all', {}, {}, 'application/json');
+    }
 }
 
 // Export as a singleton

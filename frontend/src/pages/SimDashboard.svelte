@@ -414,9 +414,7 @@
                 <!-- Module name -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
                   {#if info.available === false}
-                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400">
-                      {$t('unavailable')}
-                    </span>
+                    <span class="text-gray-400">—</span>
                   {:else}
                     {info.model_info?.model ?? '—'}
                   {/if}
@@ -441,6 +439,8 @@
                       {rssiToDbm(info.signal_quality?.rssi)}
                     </span>
                   </div>
+                  {:else if info.available === false}
+                    <span class="text-gray-400">—</span>
                   {:else}
                     <span class="text-gray-400">—</span>
                   {/if}
@@ -450,6 +450,8 @@
                 <td class="px-3 py-2.5 whitespace-nowrap font-medium">
                   {#if hasSim}
                     <span class="{net.cls}">{net.key ? $t(net.key, { n: net.codeN }) : '—'}</span>
+                  {:else if info.available === false}
+                    <span class="text-gray-400">—</span>
                   {:else}
                     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-gray-100 dark:bg-zinc-700 text-gray-500 dark:text-gray-400">{$t('no_sim')}</span>
                   {/if}
@@ -459,7 +461,11 @@
                 <td class="px-3 py-2.5 whitespace-nowrap">
                   <div class="flex items-center gap-2">
                     <span class="font-mono text-gray-700 dark:text-gray-200">
-                      {card.phone_number ?? info.phone_number ?? '—'}
+                      {#if info.available === false}
+                        —
+                      {:else}
+                        {card.phone_number ?? info.phone_number ?? '—'}
+                      {/if}
                     </span>
                     {#if hasSim}
                       <button
@@ -478,17 +484,27 @@
 
                 <!-- Operator -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {info.operator_info?.operator_name ?? '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {info.operator_info?.operator_name ?? '—'}
+                  {/if}
                 </td>
 
                 <!-- Country -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {getMccCountry(card.imsi, $lang)}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {getMccCountry(card.imsi, $lang)}
+                  {/if}
                 </td>
 
                 <!-- Platform status -->
                 <td class="px-3 py-2.5 whitespace-nowrap">
-                  {#if card.country_code}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else if card.country_code}
                     <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
                       <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
                       {$t('platform_connected')}
@@ -500,22 +516,38 @@
 
                 <!-- SMS recv / sent -->
                 <td class="px-3 py-2.5 text-center text-gray-700 dark:text-gray-200 whitespace-nowrap font-mono">
-                  <span class="text-green-600 dark:text-green-400">{stats.recv ?? 0}</span><span class="text-gray-400 dark:text-gray-500">/</span><span class="text-blue-500 dark:text-blue-400">{stats.sent ?? 0}</span>
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    <span class="text-green-600 dark:text-green-400">{stats.recv ?? 0}</span><span class="text-gray-400 dark:text-gray-500">/</span><span class="text-blue-500 dark:text-blue-400">{stats.sent ?? 0}</span>
+                  {/if}
                 </td>
 
                 <!-- IMSI -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {card.imsi ?? '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {card.imsi ?? '—'}
+                  {/if}
                 </td>
 
                 <!-- ICCID (= sim_id / card.id) -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {card.id ?? info.sim_id ?? '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {card.id ?? info.sim_id ?? '—'}
+                  {/if}
                 </td>
 
                 <!-- IMEI -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {info.imei ?? '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {info.imei ?? '—'}
+                  {/if}
                 </td>
               </tr>
             {/each}

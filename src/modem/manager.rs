@@ -49,51 +49,58 @@ pub struct ModemManager {
     modems: Arc<RwLock<HashMap<String, Arc<Modem>>>>,
     sim_cards_cache: Arc<RwLock<HashMap<String, SimCard>>>,
     _initialization_semaphore: Arc<Semaphore>,
-    /// COM ports that failed to open at startup (com_port, baud_rate)
+    /// COM ports that are not currently usable (com_port, baud_rate)
     pub unavailable_ports: Vec<(String, u32)>,
+    /// Original device list so unavailable ports can be retried later.
+    devices: Vec<crate::config::Device>,
 }
 
 impl ModemManager {
     pub async fn initialize(config: &crate::config::AppConfig) -> anyhow::Result<Self> {
-        let initialization_semaphore = Arc::new(Semaphore::new(3));
-        let mut initialization_futures = FuturesUnordered::new();
+        // Initialize ports sequentially (not concurrently).  In this deployment
+        // many COM ports share the same USB hub / serial concentrator; issuing
+        // AT commands to several ports at the same time causes command timeouts
+        // and makes the service hang during startup.
+        let mut modems = HashMap::new();
+        let mut new_sim_ids = Vec::new();
+        let mut unavailable_ports: Vec<(String, u32)> = Vec::new();
 
         for (index, device) in config.devices.iter().enumerate() {
             let port = device.com_port.clone();
             let baud_rate = device.baud_rate;
             let sms_storage = device.sms_storage.or(config.settings.sms_storage);
             let temp_device_id = format!("device_{}", index);
-            let semaphore = initialization_semaphore.clone();
 
-            initialization_futures.push(async move {
-                let _permit = semaphore.acquire().await;
-                Self::initialize_single_modem(port.clone(), baud_rate, temp_device_id, sms_storage, index)
-                    .await
-                    .map_err(|e| (port, baud_rate, e))
-            });
-        }
-
-        let mut modems = HashMap::new();
-        let mut new_sim_ids = Vec::new();
-        let mut unavailable_ports: Vec<(String, u32)> = Vec::new();
-
-        while let Some(result) = initialization_futures.next().await {
-            match result {
+            match Self::initialize_single_modem(
+                port.clone(),
+                baud_rate,
+                temp_device_id,
+                sms_storage,
+                index,
+            )
+            .await
+            {
                 Ok((sim_id, modem, is_new)) => {
                     if is_new {
                         new_sim_ids.push(sim_id.clone());
                     }
                     modems.insert(sim_id, Arc::new(modem));
                 }
-                Err((port, baud_rate, e)) => {
+                Err(e) => {
                     error!("Failed to initialize modem on {}: {}", port, e);
                     unavailable_ports.push((port, baud_rate));
                 }
             }
         }
 
+        // Even if no modems have a real SIM, we still start the manager so the
+        // API can report all ports as unavailable instead of crashing.
         if modems.is_empty() {
-            return Err(anyhow::anyhow!("No modems were successfully initialized"));
+            log::warn!(
+                "No modems with valid SIM cards were initialized ({} ports unavailable). \
+                 Starting with empty modem set.",
+                unavailable_ports.len()
+            );
         }
 
         info!(
@@ -105,8 +112,9 @@ impl ModemManager {
         let manager = Self {
             modems: Arc::new(RwLock::new(modems)),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
-            _initialization_semaphore: initialization_semaphore,
+            _initialization_semaphore: Arc::new(Semaphore::new(3)),
             unavailable_ports,
+            devices: config.devices.clone(),
         };
 
         manager.init_sim_cache().await?;
@@ -129,26 +137,42 @@ impl ModemManager {
 
         let modem = Modem::new(&port, baud_rate, &device_id, index).await?;
 
-        let pre_sim_id = modem.get_sim_iccid().await.ok().flatten();
-        let is_new_sim = if let Some(ref sim_id) = pre_sim_id {
-            Self::is_new_sim_id(sim_id).await
-        } else {
-            false
+        // Some virtual COM ports open but are not backed by a real modem.
+        // Verify the modem actually responds before issuing longer commands.
+        if !modem.is_responsive().await {
+            log::warn!(
+                "Modem on port {} is not responding to AT commands. Treating as unavailable.",
+                port
+            );
+            return Err(anyhow::anyhow!("Modem not responsive to AT commands"));
+        }
+
+        let pre_sim_id = match modem.get_sim_iccid().await {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => {
+                log::warn!("No SIM detected on port {}, treating as unavailable", port);
+                return Err(anyhow::anyhow!("No SIM detected"));
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to read SIM ICCID on port {} (cannot communicate): {}. Treating as unavailable.",
+                    port, e
+                );
+                return Err(anyhow::anyhow!("Failed to read SIM ICCID: {}", e));
+            }
         };
+
+        let is_new_sim = Self::is_new_sim_id(pre_sim_id.as_ref().unwrap()).await;
 
         if let Err(e) = modem.init_modem(sms_storage).await {
             log::warn!(
-                "Modem AT init failed for port {} (no SIM inserted?): {}. \
-                 Adding as partial entry.",
-                port,
-                e
+                "Modem AT init failed for port {}: {}. Treating as unavailable.",
+                port, e
             );
+            return Err(anyhow::anyhow!("Modem AT init failed: {}", e));
         }
 
-        let sim_id = pre_sim_id.unwrap_or_else(|| {
-            log::warn!("Using fallback SIM ID for port {}", port);
-            format!("fallback_sim_{}", index)
-        });
+        let sim_id = pre_sim_id.unwrap();
 
         info!(
             "Successfully initialized modem on {} with SIM ID: {}",
@@ -171,6 +195,11 @@ impl ModemManager {
     async fn init_sim_cache(&self) -> anyhow::Result<()> {
         let modems = self.modems.read().await;
         let sim_ids: Vec<&str> = modems.keys().map(|k| k.as_str()).collect();
+
+        if sim_ids.is_empty() {
+            info!("Initialized SIM cache with 0 cards (no modems available)");
+            return Ok(());
+        }
 
         let sim_cards = SimCard::get_by_ids(&sim_ids).await?;
 
@@ -294,14 +323,14 @@ impl ModemManager {
         while futures.next().await.is_some() {}
     }
 
-    /// Re-check all modems in parallel for SIM insertion/removal.
+    /// Re-check all currently active modems for SIM insertion/removal.
     /// Demotes real-ICCID modems where +CCID returns a different or missing ICCID.
-    /// Promotes fallback modems where +CCID now returns an ICCID.
+    /// Periodically attempts to reopen ports listed in `unavailable_ports`.
     pub async fn recheck_fallback_modems(
-        &self,
+        &mut self,
         sms_storage_map: &std::collections::HashMap<String, Option<crate::config::SmsStorage>>,
         sse_manager: Arc<SseManager>,
-        webhook_manager: Option<webhook::WebhookManager>,
+        _webhook_manager: Option<webhook::WebhookManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
         // ── Demotion: parallel AT+CCID on all real-ICCID modems ──────────────
@@ -309,7 +338,6 @@ impl ModemManager {
             let modems = self.modems.read().await;
             modems
                 .iter()
-                .filter(|(k, _)| !k.starts_with("fallback_sim_"))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
@@ -324,9 +352,15 @@ impl ModemManager {
                             "SIM swap detected on {} (was {}, now {}). Forcing re-init.",
                             modem.com_port, iccid, current_iccid
                         );
-                        Some((iccid, modem.fallback_key.clone(), modem.com_port.clone()))
+                        Some((iccid, modem.com_port.clone()))
                     }
-                    _ => Some((iccid, modem.fallback_key.clone(), modem.com_port.clone())),
+                    _ => {
+                        info!(
+                            "SIM removed from {} (was {}). Marking port as unavailable.",
+                            modem.com_port, iccid
+                        );
+                        Some((iccid, modem.com_port.clone()))
+                    }
                 }
             });
         }
@@ -336,83 +370,80 @@ impl ModemManager {
                 demotions.push(d);
             }
         }
-        for (iccid, fallback_key, com_port) in demotions {
-            info!(
-                "SIM removed from {} (was {}). Demoting to {}.",
-                com_port, iccid, fallback_key
-            );
+        for (iccid, com_port) in demotions {
             let mut modems = self.modems.write().await;
-            if let Some(m) = modems.remove(&iccid) {
-                modems.insert(fallback_key, m);
+            if let Some(modem) = modems.remove(&iccid) {
+                let baud_rate = modem.baud_rate;
+                drop(modems);
+                let mut unavailable = self.unavailable_ports.clone();
+                if !unavailable.iter().any(|(p, _)| p == &com_port) {
+                    unavailable.push((com_port.clone(), baud_rate));
+                    self.unavailable_ports = unavailable;
+                }
             }
         }
 
-        // ── Promotion: parallel AT+CCID on all fallback modems ────────────────
-        let fallback_entries: Vec<(String, Arc<Modem>)> = {
-            let modems = self.modems.read().await;
-            modems
-                .iter()
-                .filter(|(k, _)| k.starts_with("fallback_sim_"))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
-
-        let mut promotion_futs = FuturesUnordered::new();
-        for (fallback_key, modem) in fallback_entries {
-            let sms_storage = sms_storage_map.get(&modem.com_port).copied().flatten();
-            promotion_futs.push(async move {
-                let iccid = match modem.get_sim_iccid().await {
-                    Ok(Some(id)) => id,
-                    _ => return None,
-                };
-                info!(
-                    "SIM detected on {} (was {}): ICCID={}. Re-initializing.",
-                    modem.com_port, fallback_key, iccid
-                );
-                if let Err(e) = modem.init_modem(sms_storage).await {
-                    log::warn!(
-                        "Re-init modem on {} failed: {}. Will retry next cycle.",
-                        modem.com_port,
-                        e
+        // ── Reconnection: try to reopen ports that were unavailable at startup ──
+        let unavailable_snapshot: Vec<(String, u32)> = self.unavailable_ports.clone();
+        let mut reconnected = Vec::new();
+        for (com_port, baud_rate) in unavailable_snapshot {
+            // Look up the original device configuration for sms_storage and index.
+            let device_cfg = self.devices.iter().find(|d| d.com_port == com_port);
+            let sms_storage = device_cfg
+                .and_then(|d| d.sms_storage)
+                .or(*sms_storage_map.get(&com_port).unwrap_or(&None));
+            let index = device_cfg
+                .map(|d| self.devices.iter().position(|x| x.com_port == d.com_port).unwrap_or(0))
+                .unwrap_or_else(|| {
+                    com_port
+                        .trim_start_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .unwrap_or(0)
+                        .saturating_sub(1)
+                });
+            match Self::initialize_single_modem(
+                com_port.clone(),
+                baud_rate,
+                format!("device_{}", index),
+                sms_storage,
+                index,
+            )
+            .await
+            {
+                Ok((sim_id, modem, is_new)) => {
+                    info!(
+                        "Port {} reconnected with SIM {}. Promoting to active.",
+                        com_port, sim_id
                     );
-                    return None;
-                }
-                Some((fallback_key, iccid, modem.com_port.clone()))
-            });
-        }
-        while let Some(result) = promotion_futs.next().await {
-            if let Some((fallback_key, iccid, com_port)) = result {
-                let promoted_modem = {
                     let mut modems = self.modems.write().await;
-                    if let Some(m) = modems.remove(&fallback_key) {
-                        modems.insert(iccid.clone(), m.clone());
-                        info!("Modem on {} promoted: {} -> {}", com_port, fallback_key, iccid);
-                        Some(m)
-                    } else {
-                        None
+                    modems.insert(sim_id.clone(), Arc::new(modem));
+                    drop(modems);
+                    if is_new {
+                        self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
                     }
-                };
-                // Immediately read any SMS that arrived on the new SIM
-                if let Some(modem) = promoted_modem {
-                    let sse = sse_manager.clone();
-                    let wh = webhook_manager.clone();
-                    let modem_sms = modem.clone();
-                    let com_port_sms = com_port.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = modem_sms.read_sms_async_insert(SmsType::All, sse, wh).await {
-                            log::warn!("Failed to read SMS after SIM swap on {}: {}", com_port_sms, e);
-                        }
-                    });
-                    // Spawn a URC handler for the newly promoted modem so it can
-                    // receive RING / NO CARRIER events on this line going forward.
-                    tokio::spawn(Self::run_urc_handler(
-                        iccid.clone(),
-                        modem,
-                        sse_manager.clone(),
-                        transcribe_cfg.clone(),
-                    ));
+                    if let Some(sim) = self.get_sim_card_cached(&sim_id).await {
+                        let mut cache = self.sim_cards_cache.write().await;
+                        cache.insert(sim_id.clone(), sim);
+                    }
+                    if let Some(modem) = self.get_modem(&sim_id).await {
+                        tokio::spawn(Self::run_urc_handler(
+                            sim_id.clone(),
+                            modem,
+                            sse_manager.clone(),
+                            transcribe_cfg.clone(),
+                        ));
+                    }
+                    reconnected.push(com_port);
+                }
+                Err(e) => {
+                    log::debug!("Port {} still unavailable: {}", com_port, e);
                 }
             }
+        }
+        if !reconnected.is_empty() {
+            let mut unavailable = self.unavailable_ports.clone();
+            unavailable.retain(|(p, _)| !reconnected.contains(p));
+            self.unavailable_ports = unavailable;
         }
     }
 
@@ -834,12 +865,16 @@ impl ModemManager {
     /// Spawn one URC handler task per modem.  Must be called once after
     /// initialization.  Each task owns the modem's `urc_rx` and processes
     /// RING / +CLIP: / NO CARRIER / VOICE CALL: END messages forever.
-    pub async fn start_urc_handlers(&self, sse_manager: Arc<SseManager>, transcribe_cfg: Option<Arc<TranscribeConfig>>) {
+    pub async fn start_urc_handlers(&self,
+        sse_manager: Arc<SseManager>,
+        transcribe_cfg: Option<Arc<TranscribeConfig>>,
+    ) {
         let modems = self.modems.read().await;
+        if modems.is_empty() {
+            log::info!("No active modems; skipping URC handler startup");
+            return;
+        }
         for (sim_id, modem) in modems.iter() {
-            if sim_id.starts_with("fallback_sim_") {
-                continue;
-            }
             let sim_id = sim_id.clone();
             let modem = modem.clone();
             let sse = sse_manager.clone();

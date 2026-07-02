@@ -153,9 +153,19 @@ async fn recheck_fallback_worker(
 ) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        modem_manager
-            .recheck_fallback_modems(&sms_storage_map, sse_manager.clone(), webhook_manager.clone(), transcribe_cfg.clone())
-            .await;
+        // Clone the Arc so we can get a mutable reference to the manager's
+        // unavailable_ports list without holding the lock across awaits.
+        let mm = modem_manager.clone();
+        match Arc::get_mut(&mut { mm }) {
+            Some(manager) => {
+                manager
+                    .recheck_fallback_modems(&sms_storage_map, sse_manager.clone(), webhook_manager.clone(), transcribe_cfg.clone())
+                    .await;
+            }
+            None => {
+                log::debug!("Could not get mutable reference to ModemManager for recheck");
+            }
+        }
     }
 }
 

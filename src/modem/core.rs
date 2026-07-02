@@ -752,6 +752,27 @@ impl Modem {
         Ok(parser(&cleaned_response))
     }
 
+    /// Ping the modem with a harmless command and a short timeout to verify it
+    /// is actually responsive.  Some virtual COM ports open successfully but
+    /// never return data; this catches them before we waste time on longer
+    /// commands.
+    pub async fn is_responsive(&self) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        let command = ATCommand {
+            command: "AT\r\n".to_string(),
+            response_tx: tx,
+            _priority: 5,
+            retries: 0,
+        };
+        if self.command_tx.send(command).is_err() {
+            return false;
+        }
+        match tokio::time::timeout(Duration::from_secs(3), rx).await {
+            Ok(Ok(Ok(resp))) => resp.trim().contains("OK"),
+            _ => false,
+        }
+    }
+
     pub async fn get_signal_quality(&self) -> io::Result<Option<SignalQuality>> {
         self.get_modem_info("AT+CSQ\r\n", SignalQuality::from_response)
             .await

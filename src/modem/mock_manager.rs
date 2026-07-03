@@ -232,6 +232,13 @@ impl ModemManager {
         Ok(())
     }
 
+    pub async fn read_sms_and_get_latest(
+        &self,
+        _sim_id: &str,
+    ) -> anyhow::Result<Option<crate::db::Sms>> {
+        Ok(None)
+    }
+
     pub async fn read_all_sms_async(
         &self,
         _sms_type: SmsType,

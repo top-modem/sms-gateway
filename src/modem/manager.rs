@@ -8,7 +8,7 @@ use tokio::sync::{RwLock, Semaphore};
 use crate::api::sse_manager::CallEvent;
 use crate::api::SseManager;
 use crate::config::{Settings, SmsStorage};
-use crate::db::{Call, Contact, ModemSMS, SimCard};
+use crate::db::{Call, Contact, ModemSMS, SimCard, Sms, SmsStatus};
 use crate::webhook;
 
 use super::core::Modem;
@@ -288,6 +288,46 @@ impl ModemManager {
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
         modem.read_sms_sync_insert(sms_type).await
+    }
+
+    /// Read SMS from modem, sync to DB, and return the latest incoming message.
+    /// Falls back to the database if the modem has no unread SMS.
+    pub async fn read_sms_and_get_latest(
+        &self,
+        sim_id: &str,
+    ) -> anyhow::Result<Option<Sms>> {
+        let modem = self
+            .get_modem(sim_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
+
+        let sms_list = modem.read_sms(crate::modem::SmsType::All).await?;
+
+        if sms_list.is_empty() {
+            // Modem has no SMS — fall back to the latest DB record
+            return Sms::find_latest_incoming_by_sim_id(sim_id).await.map_err(Into::into);
+        }
+
+        if let Err(e) = modem.delete_all_sms().await {
+            log::warn!("Failed to delete SMS from modem after reading: {}", e);
+        }
+
+        ModemSMS::bulk_insert(&sms_list).await?;
+
+        let latest = sms_list
+            .into_iter()
+            .filter(|s| !s.send)
+            .max_by_key(|s| s.timestamp);
+
+        Ok(latest.map(|sms| Sms {
+            id: 0,
+            contact_id: sms.contact,
+            timestamp: sms.timestamp,
+            message: sms.message,
+            sim_id: sms.sim_id,
+            send: sms.send,
+            status: SmsStatus::Read,
+        }))
     }
 
     pub async fn read_all_sms_async(

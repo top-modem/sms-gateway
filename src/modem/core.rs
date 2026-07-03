@@ -24,6 +24,10 @@ const TERMINATORS: &[&[u8]] = &[
     b"\r\n+CMS ERROR",
 ];
 
+/// Terminators that have a variable-length error code after the prefix.
+/// When matched, we scan ahead for the trailing `\r\n` to include the full error message.
+const ERROR_TERMINATORS: &[&[u8]] = &[b"\r\n+CME ERROR", b"\r\n+CMS ERROR"];
+
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_LINE_BUF: usize = 64 * 1024;
@@ -247,7 +251,21 @@ impl Modem {
             if has_str_tx || has_raw_tx {
                 // Command-response mode: buffer until we see a terminator
                 if let Some((term, pos)) = Self::find_terminator(line_buf) {
-                    let end = pos + term.len();
+                    // For error terminators (e.g. +CMS ERROR), scan ahead to include
+                    // the full error code (e.g. "+CMS ERROR: 500") instead of cutting
+                    // off at the prefix.
+                    let end = if ERROR_TERMINATORS.contains(&term) {
+                        let after_prefix = pos + term.len();
+                        // Look for the trailing \r\n to capture the complete error line
+                        if let Some(rn_pos) = line_buf[after_prefix..].windows(2).position(|w| w == b"\r\n") {
+                            after_prefix + rn_pos + 2
+                        } else {
+                            // Trailing \r\n not yet received — wait for more data
+                            break;
+                        }
+                    } else {
+                        pos + term.len()
+                    };
                     let mut state = reader_state.lock().await;
                     if let Some(tx) = state.raw_response_tx.take() {
                         // Raw bytes mode (e.g. AT+QFDWL binary download)
@@ -613,7 +631,15 @@ impl Modem {
         contact: &Contact,
         message: &str,
     ) -> anyhow::Result<(i64, String)> {
-        info!("Sending SMS via PDU to {}: {}", contact.name, message);
+        // Use contact.id if it looks like a phone number (starts with + or is all digits),
+        // otherwise fall back to contact.name (contacts auto-created from received SMS
+        // store the phone number in the name field with a UUID as the id).
+        let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit()) {
+            contact.id.clone()
+        } else {
+            contact.name.clone()
+        };
+        info!("Sending SMS via PDU to {}: {}", phone, message);
 
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
 
@@ -629,7 +655,7 @@ impl Modem {
 
         let sms_id = sms.insert().await?;
 
-        match self.send_pdu_message(&contact.name, message).await {
+        match self.send_pdu_message(&phone, message).await {
             Ok(_) => {
                 Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
                 Ok((sms_id, contact.id.clone()))
@@ -893,7 +919,12 @@ impl Modem {
         contact: &Contact,
         message: &str,
     ) -> anyhow::Result<(i64, String)> {
-        info!("Sending SMS text to {}: {}", contact.name, message);
+        let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit()) {
+            contact.id.clone()
+        } else {
+            contact.name.clone()
+        };
+        info!("Sending SMS text to {}: {}", phone, message);
 
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
 
@@ -909,7 +940,7 @@ impl Modem {
 
         let sms_id = sms.insert().await?;
 
-        match self.send_text_message(&contact.name, message).await {
+        match self.send_text_message(&phone, message).await {
             Ok(_) => {
                 Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
                 Ok((sms_id, contact.id.clone()))

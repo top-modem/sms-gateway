@@ -173,9 +173,11 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
     use std::collections::HashSet;
     let poll_interval = tokio::time::Duration::from_secs(3);
     let mut processed_phones: HashSet<String> = HashSet::new();
+    let mut heartbeat_count: u32 = 0;
 
     loop {
         tokio::time::sleep(poll_interval).await;
+        heartbeat_count += 1;
 
         let api_key = match db::AppSetting::get("firefox_api_key").await {
             Ok(Some(key)) => key,
@@ -242,16 +244,8 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
 
                             log::info!("[火狐狸轮询] 找到 SIM: {}, 强制读取短信", sim_id);
 
-                            // Force SMS read from this modem
-                            if let Err(e) = modem_manager.read_sms_sync_insert(&sim_id, SmsType::RecUnread).await {
-                                log::warn!("[火狐狸轮询] 读取 SMS 失败 (SIM: {}): {}", sim_id, e);
-                            }
-
-                            // Give DB a moment to update
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                            // Query the latest incoming SMS for this SIM
-                            match db::Sms::find_latest_incoming_by_sim_id(&sim_id).await {
+                            // Read SMS from modem, sync to DB, and get the latest incoming message
+                            match modem_manager.read_sms_and_get_latest(&sim_id).await {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
                                     match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
@@ -277,7 +271,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                         }
                                     }
                                 }
-                                Err(e) => log::warn!("[火狐狸轮询] 查询短信失败 (SIM: {}): {}", sim_id, e),
+                                Err(e) => log::warn!("[火狐狸轮询] 读取/查询短信失败 (SIM: {}): {}", sim_id, e),
                             }
 
                             processed_phones.insert(phone_num.to_string());
@@ -288,6 +282,10 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
             Err(e) => {
                 log::warn!("[火狐狸轮询] 获取等待列表失败: {}", e);
             }
+        }
+
+        if heartbeat_count % 10 == 0 {
+            log::info!("[火狐狸轮询] 运行中 (心跳), 已轮询 {} 次", heartbeat_count);
         }
     }
 }

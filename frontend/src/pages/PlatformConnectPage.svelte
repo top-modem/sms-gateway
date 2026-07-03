@@ -14,6 +14,29 @@
 
   let countries = $state([]);
   let selectedCountry = $state('');
+  let countryFilter = $state('');
+
+  const sortedCountries = $derived(
+    [...countries].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')),
+  );
+
+  const filteredCountries = $derived(
+    countryFilter
+      ? sortedCountries.filter(c =>
+          c.prefix?.toLowerCase().includes(countryFilter.toLowerCase()) ||
+          c.name?.toLowerCase().includes(countryFilter.toLowerCase()) ||
+          c.id?.toLowerCase().includes(countryFilter.toLowerCase())
+        )
+      : sortedCountries,
+  );
+
+  $effect(() => {
+    if (countryFilter && selectedCountry && filteredCountries.length > 0) {
+      if (!filteredCountries.some(c => c.id === selectedCountry)) {
+        selectedCountry = filteredCountries[0].id;
+      }
+    }
+  });
 
   let sims = $state([]);
   let simCards = $state([]);
@@ -237,14 +260,32 @@
               <label for="country" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
                 {$t('country_code_label')}
               </label>
+              <div class="relative">
+                <input
+                  type="text"
+                  bind:value={countryFilter}
+                  placeholder={$t('country_search_ph')}
+                  class="w-full px-3 py-2 pr-8 rounded-lg border border-gray-300 dark:border-zinc-700
+                         bg-white dark:bg-zinc-950 text-gray-900 dark:text-gray-100 text-sm
+                         focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                {#if countryFilter}
+                  <button
+                    onclick={() => countryFilter = ''}
+                    class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+                  >
+                    <Icon icon="carbon:close" class="w-4 h-4" />
+                  </button>
+                {/if}
+              </div>
               <select
                 id="country"
                 bind:value={selectedCountry}
                 class="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-zinc-700
                        bg-white dark:bg-zinc-950 text-gray-900 dark:text-gray-100 text-sm
-                       focus:outline-none focus:ring-2 focus:ring-blue-500"
+                       focus:outline-none focus:ring-2 focus:ring-blue-500 mt-1"
               >
-                {#each countries as country}
+                {#each filteredCountries as country}
                   <option value={country.id}>{country.prefix} {country.name} ({country.id})</option>
                 {/each}
               </select>

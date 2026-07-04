@@ -3,6 +3,7 @@ use log::{debug, error, info};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
@@ -64,6 +65,10 @@ pub struct Modem {
     pub outbound_poll_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Becomes true when the CLCC poller observes stat=0 (remote answered the call).
     pub outbound_call_answered: Arc<tokio::sync::Mutex<bool>>,
+    /// Reader task handle so we can abort and release COM resources on drop.
+    reader_task: JoinHandle<()>,
+    /// Command processor task handle so it does not outlive modem shutdown.
+    command_task: JoinHandle<()>,
 }
 
 impl Modem {
@@ -79,7 +84,7 @@ impl Modem {
         let reader_state = Arc::new(Mutex::new(ReaderState { response_tx: None, raw_response_tx: None }));
 
         // Spawn background reader task — owns ReadHalf, routes bytes to commands or URC channel
-        tokio::spawn({
+        let reader_task = tokio::spawn({
             let reader_state = reader_state.clone();
             let urc_tx = urc_tx.clone();
             let write_half = write_half.clone();
@@ -96,7 +101,7 @@ impl Modem {
         });
 
         // Spawn sequential command processor
-        tokio::spawn({
+        let command_task = tokio::spawn({
             let write_half = write_half.clone();
             let reader_state = reader_state.clone();
             let name_c = name.to_string();
@@ -122,9 +127,22 @@ impl Modem {
             outbound_call_id: Arc::new(tokio::sync::Mutex::new(None)),
             outbound_poll_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
             outbound_call_answered: Arc::new(tokio::sync::Mutex::new(false)),
+            reader_task,
+            command_task,
         })
     }
 
+}
+
+impl Drop for Modem {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+        self.command_task.abort();
+    }
+}
+
+
+impl Modem {
     async fn create_serial_connection(
         com_port: &str,
         baud_rate: u32,

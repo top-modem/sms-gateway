@@ -730,11 +730,16 @@ fn resolve_barcode_launcher_file(configured: Option<&str>) -> PathBuf {
 fn normalize_msisdn(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('+') {
-        let mut out = String::from("+");
-        out.push_str(&trimmed[1..].chars().filter(|c| c.is_ascii_digit()).collect::<String>());
-        out
+        let digits: String = trimmed[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+        let normalized = digits.trim_start_matches('0');
+        if normalized.is_empty() {
+            "+".to_string()
+        } else {
+            format!("+{}", normalized)
+        }
     } else {
-        trimmed.chars().filter(|c| c.is_ascii_digit()).collect()
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        digits.trim_start_matches('0').to_string()
     }
 }
 
@@ -913,7 +918,7 @@ async fn phone_numbers_import(
     let entries: Vec<(String, String)> = payload
         .entries
         .into_iter()
-        .map(|e| (e.iccid, e.msisdn))
+        .map(|e| (e.iccid, normalize_msisdn(&e.msisdn)))
         .collect();
 
     let task = get_phone_number_task().clone();

@@ -68,6 +68,18 @@
     return isNaN(n) ? Infinity : n;
   }
 
+  function normalizeMsisdn(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return '';
+
+    if (text.startsWith('+')) {
+      const digits = text.slice(1).replace(/\D/g, '').replace(/^0+/, '');
+      return digits ? `+${digits}` : '';
+    }
+
+    return text.replace(/\D/g, '').replace(/^0+/, '');
+  }
+
   // ── Status polling ─────────────────────────────────────────────────────────
   async function pollStatus() {
     try {
@@ -101,7 +113,10 @@
     const lines = text.split(/\r?\n/).filter(l => l.trim());
     return lines.map(line => {
       const parts = line.split(',').map(s => s.trim());
-      return { iccid: parts[0] ?? '', msisdn: parts[1] ?? '' };
+      return {
+        iccid: parts[0] ?? '',
+        msisdn: normalizeMsisdn(parts[1] ?? ''),
+      };
     }).filter(e => e.iccid && e.msisdn);
   }
 
@@ -172,9 +187,10 @@
       const seen = new Set(existing.map(e => `${e.iccid},${e.msisdn}`));
 
       for (const row of rows) {
-        const key = `${row.iccid},${row.msisdn}`;
+        const normalizedMsisdn = normalizeMsisdn(row.msisdn);
+        const key = `${row.iccid},${normalizedMsisdn}`;
         if (!seen.has(key)) {
-          existing.push({ iccid: row.iccid, msisdn: row.msisdn });
+          existing.push({ iccid: row.iccid, msisdn: normalizedMsisdn });
           seen.add(key);
         }
       }

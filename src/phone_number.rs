@@ -44,6 +44,25 @@ pub fn new_task_handle() -> TaskHandle {
     Arc::new(RwLock::new(PhoneNumberTask::default()))
 }
 
+fn normalize_import_msisdn(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .collect();
+
+    if let Some(rest) = cleaned.strip_prefix('+') {
+        let digits = rest.trim_start_matches('0');
+        if digits.is_empty() {
+            "+".to_string()
+        } else {
+            format!("+{}", digits)
+        }
+    } else {
+        cleaned.trim_start_matches('0').to_string()
+    }
+}
+
 /// Batch import phone numbers from `(iccid, msisdn)` pairs.
 pub async fn import_phone_numbers(
     mm: Arc<ModemManager>,
@@ -62,15 +81,27 @@ pub async fn import_phone_numbers(
     }
 
     for (idx, (iccid, msisdn)) in entries.iter().enumerate() {
-        let msisdn_clean: String = msisdn
-            .trim()
-            .chars()
-            .filter(|c| c.is_ascii_digit() || *c == '+')
-            .collect();
+        let msisdn_clean = normalize_import_msisdn(msisdn);
 
         {
             let mut t = task.write().await;
             t.current = format!("正在导入 ICCID {} → {}", iccid, msisdn_clean);
+        }
+
+        if msisdn_clean.trim_start_matches('+').is_empty() {
+            let result = PhoneResult {
+                com_port: String::new(),
+                sim_id: iccid.clone(),
+                phone_number: None,
+                status: PhoneResultStatus::Failed,
+                message: "手机号格式无效".to_string(),
+            };
+
+            let mut t = task.write().await;
+            t.errors.push(format!("{}: {}", iccid, result.message));
+            t.results.push(result);
+            t.done = idx + 1;
+            continue;
         }
 
         let result = if let Some(sim_id) = find_sim_id_by_iccid(iccid).await {

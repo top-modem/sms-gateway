@@ -552,7 +552,8 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
     }
 
     // Append stubs for ports that failed to open at startup
-    for (com_port, baud_rate) in &modem_manager.unavailable_ports {
+    let unavailable_ports = modem_manager.unavailable_ports.read().await.clone();
+    for (com_port, baud_rate) in unavailable_ports {
         details.push(json!({
             "available": false,
             "sim_id": null,

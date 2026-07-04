@@ -50,7 +50,7 @@ pub struct ModemManager {
     sim_cards_cache: Arc<RwLock<HashMap<String, SimCard>>>,
     _initialization_semaphore: Arc<Semaphore>,
     /// COM ports that are not currently usable (com_port, baud_rate)
-    pub unavailable_ports: Vec<(String, u32)>,
+    pub unavailable_ports: RwLock<Vec<(String, u32)>>,
     /// Original device list so unavailable ports can be retried later.
     devices: Vec<crate::config::Device>,
 }
@@ -113,7 +113,7 @@ impl ModemManager {
             modems: Arc::new(RwLock::new(modems)),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
             _initialization_semaphore: Arc::new(Semaphore::new(3)),
-            unavailable_ports,
+            unavailable_ports: RwLock::new(unavailable_ports),
             devices: config.devices.clone(),
         };
 
@@ -367,7 +367,7 @@ impl ModemManager {
     /// Demotes real-ICCID modems where +CCID returns a different or missing ICCID.
     /// Periodically attempts to reopen ports listed in `unavailable_ports`.
     pub async fn recheck_fallback_modems(
-        &mut self,
+        &self,
         sms_storage_map: &std::collections::HashMap<String, Option<crate::config::SmsStorage>>,
         sse_manager: Arc<SseManager>,
         _webhook_manager: Option<webhook::WebhookManager>,
@@ -415,16 +415,15 @@ impl ModemManager {
             if let Some(modem) = modems.remove(&iccid) {
                 let baud_rate = modem.baud_rate;
                 drop(modems);
-                let mut unavailable = self.unavailable_ports.clone();
+                let mut unavailable = self.unavailable_ports.write().await;
                 if !unavailable.iter().any(|(p, _)| p == &com_port) {
                     unavailable.push((com_port.clone(), baud_rate));
-                    self.unavailable_ports = unavailable;
                 }
             }
         }
 
         // ── Reconnection: try to reopen ports that were unavailable at startup ──
-        let unavailable_snapshot: Vec<(String, u32)> = self.unavailable_ports.clone();
+        let unavailable_snapshot: Vec<(String, u32)> = self.unavailable_ports.read().await.clone();
         let mut reconnected = Vec::new();
         for (com_port, baud_rate) in unavailable_snapshot {
             // Look up the original device configuration for sms_storage and index.
@@ -481,9 +480,8 @@ impl ModemManager {
             }
         }
         if !reconnected.is_empty() {
-            let mut unavailable = self.unavailable_ports.clone();
+            let mut unavailable = self.unavailable_ports.write().await;
             unavailable.retain(|(p, _)| !reconnected.contains(p));
-            self.unavailable_ports = unavailable;
         }
     }
 

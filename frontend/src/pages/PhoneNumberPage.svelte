@@ -18,6 +18,8 @@
   let importText = $state('');
   let importPreview = $state([]);
   let importRunning = $state(false);
+  let scanRunning = $state(false);
+  let scanSummary = $state('');
 
   // Exchange tabs
   let exchangeRunning = $state(false);
@@ -147,6 +149,47 @@
     } catch (e) {
       error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
       importRunning = false;
+    }
+  }
+
+  async function scanBarcode() {
+    scanRunning = true;
+    error = '';
+    scanSummary = '';
+
+    try {
+      const res = await apiClient.runBarcodeScannerAndRead();
+      const payload = res?.data ?? res ?? {};
+      const rows = Array.isArray(payload.entries) ? payload.entries : [];
+      const invalidCount = payload.invalid_count ?? 0;
+
+      if (rows.length === 0) {
+        scanSummary = $t('barcode_scan_empty');
+        return;
+      }
+
+      const existing = parseImportText(importText);
+      const seen = new Set(existing.map(e => `${e.iccid},${e.msisdn}`));
+
+      for (const row of rows) {
+        const key = `${row.iccid},${row.msisdn}`;
+        if (!seen.has(key)) {
+          existing.push({ iccid: row.iccid, msisdn: row.msisdn });
+          seen.add(key);
+        }
+      }
+
+      importText = existing.map(e => `${e.iccid},${e.msisdn}`).join('\n');
+      updatePreview();
+
+      scanSummary = $t('barcode_scan_launched_loaded', {
+        n: rows.length,
+        invalid: invalidCount,
+      });
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('barcode_scan_error');
+    } finally {
+      scanRunning = false;
     }
   }
 
@@ -327,23 +370,43 @@
             {/if}
 
             <div class="flex items-center justify-between">
-              <div class="text-sm text-gray-500 dark:text-gray-400">
+              <div class="text-sm text-gray-500 dark:text-gray-400 space-y-1">
                 {#if taskStatus.running && taskStatus.task_type === 'import'}
-                  {$t('import_progress', { done: taskStatus.done, total: taskStatus.total })}
+                  <div>{$t('import_progress', { done: taskStatus.done, total: taskStatus.total })}</div>
+                {/if}
+                {#if scanSummary}
+                  <div>{scanSummary}</div>
                 {/if}
               </div>
-              <button
-                onclick={startImport}
-                disabled={importRunning || importPreview.length === 0}
-                class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
-              >
-                {#if importRunning}
-                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
-                {:else}
-                  <Icon icon="carbon:document-import" class="w-4 h-4" />
-                {/if}
-                {$t('btn_start_import')}
-              </button>
+              <div class="flex items-center gap-2">
+                <button
+                  onclick={scanBarcode}
+                  disabled={scanRunning}
+                  class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
+                         text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-zinc-800
+                         hover:bg-gray-200 dark:hover:bg-zinc-700
+                         disabled:opacity-50 disabled:cursor-not-allowed transition"
+                >
+                  {#if scanRunning}
+                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                  {:else}
+                    <Icon icon="carbon:scan" class="w-4 h-4" />
+                  {/if}
+                  {$t('btn_scan_barcode')}
+                </button>
+                <button
+                  onclick={startImport}
+                  disabled={importRunning || importPreview.length === 0}
+                  class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                >
+                  {#if importRunning}
+                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                  {:else}
+                    <Icon icon="carbon:document-import" class="w-4 h-4" />
+                  {/if}
+                  {$t('btn_start_import')}
+                </button>
+              </div>
             </div>
           </div>
 

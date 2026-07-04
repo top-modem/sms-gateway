@@ -1,5 +1,5 @@
 use fancy_regex::Regex;
-use std::{convert::Infallible, sync::Arc, sync::OnceLock, time::Duration};
+use std::{collections::HashSet, convert::Infallible, path::PathBuf, sync::Arc, sync::OnceLock, time::Duration};
 
 use axum::{
     extract::{Path, Query, State},
@@ -33,6 +33,12 @@ static PHONE_NUMBER_TASK: OnceLock<TaskHandle> = OnceLock::new();
 struct CallState {
     mm: ModemManagerRef,
     sse: Arc<SseManager>,
+}
+
+#[derive(Clone)]
+struct BarcodeState {
+    output_file: Option<String>,
+    launcher_path: Option<String>,
 }
 
 fn decode_sms_center(sms_center: &str) -> String {
@@ -108,7 +114,14 @@ pub async fn run_api(
     username: &str,
     password: &str,
     sse_manager: Arc<SseManager>,
+    barcode_output_file: Option<String>,
+    barcode_launcher_path: Option<String>,
 ) -> anyhow::Result<()> {
+    let barcode_state = BarcodeState {
+        output_file: barcode_output_file,
+        launcher_path: barcode_launcher_path,
+    };
+
     let api = Router::new()
         .route("/check", get(check))
         .route("/sms", get(get_sms_paginated))
@@ -162,6 +175,18 @@ pub async fn run_api(
         .route(
             "/phone-numbers/import",
             post(phone_numbers_import).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/phone-numbers/barcode-scan",
+            get(phone_numbers_barcode_scan).with_state(barcode_state.clone()),
+        )
+        .route(
+            "/phone-numbers/barcode-scan/launch",
+            post(phone_numbers_barcode_launch).with_state(barcode_state.clone()),
+        )
+        .route(
+            "/phone-numbers/barcode-scan/run",
+            post(phone_numbers_barcode_run).with_state(barcode_state.clone()),
         )
         .route(
             "/phone-numbers/call-exchange",
@@ -637,6 +662,248 @@ struct PhoneNumberUssdRequest {
 
 fn get_phone_number_task() -> &'static TaskHandle {
     PHONE_NUMBER_TASK.get_or_init(new_task_handle)
+}
+
+#[derive(Serialize)]
+struct BarcodeScanEntry {
+    iccid: String,
+    msisdn: String,
+}
+
+#[derive(Serialize)]
+struct BarcodeInvalidLine {
+    line_no: usize,
+    raw: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct BarcodeScanResponse {
+    source_file: String,
+    total_lines: usize,
+    valid_count: usize,
+    invalid_count: usize,
+    entries: Vec<BarcodeScanEntry>,
+    invalid_lines: Vec<BarcodeInvalidLine>,
+}
+
+fn resolve_barcode_output_file(configured: Option<&str>) -> PathBuf {
+    if let Some(path) = configured {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    let candidates = [
+        PathBuf::from("../bar_code/dist/号码.txt"),
+        PathBuf::from("../bar_code/号码.txt"),
+        PathBuf::from("./号码.txt"),
+    ];
+
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("../bar_code/dist/号码.txt"))
+}
+
+fn resolve_barcode_launcher_file(configured: Option<&str>) -> PathBuf {
+    if let Some(path) = configured {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    let candidates = [
+        PathBuf::from("../bar_code/dist/扫码枪录入程序.exe"),
+        PathBuf::from("../bar_code/扫码枪录入程序.exe"),
+        PathBuf::from("./扫码枪录入程序.exe"),
+    ];
+
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("../bar_code/dist/扫码枪录入程序.exe"))
+}
+
+fn normalize_msisdn(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('+') {
+        let mut out = String::from("+");
+        out.push_str(&trimmed[1..].chars().filter(|c| c.is_ascii_digit()).collect::<String>());
+        out
+    } else {
+        trimmed.chars().filter(|c| c.is_ascii_digit()).collect()
+    }
+}
+
+async fn phone_numbers_barcode_scan(State(state): State<BarcodeState>) -> Response {
+    let output_path = resolve_barcode_output_file(state.output_file.as_deref());
+    let source_file = output_path.to_string_lossy().to_string();
+
+    if !output_path.exists() {
+        let response = BarcodeScanResponse {
+            source_file,
+            total_lines: 0,
+            valid_count: 0,
+            invalid_count: 0,
+            entries: Vec::new(),
+            invalid_lines: Vec::new(),
+        };
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+
+    let bytes = match tokio::fs::read(&output_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to read barcode output file: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).to_string(),
+    };
+
+    let mut entries = Vec::new();
+    let mut invalid_lines = Vec::new();
+    let mut seen = HashSet::<(String, String)>::new();
+    let mut total_lines = 0usize;
+
+    for (idx, line) in content.lines().enumerate() {
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        total_lines += 1;
+
+        let mut parts = raw.splitn(2, ',').map(|s| s.trim());
+        let iccid_raw = parts.next().unwrap_or_default();
+        let msisdn_raw = parts.next().unwrap_or_default();
+
+        if iccid_raw.is_empty() || msisdn_raw.is_empty() {
+            invalid_lines.push(BarcodeInvalidLine {
+                line_no: idx + 1,
+                raw: raw.to_string(),
+                reason: "Expected format ICCID,MSISDN".to_string(),
+            });
+            continue;
+        }
+
+        let iccid: String = iccid_raw.chars().filter(|c| c.is_ascii_digit()).collect();
+        let msisdn = normalize_msisdn(msisdn_raw);
+
+        if !iccid.starts_with("8944") || iccid.len() != 20 {
+            invalid_lines.push(BarcodeInvalidLine {
+                line_no: idx + 1,
+                raw: raw.to_string(),
+                reason: "Invalid ICCID".to_string(),
+            });
+            continue;
+        }
+
+        if msisdn.trim_start_matches('+').is_empty() {
+            invalid_lines.push(BarcodeInvalidLine {
+                line_no: idx + 1,
+                raw: raw.to_string(),
+                reason: "Invalid MSISDN".to_string(),
+            });
+            continue;
+        }
+
+        if seen.insert((iccid.clone(), msisdn.clone())) {
+            entries.push(BarcodeScanEntry { iccid, msisdn });
+        }
+    }
+
+    let response = BarcodeScanResponse {
+        source_file,
+        total_lines,
+        valid_count: entries.len(),
+        invalid_count: invalid_lines.len(),
+        entries,
+        invalid_lines,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn phone_numbers_barcode_launch(State(state): State<BarcodeState>) -> Response {
+    let launcher_path = resolve_barcode_launcher_file(state.launcher_path.as_deref());
+    let launcher_str = launcher_path.to_string_lossy().to_string();
+
+    if !launcher_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Barcode scanner executable not found: {}", launcher_str)})),
+        )
+            .into_response();
+    }
+
+    match std::process::Command::new(&launcher_path).spawn() {
+        Ok(child) => (
+            StatusCode::OK,
+            Json(json!({"message": "Barcode scanner launched", "pid": child.id(), "path": launcher_str})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to launch barcode scanner: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn phone_numbers_barcode_run(State(state): State<BarcodeState>) -> Response {
+    let launcher_path = resolve_barcode_launcher_file(state.launcher_path.as_deref());
+    let launcher_str = launcher_path.to_string_lossy().to_string();
+
+    if !launcher_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Barcode scanner executable not found: {}", launcher_str)})),
+        )
+            .into_response();
+    }
+
+    let mut child = match std::process::Command::new(&launcher_path).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to launch barcode scanner: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let pid = child.id();
+    let wait_result = tokio::task::spawn_blocking(move || child.wait()).await;
+    match wait_result {
+        Ok(Ok(_status)) => {
+            let scan_resp = phone_numbers_barcode_scan(State(state)).await;
+            let mut response = scan_resp.into_response();
+            response
+                .headers_mut()
+                .insert("x-barcode-scanner-pid", header::HeaderValue::from_str(&pid.to_string()).unwrap_or(header::HeaderValue::from_static("0")));
+            response
+        }
+        Ok(Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Barcode scanner process wait failed: {}", e)})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Barcode scanner task join failed: {}", e)})),
+        )
+            .into_response(),
+    }
 }
 
 async fn phone_numbers_import(

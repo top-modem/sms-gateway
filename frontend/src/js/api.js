@@ -189,6 +189,18 @@ class ApiClient {
         return FetchApi.post('/api/phone-numbers/import', { entries });
     }
 
+    async getBarcodeScanEntries() {
+        return FetchApi.get('/api/phone-numbers/barcode-scan');
+    }
+
+    async launchBarcodeScanner() {
+        return FetchApi.post('/api/phone-numbers/barcode-scan/launch', {});
+    }
+
+    async runBarcodeScannerAndRead() {
+        return FetchApi.post('/api/phone-numbers/barcode-scan/run', {});
+    }
+
     async startCallExchange() {
         return FetchApi.post('/api/phone-numbers/call-exchange');
     }

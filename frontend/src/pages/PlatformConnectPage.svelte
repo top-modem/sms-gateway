@@ -52,6 +52,54 @@
   let deleteResult = $state('');
   let deleteError = $state('');
 
+  // Prefer a country default inferred from SIM MCC (e.g. UK MCC 234/235 -> +44).
+  const mccToDialPrefix = {
+    '234': '+44',
+    '235': '+44',
+    '460': '+86',
+    '461': '+86',
+    '454': '+852',
+    '455': '+853',
+    '262': '+49',
+    '208': '+33',
+    '222': '+39',
+    '214': '+34',
+    '310': '+1',
+    '311': '+1',
+    '312': '+1',
+    '313': '+1',
+    '314': '+1',
+    '315': '+1',
+    '316': '+1',
+  };
+
+  function normalizePrefix(prefix) {
+    return String(prefix ?? '').replace(/\s+/g, '');
+  }
+
+  function matchCountryByDialPrefix(targetPrefix, list) {
+    if (!targetPrefix) return null;
+    const normalizedTarget = normalizePrefix(targetPrefix);
+    return list.find(c => {
+      const p = normalizePrefix(c.prefix);
+      return p === normalizedTarget || p.startsWith(`${normalizedTarget}/`) || p.startsWith(`${normalizedTarget},`);
+    }) ?? null;
+  }
+
+  function findCountryBySimMcc(simList, countryList) {
+    for (const sim of simList) {
+      const imsi = String(sim?.card?.imsi ?? '').trim();
+      if (imsi.length < 3) continue;
+      const mcc = imsi.slice(0, 3);
+      const dialPrefix = mccToDialPrefix[mcc];
+      if (!dialPrefix) continue;
+
+      const matched = matchCountryByDialPrefix(dialPrefix, countryList);
+      if (matched?.id) return matched.id;
+    }
+    return '';
+  }
+
   // ── Data fetching ──────────────────────────────────────────────────────────
   async function fetchData() {
     loading = true;
@@ -84,8 +132,13 @@
         const firstWithCountry = sims.find(s => s.card?.country_code);
         if (firstWithCountry) {
           selectedCountry = firstWithCountry.card.country_code;
-        } else if (countries.length > 0) {
-          selectedCountry = countries[0].id;
+        } else {
+          const mccDefaultCountry = findCountryBySimMcc(sims, countries);
+          if (mccDefaultCountry) {
+            selectedCountry = mccDefaultCountry;
+          } else if (countries.length > 0) {
+            selectedCountry = countries[0].id;
+          }
         }
       }
     } catch (e) {

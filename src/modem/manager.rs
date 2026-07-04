@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
+use tokio::task::JoinHandle;
 
 use crate::api::sse_manager::CallEvent;
 use crate::api::SseManager;
@@ -49,6 +50,8 @@ pub struct ModemManager {
     modems: Arc<RwLock<HashMap<String, Arc<Modem>>>>,
     sim_cards_cache: Arc<RwLock<HashMap<String, SimCard>>>,
     _initialization_semaphore: Arc<Semaphore>,
+    /// Background URC tasks keyed by SIM ID so they can be cancelled on demotion.
+    urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
     /// Original device list so unavailable ports can be retried later.
@@ -113,6 +116,7 @@ impl ModemManager {
             modems: Arc::new(RwLock::new(modems)),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
             _initialization_semaphore: Arc::new(Semaphore::new(3)),
+            urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(unavailable_ports),
             devices: config.devices.clone(),
         };
@@ -413,6 +417,9 @@ impl ModemManager {
         for (iccid, com_port) in demotions {
             let mut modems = self.modems.write().await;
             if let Some(modem) = modems.remove(&iccid) {
+                if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {
+                    task.abort();
+                }
                 let baud_rate = modem.baud_rate;
                 drop(modems);
                 let mut unavailable = self.unavailable_ports.write().await;
@@ -465,12 +472,15 @@ impl ModemManager {
                         cache.insert(sim_id.clone(), sim);
                     }
                     if let Some(modem) = self.get_modem(&sim_id).await {
-                        tokio::spawn(Self::run_urc_handler(
+                        let handle = tokio::spawn(Self::run_urc_handler(
                             sim_id.clone(),
                             modem,
                             sse_manager.clone(),
                             transcribe_cfg.clone(),
                         ));
+                        if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
+                            old.abort();
+                        }
                     }
                     reconnected.push(com_port);
                 }
@@ -917,9 +927,13 @@ impl ModemManager {
             let modem = modem.clone();
             let sse = sse_manager.clone();
             let cfg = transcribe_cfg.clone();
-            tokio::spawn(async move {
-                Self::run_urc_handler(sim_id, modem, sse, cfg).await;
+            let sim_id_for_task = sim_id.clone();
+            let handle = tokio::spawn(async move {
+                Self::run_urc_handler(sim_id_for_task, modem, sse, cfg).await;
             });
+            if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
+                old.abort();
+            }
         }
     }
 

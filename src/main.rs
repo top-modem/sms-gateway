@@ -246,7 +246,8 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
                                     match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
-                                        Ok(upload_resp) => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
                                         Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
                                     }
                                 }
@@ -260,7 +261,11 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                     if let Some(content) = result_item.get("Phone_SmsContent").and_then(|v| v.as_str()) {
                                                         if !content.is_empty() {
                                                             log::info!("[火狐狸轮询] 从平台获取到短信内容, 上传中 - 号码: {}, Item_ID: {}", phone_num, item_id);
-                                                            let _ = firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await;
+                                                            match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await {
+                                                                Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                                                Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
+                                                                Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
+                                                            }
                                                         }
                                                     }
                                                 }

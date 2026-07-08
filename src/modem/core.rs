@@ -1,4 +1,4 @@
-﻿use chrono::{Local, Timelike};
+﻿use chrono::{Timelike, Utc};
 use log::{debug, error, info};
 use std::io;
 use std::sync::Arc;
@@ -16,6 +16,14 @@ use crate::webhook;
 
 use super::pdu::{build_pdus, string_to_ucs2_pub};
 use super::types::*;
+
+/// All SMS timestamps (incoming and outgoing) are normalized to GMT+8 so they
+/// don't depend on the host OS's configured timezone. See also
+/// `decode::parse_timestamp`, which applies the same target offset when
+/// decoding incoming SMS-DELIVER PDU timestamps.
+fn now_gmt8() -> chrono::NaiveDateTime {
+    (Utc::now() + chrono::Duration::hours(8)).naive_utc()
+}
 
 const TERMINATORS: &[&[u8]] = &[
     b"\r\nOK\r\n",
@@ -69,10 +77,18 @@ pub struct Modem {
     reader_task: JoinHandle<()>,
     /// Command processor task handle so it does not outlive modem shutdown.
     command_task: JoinHandle<()>,
+    /// If true, force COPS 46001 when IMSI MCC is 234/235.
+    force_uk_mcc_to_46001: bool,
 }
 
 impl Modem {
-    pub async fn new(com_port: &str, baud_rate: u32, name: &str, index: usize) -> io::Result<Self> {
+    pub async fn new(
+        com_port: &str,
+        baud_rate: u32,
+        name: &str,
+        index: usize,
+        force_uk_mcc_to_46001: bool,
+    ) -> io::Result<Self> {
         let serial_stream = Self::create_serial_connection(com_port, baud_rate).await?;
         let (read_half, write_half_stream) = tokio::io::split(serial_stream);
 
@@ -129,6 +145,7 @@ impl Modem {
             outbound_call_answered: Arc::new(tokio::sync::Mutex::new(false)),
             reader_task,
             command_task,
+            force_uk_mcc_to_46001,
         })
     }
 
@@ -143,14 +160,41 @@ impl Drop for Modem {
 
 
 impl Modem {
+    const SERIAL_OPEN_TIMEOUT_SECS: u64 = 20;
+
     async fn create_serial_connection(
         com_port: &str,
         baud_rate: u32,
-    ) -> tokio_serial::Result<SerialStream> {
-        tokio_serial::new(com_port, baud_rate)
-            .timeout(Duration::from_secs(10))
-            .flow_control(tokio_serial::FlowControl::None)
-            .open_native_async()
+    ) -> io::Result<SerialStream> {
+        let port_name = com_port.to_string();
+        let port_name_for_err = port_name.clone();
+        let open_task = tokio::task::spawn_blocking(move || {
+            tokio_serial::new(&port_name, baud_rate)
+                .timeout(Duration::from_secs(10))
+                .flow_control(tokio_serial::FlowControl::None)
+                .open_native_async()
+                .map_err(|e| io::Error::other(format!("Failed to open {}: {}", port_name, e)))
+        });
+
+        match tokio::time::timeout(Duration::from_secs(Self::SERIAL_OPEN_TIMEOUT_SECS), open_task)
+            .await
+        {
+            Ok(joined) => match joined {
+                Ok(result) => result,
+                Err(e) => Err(io::Error::other(format!(
+                    "Serial open worker failed for {}: {}",
+                    port_name_for_err, e
+                ))),
+            },
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Opening serial port {} timed out after {}s",
+                    com_port,
+                    Self::SERIAL_OPEN_TIMEOUT_SECS
+                ),
+            )),
+        }
     }
 
     // ─── Background reader task ────────────────────────────────────────────────
@@ -500,6 +544,10 @@ impl Modem {
         let iccid = iccid_result.ok().flatten();
         let imsi = imsi_result.ok().flatten();
         let phone_number = phone_result.ok().flatten();
+        let should_force_china_unicom = self.force_uk_mcc_to_46001
+            && imsi
+            .as_deref()
+            .is_some_and(|v| v.starts_with("234") || v.starts_with("235"));
 
         if let Some(iccid) = iccid {
             match SimCard::find_or_create_with_phone(&iccid, imsi, phone_number).await {
@@ -509,6 +557,20 @@ impl Modem {
                         "SIM card initialized for device {}: ICCID={}",
                         self.name, iccid
                     );
+
+                    if should_force_china_unicom {
+                        if let Err(e) = self.send_cops_command().await {
+                            log::warn!(
+                                "Failed to force operator 46001 for UK MCC SIM on device {}: {}",
+                                self.name, e
+                            );
+                        } else {
+                            info!(
+                                "Forced operator 46001 for UK MCC SIM on device {}",
+                                self.name
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Failed to store SIM card info: {}", e);
@@ -520,6 +582,34 @@ impl Modem {
         }
 
         Ok(())
+    }
+
+    /// Send AT+COPS command with extended timeout (45s) since network registration
+    /// can take longer when the device is searching for operators, especially for
+    /// forced operator selection on UK MCC SIMs (234/235 -> 46001).
+    async fn send_cops_command(&self) -> io::Result<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
+
+        let at_command = ATCommand {
+            command: "AT+COPS=1,2,\"46001\"\r\n".to_string(),
+            response_tx: tx,
+            _priority: 5,
+            retries: 0,
+        };
+
+        self.command_tx
+            .send(at_command)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Command queue closed"))?;
+
+        // Use 45-second timeout instead of default 8 seconds
+        match tokio::time::timeout(Duration::from_secs(45), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "Response channel closed")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "AT+COPS command timed out after 45s",
+            )),
+        }
     }
 
     async fn send_command_priority(&self, command: &str, priority: u8) -> io::Result<String> {
@@ -664,7 +754,7 @@ impl Modem {
         let sms = Sms {
             id: 0,
             contact_id: contact.id.clone(),
-            timestamp: Local::now().naive_local().with_nanosecond(0).unwrap(),
+            timestamp: now_gmt8().with_nanosecond(0).unwrap(),
             message: message.to_string(),
             sim_id,
             send: true,
@@ -740,27 +830,104 @@ impl Modem {
 
         // ── Upload received SMS to 火狐狸 platform ────────────────
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
-        if !sim_id.is_empty() {
-            if let Ok(cards) = SimCard::query_all().await {
-                if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
-                    if let (Some(country_id), Some(phone_num)) = (&card.country_code, &card.phone_number) {
-                        if let Ok(api_key) = crate::db::AppSetting::get("firefox_api_key").await {
-                            if let Some(api_key) = api_key {
-                                let client = reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(10))
-                                    .build()
-                                    .unwrap_or_default();
-                                for sms in &sms_list {
-                                    if !sms.send {
-                                        let _ = crate::firefox_api::upload_sms(
-                                            &client, &api_key,
-                                            country_id, phone_num, &sms.message,
-                                        ).await;
+        if sim_id.is_empty() {
+            log::warn!("Skipping 火狐狸 SMS upload: SIM ID is empty on device {}", self.name);
+        } else {
+            match SimCard::query_all().await {
+                Ok(cards) => {
+                    if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
+                        if let (Some(country_id), Some(phone_num)) = (&card.country_code, &card.phone_number) {
+                            match crate::db::AppSetting::get("firefox_api_key").await {
+                                Ok(Some(api_key)) => {
+                                    match reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(10))
+                                        .build()
+                                    {
+                                        Ok(client) => {
+                                            for sms in &sms_list {
+                                                if sms.send {
+                                                    continue;
+                                                }
+                                                match crate::firefox_api::upload_sms(
+                                                    &client,
+                                                    &api_key,
+                                                    country_id,
+                                                    phone_num,
+                                                    &sms.message,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(resp) if resp.code == "1" => {
+                                                        info!(
+                                                            "[{}] Uploaded incoming SMS to 火狐狸: phone={}, code={}, data={:?}",
+                                                            sim_id,
+                                                            phone_num,
+                                                            resp.code,
+                                                            resp.data
+                                                        );
+                                                    }
+                                                    Ok(resp) => {
+                                                        log::warn!(
+                                                            "[{}] Failed to upload incoming SMS to 火狐狸 (platform rejected): phone={}, code={}, data={:?}",
+                                                            sim_id,
+                                                            phone_num,
+                                                            resp.code,
+                                                            resp.data
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "[{}] Failed to upload incoming SMS to 火狐狸: phone={}, error={}",
+                                                            sim_id,
+                                                            phone_num,
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "[{}] Failed to build HTTP client for 火狐狸 SMS upload: {}",
+                                                sim_id,
+                                                e
+                                            );
+                                        }
                                     }
                                 }
+                                Ok(None) => {
+                                    log::warn!(
+                                        "[{}] Skipping 火狐狸 SMS upload: app_settings.firefox_api_key is not set",
+                                        sim_id
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[{}] Skipping 火狐狸 SMS upload: failed to read firefox_api_key: {}",
+                                        sim_id,
+                                        e
+                                    );
+                                }
                             }
+                        } else {
+                            log::warn!(
+                                "[{}] Skipping 火狐狸 SMS upload: SIM card missing country_code or phone_number",
+                                sim_id
+                            );
                         }
+                    } else {
+                        log::warn!(
+                            "[{}] Skipping 火狐狸 SMS upload: SIM card record not found in database",
+                            sim_id
+                        );
                     }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Skipping 火狐狸 SMS upload: failed to query sim_cards: {}",
+                        sim_id,
+                        e
+                    );
                 }
             }
         }
@@ -801,20 +968,37 @@ impl Modem {
     /// never return data; this catches them before we waste time on longer
     /// commands.
     pub async fn is_responsive(&self) -> bool {
-        let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
-        let command = ATCommand {
-            command: "AT\r\n".to_string(),
-            response_tx: tx,
-            _priority: 5,
-            retries: 0,
-        };
-        if self.command_tx.send(command).is_err() {
-            return false;
+        const PROBE_ATTEMPTS: usize = 2;
+
+        for attempt in 0..PROBE_ATTEMPTS {
+            let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
+            let command = ATCommand {
+                command: "AT\r\n".to_string(),
+                response_tx: tx,
+                _priority: 5,
+                // Start at MAX_RETRIES so command_processor performs a single
+                // quick probe attempt instead of 4 long timeout retries.
+                retries: MAX_RETRIES,
+            };
+            if self.command_tx.send(command).is_err() {
+                return false;
+            }
+
+            let ok = matches!(
+                tokio::time::timeout(Duration::from_secs(5), rx).await,
+                Ok(Ok(Ok(resp))) if resp.trim().contains("OK")
+            );
+
+            if ok {
+                return true;
+            }
+
+            if attempt + 1 < PROBE_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
         }
-        match tokio::time::timeout(Duration::from_secs(3), rx).await {
-            Ok(Ok(Ok(resp))) => resp.trim().contains("OK"),
-            _ => false,
-        }
+
+        false
     }
 
     pub async fn get_signal_quality(&self) -> io::Result<Option<SignalQuality>> {
@@ -949,7 +1133,7 @@ impl Modem {
         let sms = Sms {
             id: 0,
             contact_id: contact.id.clone(),
-            timestamp: Local::now().naive_local().with_nanosecond(0).unwrap(),
+            timestamp: now_gmt8().with_nanosecond(0).unwrap(),
             message: message.to_string(),
             sim_id,
             send: true,

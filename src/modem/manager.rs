@@ -1,4 +1,5 @@
 use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use log::{error, info};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,42 +57,145 @@ pub struct ModemManager {
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
     /// Original device list so unavailable ports can be retried later.
     devices: Vec<crate::config::Device>,
+    /// If true, UK MCC SIMs (234/235) will force COPS 46001 during SIM init.
+    force_uk_mcc_to_46001: bool,
+    /// Transient AT+CCID probe failures before a modem is considered truly unavailable.
+    sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
 }
 
+const SIM_PROBE_FAILURE_THRESHOLD: u8 = 3;
+
 impl ModemManager {
+    async fn initialize_single_modem_safe(
+        port: String,
+        baud_rate: u32,
+        device_id: String,
+        sms_storage: Option<SmsStorage>,
+        index: usize,
+        force_uk_mcc_to_46001: bool,
+    ) -> anyhow::Result<(String, Modem, bool)> {
+        const INIT_TIMEOUT_SECS: u64 = 45;
+
+        // Some serial stack failures on Windows can panic internally while opening a COM port.
+        // Catch unwind here so one bad port cannot terminate the whole process.
+        let init_future = tokio::time::timeout(
+            Duration::from_secs(INIT_TIMEOUT_SECS),
+            Self::initialize_single_modem(
+                port.clone(),
+                baud_rate,
+                device_id,
+                sms_storage,
+                index,
+                force_uk_mcc_to_46001,
+            ),
+        );
+
+        let result = std::panic::AssertUnwindSafe(init_future)
+        .catch_unwind()
+        .await;
+
+        match result {
+            Ok(Ok(v)) => v,
+            Ok(Err(_elapsed)) => Err(anyhow::anyhow!(
+                "Modem initialization timed out after {}s on port {}",
+                INIT_TIMEOUT_SECS,
+                port
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "Modem initialization panicked on port {} (likely serial driver/runtime issue)",
+                port
+            )),
+        }
+    }
+
     pub async fn initialize(config: &crate::config::AppConfig) -> anyhow::Result<Self> {
-        // Initialize ports sequentially (not concurrently).  In this deployment
-        // many COM ports share the same USB hub / serial concentrator; issuing
-        // AT commands to several ports at the same time causes command timeouts
-        // and makes the service hang during startup.
+        let force_uk_mcc_to_46001 = config.settings.force_uk_mcc_to_46001.unwrap_or(true);
+        let max_concurrent = config.settings.max_concurrent_modem_init.unwrap_or(1);
+        
+        // 0 or 1 = serial initialization (safest for USB hubs with shared resources)
+        // 2+ = parallel initialization with semaphore to limit concurrent AT commands
+        let is_serial = max_concurrent <= 1;
+
         let mut modems = HashMap::new();
         let mut new_sim_ids = Vec::new();
         let mut unavailable_ports: Vec<(String, u32)> = Vec::new();
 
-        for (index, device) in config.devices.iter().enumerate() {
-            let port = device.com_port.clone();
-            let baud_rate = device.baud_rate;
-            let sms_storage = device.sms_storage.or(config.settings.sms_storage);
-            let temp_device_id = format!("device_{}", index);
+        if is_serial {
+            info!("Initializing modems serially (max_concurrent_modem_init={})", max_concurrent);
+            // Initialize ports sequentially (not concurrently).  In this deployment
+            // many COM ports share the same USB hub / serial concentrator; issuing
+            // AT commands to several ports at the same time causes command timeouts
+            // and makes the service hang during startup.
+            for (index, device) in config.devices.iter().enumerate() {
+                let port = device.com_port.clone();
+                let baud_rate = device.baud_rate;
+                let sms_storage = device.sms_storage.or(config.settings.sms_storage);
+                let temp_device_id = format!("device_{}", index);
 
-            match Self::initialize_single_modem(
-                port.clone(),
-                baud_rate,
-                temp_device_id,
-                sms_storage,
-                index,
-            )
-            .await
-            {
-                Ok((sim_id, modem, is_new)) => {
-                    if is_new {
-                        new_sim_ids.push(sim_id.clone());
+                match Self::initialize_single_modem_safe(
+                    port.clone(),
+                    baud_rate,
+                    temp_device_id,
+                    sms_storage,
+                    index,
+                    force_uk_mcc_to_46001,
+                )
+                .await
+                {
+                    Ok((sim_id, modem, is_new)) => {
+                        if is_new {
+                            new_sim_ids.push(sim_id.clone());
+                        }
+                        modems.insert(sim_id, Arc::new(modem));
                     }
-                    modems.insert(sim_id, Arc::new(modem));
+                    Err(e) => {
+                        error!("Failed to initialize modem on {}: {}", port, e);
+                        unavailable_ports.push((port, baud_rate));
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to initialize modem on {}: {}", port, e);
-                    unavailable_ports.push((port, baud_rate));
+            }
+        } else {
+            info!("Initializing modems in parallel (max_concurrent_modem_init={})", max_concurrent);
+            // Parallel initialization with semaphore to limit concurrent AT commands
+            let semaphore = Arc::new(Semaphore::new(max_concurrent));
+            let mut init_futures = FuturesUnordered::new();
+
+            for (index, device) in config.devices.iter().enumerate() {
+                let port = device.com_port.clone();
+                let baud_rate = device.baud_rate;
+                let sms_storage = device.sms_storage.or(config.settings.sms_storage);
+                let temp_device_id = format!("device_{}", index);
+                let sem = semaphore.clone();
+
+                init_futures.push(async move {
+                    let _permit = sem.acquire().await;
+                    let result = Self::initialize_single_modem_safe(
+                        port.clone(),
+                        baud_rate,
+                        temp_device_id,
+                        sms_storage,
+                        index,
+                        force_uk_mcc_to_46001,
+                    )
+                    .await;
+                    (port, result)
+                });
+            }
+
+            while let Some((port, result)) = init_futures.next().await {
+                match result {
+                    Ok((sim_id, modem, is_new)) => {
+                        if is_new {
+                            new_sim_ids.push(sim_id.clone());
+                        }
+                        modems.insert(sim_id, Arc::new(modem));
+                    }
+                    Err(e) => {
+                        error!("Failed to initialize modem on {}: {}", port, e);
+                        if let Some(device) = config.devices.iter().find(|d| d.com_port == port) {
+                            unavailable_ports.push((port, device.baud_rate));
+                        }
+                    }
                 }
             }
         }
@@ -119,6 +223,8 @@ impl ModemManager {
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(unavailable_ports),
             devices: config.devices.clone(),
+            force_uk_mcc_to_46001,
+            sim_probe_fail_counts: RwLock::new(HashMap::new()),
         };
 
         manager.init_sim_cache().await?;
@@ -136,19 +242,27 @@ impl ModemManager {
         device_id: String,
         sms_storage: Option<SmsStorage>,
         index: usize,
+        force_uk_mcc_to_46001: bool,
     ) -> anyhow::Result<(String, Modem, bool)> {
         info!("Initializing modem on port {}", port);
 
-        let modem = Modem::new(&port, baud_rate, &device_id, index).await?;
+        let modem = Modem::new(
+            &port,
+            baud_rate,
+            &device_id,
+            index,
+            force_uk_mcc_to_46001,
+        )
+        .await?;
 
         // Some virtual COM ports open but are not backed by a real modem.
-        // Verify the modem actually responds before issuing longer commands.
+        // Keep this probe as advisory only: certain healthy modems can miss the
+        // first quick AT check right after opening and then respond normally.
         if !modem.is_responsive().await {
             log::warn!(
-                "Modem on port {} is not responding to AT commands. Treating as unavailable.",
+                "Modem on port {} did not pass initial quick AT probe; continuing with ICCID/init checks.",
                 port
             );
-            return Err(anyhow::anyhow!("Modem not responsive to AT commands"));
         }
 
         let pre_sim_id = match modem.get_sim_iccid().await {
@@ -386,32 +500,66 @@ impl ModemManager {
                 .collect()
         };
 
+        #[derive(Debug)]
+        enum ProbeOutcome {
+            Healthy { iccid: String },
+            Swap { iccid: String, com_port: String },
+            MissingOrError { iccid: String, com_port: String },
+        }
+
         let mut demotion_futs = FuturesUnordered::new();
         for (iccid, modem) in active_entries {
             demotion_futs.push(async move {
                 match modem.get_sim_iccid().await {
-                    Ok(Some(current_iccid)) if current_iccid == iccid => None,
+                    Ok(Some(current_iccid)) if current_iccid == iccid => ProbeOutcome::Healthy { iccid },
                     Ok(Some(current_iccid)) => {
                         info!(
                             "SIM swap detected on {} (was {}, now {}). Forcing re-init.",
                             modem.com_port, iccid, current_iccid
                         );
-                        Some((iccid, modem.com_port.clone()))
+                        ProbeOutcome::Swap { iccid, com_port: modem.com_port.clone() }
                     }
                     _ => {
-                        info!(
-                            "SIM removed from {} (was {}). Marking port as unavailable.",
-                            modem.com_port, iccid
-                        );
-                        Some((iccid, modem.com_port.clone()))
+                        ProbeOutcome::MissingOrError { iccid, com_port: modem.com_port.clone() }
                     }
                 }
             });
         }
-        let mut demotions = Vec::new();
+        let mut demotions: Vec<(String, String)> = Vec::new();
         while let Some(result) = demotion_futs.next().await {
-            if let Some(d) = result {
-                demotions.push(d);
+            match result {
+                ProbeOutcome::Healthy { iccid } => {
+                    self.sim_probe_fail_counts.write().await.remove(&iccid);
+                }
+                ProbeOutcome::Swap { iccid, com_port } => {
+                    self.sim_probe_fail_counts.write().await.remove(&iccid);
+                    demotions.push((iccid, com_port));
+                }
+                ProbeOutcome::MissingOrError { iccid, com_port } => {
+                    let failures = {
+                        let mut fail_counts = self.sim_probe_fail_counts.write().await;
+                        let count = fail_counts.entry(iccid.clone()).or_insert(0);
+                        *count = count.saturating_add(1);
+                        *count
+                    };
+
+                    if failures >= SIM_PROBE_FAILURE_THRESHOLD {
+                        info!(
+                            "SIM probe failed {} times on {} (was {}). Marking port as unavailable.",
+                            failures, com_port, iccid
+                        );
+                        self.sim_probe_fail_counts.write().await.remove(&iccid);
+                        demotions.push((iccid, com_port));
+                    } else {
+                        log::debug!(
+                            "Transient SIM probe failure {}/{} on {} (SIM {}). Keeping modem active.",
+                            failures,
+                            SIM_PROBE_FAILURE_THRESHOLD,
+                            com_port,
+                            iccid
+                        );
+                    }
+                }
             }
         }
         for (iccid, com_port) in demotions {
@@ -419,6 +567,13 @@ impl ModemManager {
             if let Some(modem) = modems.remove(&iccid) {
                 if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {
                     task.abort();
+                }
+                // Remove stale SIM card record so the dashboard doesn't show it
+                if let Err(e) = SimCard::delete_by_id(&iccid).await {
+                    log::warn!(
+                        "Failed to delete sim_cards record for {} on {}: {}",
+                        iccid, com_port, e
+                    );
                 }
                 let baud_rate = modem.baud_rate;
                 drop(modems);
@@ -447,12 +602,13 @@ impl ModemManager {
                         .unwrap_or(0)
                         .saturating_sub(1)
                 });
-            match Self::initialize_single_modem(
+            match Self::initialize_single_modem_safe(
                 com_port.clone(),
                 baud_rate,
                 format!("device_{}", index),
                 sms_storage,
                 index,
+                self.force_uk_mcc_to_46001,
             )
             .await
             {

@@ -9,8 +9,10 @@ class ApiClient {
      * Check authentication validity
      */
     async checkAuth() {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
         try {
-            const response = await FetchApi.get('/api/check');
+            const response = await FetchApi.get('/api/check', {}, undefined, { signal: controller.signal });
             return response.status === 204;
         } catch (error) {
             if (error.status === 401) {
@@ -18,9 +20,16 @@ class ApiClient {
                 sessionStorage.removeItem('auth');
                 window.location.reload();
             }
+            if (error?.name === 'AbortError') {
+                console.warn('Auth check timed out after 5s, falling back to unauthenticated state.');
+            }
             return false;
+        } finally {
+            clearTimeout(timeoutId);
         }
-    }    /**
+    }
+
+    /**
      * Get paginated SMS list
      * @param {number} [page=1] - Page number
      * @param {number} [perPage=10] - Number of items per page

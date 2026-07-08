@@ -1,4 +1,4 @@
-use chrono::NaiveDateTime;
+use chrono::{Duration, NaiveDateTime};
 use fancy_regex::Regex;
 use std::collections::HashMap;
 
@@ -524,8 +524,17 @@ fn decode_bcd(bytes: &[u8], len: usize) -> String {
         .collect()
 }
 
+/// Fixed offset (in hours) that all stored SMS timestamps are normalized to.
+/// The gateway and platform operate on GMT+8 (China Standard Time), so every
+/// incoming SMS timestamp — regardless of which SMSC/carrier timezone it was
+/// stamped with — is converted to GMT+8 before being stored/displayed.
+const TARGET_UTC_OFFSET_HOURS: i64 = 8;
+
+/// Parses a 7-octet GSM 03.40 SMS-DELIVER timestamp (YY MM DD HH MM SS TZ) and
+/// converts it to GMT+8, so all incoming SMS timestamps are consistent
+/// regardless of the sending SMSC's local timezone.
 fn parse_timestamp(bytes: &[u8]) -> NaiveDateTime {
-    let decode = |b| ((b & 0x0F) * 10) + (b >> 4);
+    let decode = |b: u8| ((b & 0x0F) * 10) + (b >> 4);
 
     let year = 2000 + decode(bytes[0]) as i32;
     let month = decode(bytes[1]) as u32;
@@ -534,12 +543,32 @@ fn parse_timestamp(bytes: &[u8]) -> NaiveDateTime {
     let minute = decode(bytes[4]) as u32;
     let second = decode(bytes[5]) as u32;
 
-    chrono::NaiveDate::from_ymd_opt(year, month, day)
+    let naive_local = chrono::NaiveDate::from_ymd_opt(year, month, day)
         .and_then(|date| date.and_hms_opt(hour, minute, second))
         .unwrap_or_else(|| {
             chrono::NaiveDate::from_ymd_opt(2025, 1, 1)
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
-        })
+        });
+
+    // Timezone octet (GSM 03.40 9.2.3.11): quarters of an hour offset from GMT.
+    // Semi-octets are swapped like the other date/time fields, but the MSB of
+    // the low nibble (which would otherwise be the tens digit) is instead the
+    // sign flag (1 = negative/west of GMT).
+    let tz_byte = bytes[6];
+    let tz_tens = (tz_byte & 0x07) as i64;
+    let tz_units = (tz_byte >> 4) as i64;
+    let quarter_hours = tz_tens * 10 + tz_units;
+    let is_negative = (tz_byte & 0x08) != 0;
+    let smsc_offset_minutes = if is_negative {
+        -quarter_hours * 15
+    } else {
+        quarter_hours * 15
+    };
+
+    // Convert SMSC-local time -> GMT -> target (GMT+8) so all stored
+    // timestamps use the same timezone no matter which network sent the SMS.
+    let gmt = naive_local - Duration::minutes(smsc_offset_minutes);
+    gmt + Duration::hours(TARGET_UTC_OFFSET_HOURS)
 }

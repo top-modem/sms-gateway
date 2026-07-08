@@ -32,6 +32,9 @@
             return;
         }
 
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+
         try {
             isLoading = true;
             error = "";
@@ -44,6 +47,7 @@
                     Authorization: `Basic ${authToken}`,
                     "Content-Type": "application/json",
                 },
+                signal: controller.signal,
             });
 
             switch (response.status) {
@@ -67,10 +71,15 @@
                     break;
             }
         } catch (err) {
-            error = err.message.includes("Failed to fetch")
-                ? $t('login_err_connect')
-                : $t('login_err_auth');
+            if (err?.name === "AbortError") {
+                error = $t('login_err_connect');
+            } else {
+                error = err.message.includes("Failed to fetch")
+                    ? $t('login_err_connect')
+                    : $t('login_err_auth');
+            }
         } finally {
+            clearTimeout(timeoutId);
             isLoading = false;
         }
     };

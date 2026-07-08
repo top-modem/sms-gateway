@@ -169,7 +169,7 @@ async fn recheck_fallback_worker(
 async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
     use std::collections::HashSet;
     let poll_interval = tokio::time::Duration::from_secs(3);
-    let mut processed_phones: HashSet<String> = HashSet::new();
+    let mut processed_tasks: HashSet<String> = HashSet::new();
     let mut heartbeat_count: u32 = 0;
 
     loop {
@@ -206,8 +206,10 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 continue;
                             }
 
+                            let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
+
                             // Skip if we already processed this item
-                            if processed_phones.contains(phone_num) {
+                            if processed_tasks.contains(&task_key) {
                                 // Still check result list for release status
                                 if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
                                     if let Some(data) = result_resp.data {
@@ -216,7 +218,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                 let is_ret = result_item.get("Phone_IsRet").and_then(|v| v.as_str()).unwrap_or("false");
                                                 let remark = result_item.get("Phone_Remark").and_then(|v| v.as_str()).unwrap_or("");
                                                 if is_ret == "True" || is_ret == "true" || !remark.is_empty() {
-                                                    processed_phones.remove(phone_num);
+                                                    processed_tasks.remove(&task_key);
                                                     log::info!("[火狐狸轮询] 任务已释放 - 号码: {}, Item_ID: {}, 备注: {}", phone_num, item_id, remark);
                                                 }
                                             }
@@ -234,7 +236,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Some(id) => id,
                                 None => {
                                     log::warn!("[火狐狸轮询] 未找到号码 {} 对应的 SIM 卡", phone_num);
-                                    processed_phones.insert(phone_num.to_string());
+                                    processed_tasks.insert(task_key.clone());
                                     continue;
                                 }
                             };
@@ -246,7 +248,8 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
                                     match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
-                                        Ok(upload_resp) => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
                                         Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
                                     }
                                 }
@@ -260,7 +263,11 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                     if let Some(content) = result_item.get("Phone_SmsContent").and_then(|v| v.as_str()) {
                                                         if !content.is_empty() {
                                                             log::info!("[火狐狸轮询] 从平台获取到短信内容, 上传中 - 号码: {}, Item_ID: {}", phone_num, item_id);
-                                                            let _ = firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await;
+                                                            match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await {
+                                                                Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                                                Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
+                                                                Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -271,7 +278,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Err(e) => log::warn!("[火狐狸轮询] 读取/查询短信失败 (SIM: {}): {}", sim_id, e),
                             }
 
-                            processed_phones.insert(phone_num.to_string());
+                            processed_tasks.insert(task_key);
                         }
                     }
                 }

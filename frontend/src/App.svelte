@@ -61,7 +61,11 @@
 </script>
 
 <div class="app-container">
-  {#if !$isAuthLoading}
+  {#if $isAuthLoading}
+    <div class="h-dvh w-screen flex items-center justify-center text-gray-500 dark:text-gray-400">
+      Loading...
+    </div>
+  {:else}
     <div class="h-dvh w-screen overflow-hidden">
       {#if $isAuthenticated}
 

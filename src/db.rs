@@ -712,9 +712,14 @@ impl SimCard {
 
     /// 5. 删除
     pub async fn delete(&self) -> Result<bool> {
+        SimCard::delete_by_id(&self.id).await
+    }
+
+    /// 5b. 根据 ID 删除
+    pub async fn delete_by_id(id: &str) -> Result<bool> {
         let pool = get_pool()?;
         let result = sqlx::query("DELETE FROM sim_cards WHERE id = ?")
-            .bind(&self.id)
+            .bind(id)
             .execute(pool)
             .await?;
         Ok(result.rows_affected() > 0)

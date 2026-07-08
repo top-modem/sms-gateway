@@ -1,0 +1,132 @@
+{
+  "info": {
+    "name": "SMS Gateway API",
+    "description": "API tests for SMS Gateway",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "AT Command - Send to COM3",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "const req = {",
+              "  command: pm.variables.get('command') || 'AT+CSQ'",
+              "};",
+              "pm.request.body.raw = JSON.stringify(req);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Basic {{auth}}",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"command\": \"AT+CSQ\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/at/{{com_port}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "at", "{{com_port}}"]
+        }
+      },
+      "response": [
+        {
+          "name": "Success",
+          "status": "OK",
+          "code": 200,
+          "header": [
+            { "key": "Content-Type", "value": "application/json" }
+          ],
+          "body": "{\n  \"response\": \"+CSQ: 20,0\\r\\n\\r\\nOK\\r\\n\"\n}"
+        },
+        {
+          "name": "Modem Not Found",
+          "status": "Bad Gateway",
+          "code": 502,
+          "header": [
+            { "key": "Content-Type", "value": "application/json" }
+          ],
+          "body": "{\n  \"error\": \"Modem not found on port: COM99\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "AT Command - Send custom command",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Basic {{auth}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"command\": \"AT+CGMM\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/at/{{com_port}}",
+          "host": ["{{base_url}}"],
+          "path": ["api", "at", "{{com_port}}"]
+        }
+      }
+    },
+    {
+      "name": "AT Command - All ports",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/sims/info",
+          "host": ["{{base_url}}"],
+          "path": ["api", "sims", "info"]
+        }
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "auth",
+      "value": "YWRtaW46YWRtaW4="
+    },
+    {
+      "key": "com_port",
+      "value": "COM3"
+    },
+    {
+      "key": "command",
+      "value": "AT+CSQ"
+    }
+  ]
+}

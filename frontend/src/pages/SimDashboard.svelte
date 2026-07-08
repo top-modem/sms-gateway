@@ -123,6 +123,7 @@
   let simStats   = $state([]);   // from /api/sims/stats (SMS counts)
   let loading    = $state(true);
   let error      = $state('');
+  let isFetching = false;
   let selected   = $state(new Set());
   let hoveredRow = $state(null);
 
@@ -181,6 +182,8 @@
 
   // ── Data fetching ─────────────────────────────────────────────────────────
   async function fetchData() {
+    if (isFetching) return;
+    isFetching = true;
     try {
       const [infoRes, cardsRes, statsRes] = await Promise.all([
         apiClient.getAllSimsInfo(),
@@ -193,6 +196,7 @@
     } catch (e) {
       error = e?.message ?? $t('err_load_sim');
     } finally {
+      isFetching = false;
       loading = false;
     }
   }
@@ -416,7 +420,7 @@
                   {#if info.available === false}
                     <span class="text-gray-400">—</span>
                   {:else}
-                    {info.model_info?.model ?? '—'}
+                    {info.model_info?.model === 'EC20F' ? '4G' : (info.model_info?.model ?? '—')}
                   {/if}
                 </td>
 

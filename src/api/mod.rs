@@ -219,7 +219,7 @@ pub async fn run_api(
         .route("/firefox/result-list", get(firefox_result_list))
         .route("/firefox/upload-sms", post(firefox_upload_sms))
         .route("/firefox/platform-items", get(firefox_platform_items))
-        .route("/firefox/platform-items/:item_id", get(firefox_platform_item_detail))
+        .route("/firefox/platform-items/{item_id}", get(firefox_platform_item_detail))
         .route("/firefox/platform-statistics", get(firefox_platform_statistics))
         // ── Voice call routes ─────────────────────────────────────────────
         .route(

@@ -192,6 +192,7 @@ const translations = {
 
     // Platform integration
     btn_connect_platform:     'Connect Platform',
+    btn_platform_stats:       'Platform Stats',
     platform_connect_title:   'Connect Platform',
     platform_api_key_title:   'Platform API Key',
     platform_api_key_desc:    'Enter your 火狐狸 platform API key to upload SIM numbers.',
@@ -449,6 +450,7 @@ const translations = {
 
     // Platform integration
     btn_connect_platform:     '接入平台',
+    btn_platform_stats:       '平台统计',
     platform_connect_title:   '接入平台',
     platform_api_key_title:   '平台 API Key',
     platform_api_key_desc:    '输入您的火狐狸平台 API Key，用于上传SIM号码。',

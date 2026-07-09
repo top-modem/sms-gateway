@@ -759,6 +759,10 @@ impl Modem {
             sim_id,
             send: true,
             status: crate::db::SmsStatus::Loading,
+            uploaded_to_platform: false,
+            platform_item_id: None,
+            platform_uploaded_at: None,
+            platform_response: None,
         };
 
         let sms_id = sms.insert().await?;
@@ -876,6 +880,18 @@ impl Modem {
                                                             resp.code,
                                                             resp.data
                                                         );
+                                                        // Try to find the local SMS record and mark it uploaded
+                                                        if let Ok(Some(db_sms)) = Sms::find_by_sim_and_message(
+                                                            &sim_id, &sms.message,
+                                                        ).await {
+                                                            if let Ok(Some(item_id)) = crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
+                                                                let _ = crate::db::Sms::mark_uploaded(
+                                                                    db_sms.id,
+                                                                    &item_id,
+                                                                    resp.data.as_deref(),
+                                                                ).await;
+                                                            }
+                                                        }
                                                     }
                                                     Ok(resp) => {
                                                         log::warn!(
@@ -1149,6 +1165,10 @@ impl Modem {
             sim_id,
             send: true,
             status: crate::db::SmsStatus::Loading,
+            uploaded_to_platform: false,
+            platform_item_id: None,
+            platform_uploaded_at: None,
+            platform_response: None,
         };
 
         let sms_id = sms.insert().await?;

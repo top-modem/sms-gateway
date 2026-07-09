@@ -12,8 +12,9 @@
   import SimSetPhonePage from "./pages/SimSetPhonePage.svelte";
   import PlatformConnectPage from "./pages/PlatformConnectPage.svelte";
   import PhoneNumberPage from "./pages/PhoneNumberPage.svelte";
+  import PlatformStatisticsPage from "./pages/PlatformStatisticsPage.svelte";
 
-  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone' | 'platform' | 'phonenumber'} */
+  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone' | 'platform' | 'phonenumber' | 'platform-stats'} */
   let currentPage = $state('sim');
   let filterSimId = $state(null);
 
@@ -44,6 +45,10 @@
 
   function goToPlatform() {
     currentPage = 'platform';
+  }
+
+  function goToPlatformStats() {
+    currentPage = 'platform-stats';
   }
 
   function goToPhoneNumber() {
@@ -78,6 +83,7 @@
               onNavigateSetPhone={goToSetPhone}
               onNavigatePlatform={goToPlatform}
               onNavigatePhoneNumber={goToPhoneNumber}
+              onNavigatePlatformStats={goToPlatformStats}
             />
           </div>
 
@@ -104,6 +110,11 @@
         {:else if currentPage === 'platform'}
           <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
             <PlatformConnectPage onBack={goToSim} />
+          </div>
+
+        {:else if currentPage === 'platform-stats'}
+          <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
+            <PlatformStatisticsPage onBack={goToSim} />
           </div>
 
         {:else if currentPage === 'phonenumber'}

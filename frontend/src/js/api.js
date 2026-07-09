@@ -234,6 +234,28 @@ class ApiClient {
     async deleteAllFromPlatform() {
         return FetchApi.post('/api/firefox/delete-all', {}, {}, 'application/json');
     }
+
+    /**
+     * Get all platform items tracked from the wait list.
+     */
+    async getFirefoxPlatformItems() {
+        return FetchApi.get('/api/firefox/platform-items');
+    }
+
+    /**
+     * Get detail of a platform item, including its SMS list.
+     * @param {string} itemId
+     */
+    async getFirefoxPlatformItemDetail(itemId) {
+        return FetchApi.get(`/api/firefox/platform-items/${itemId}`);
+    }
+
+    /**
+     * Get aggregated platform statistics (SMS count per item/phone).
+     */
+    async getFirefoxPlatformStatistics() {
+        return FetchApi.get('/api/firefox/platform-statistics');
+    }
 }
 
 // Export as a singleton

@@ -218,6 +218,9 @@ pub async fn run_api(
         .route("/firefox/wait-list", get(firefox_wait_list))
         .route("/firefox/result-list", get(firefox_result_list))
         .route("/firefox/upload-sms", post(firefox_upload_sms))
+        .route("/firefox/platform-items", get(firefox_platform_items))
+        .route("/firefox/platform-items/:item_id", get(firefox_platform_item_detail))
+        .route("/firefox/platform-statistics", get(firefox_platform_statistics))
         // ── Voice call routes ─────────────────────────────────────────────
         .route(
             "/calls",
@@ -1910,6 +1913,54 @@ async fn firefox_upload_sms(Json(request): Json<FirefoxUploadSmsRequest>) -> Res
     match firefox_api::upload_sms(&client, &api_key, &country_id, &phone_num, &sms_content).await {
         Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Upload SMS failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 12. Platform Items & Statistics ─────────────────────────────────────
+
+async fn firefox_platform_items() -> Response {
+    match crate::db::FirefoxPlatformItem::query_all().await {
+        Ok(items) => (StatusCode::OK, Json(json!(items))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query platform items: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn firefox_platform_item_detail(Path(item_id): Path<String>) -> Response {
+    let item_id = item_id.trim().to_string();
+    if item_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Item ID is required"}))).into_response();
+    }
+
+    match crate::db::FirefoxPlatformItem::query_by_item_id(&item_id).await {
+        Ok(items) => {
+            if items.is_empty() {
+                return (StatusCode::NOT_FOUND, Json(json!({"error": "Item not found"}))).into_response();
+            }
+            match crate::db::Sms::query_by_platform_item(&item_id).await {
+                Ok(sms_list) => (StatusCode::OK, Json(json!({
+                    "item_id": item_id,
+                    "items": items,
+                    "sms_list": sms_list,
+                }))).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query SMS: {}", e)}))).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query item: {}", e)}))).into_response(),
+    }
+}
+
+async fn firefox_platform_statistics() -> Response {
+    match crate::db::FirefoxPlatformItem::query_statistics().await {
+        Ok(stats) => (StatusCode::OK, Json(json!(stats))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query statistics: {}", e)})),
+        )
+            .into_response(),
     }
 }
 

@@ -432,20 +432,8 @@ impl ModemManager {
 
         ModemSMS::bulk_insert(&sms_list).await?;
 
-        let latest = sms_list
-            .into_iter()
-            .filter(|s| !s.send)
-            .max_by_key(|s| s.timestamp);
-
-        Ok(latest.map(|sms| Sms {
-            id: 0,
-            contact_id: sms.contact,
-            timestamp: sms.timestamp,
-            message: sms.message,
-            sim_id: sms.sim_id,
-            send: sms.send,
-            status: SmsStatus::Read,
-        }))
+        // Return the actual persisted SMS record from the database so callers have its id
+        Sms::find_latest_incoming_by_sim_id(sim_id).await.map_err(Into::into)
     }
 
     pub async fn read_all_sms_async(

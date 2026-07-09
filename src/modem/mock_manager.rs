@@ -170,6 +170,10 @@ impl ModemManager {
                     } else {
                         SmsStatus::Unread
                     },
+                    uploaded_to_platform: false,
+                    platform_item_id: None,
+                    platform_uploaded_at: None,
+                    platform_response: None,
                 };
                 let _ = sms.insert().await?;
             }
@@ -200,6 +204,10 @@ impl ModemManager {
             sim_id: sim_id.to_string(),
             send: true,
             status: SmsStatus::Read,
+            uploaded_to_platform: false,
+            platform_item_id: None,
+            platform_uploaded_at: None,
+            platform_response: None,
         };
 
         let sms_id = sms.insert().await?;

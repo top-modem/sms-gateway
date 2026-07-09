@@ -206,6 +206,11 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 continue;
                             }
 
+                            // Persist/refresh platform item
+                            if let Err(e) = crate::db::FirefoxPlatformItem::upsert(&item_id, country_id, phone_num).await {
+                                log::warn!("[火狐狸轮询] 保存平台 item 失败: item_id={}, phone={}, error={}", item_id, phone_num, e);
+                            }
+
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
 
                             // Skip if we already processed this item
@@ -248,7 +253,13 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
                                     match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
-                                        Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) if upload_resp.code == "1" => {
+                                            log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp);
+                                            let resp_data = upload_resp.data.as_deref();
+                                            if let Err(e) = crate::db::Sms::mark_uploaded(sms.id, &item_id, resp_data).await {
+                                                log::warn!("[火狐狸轮询] 标记 SMS 上传状态失败: id={}, error={}", sms.id, e);
+                                            }
+                                        }
                                         Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
                                         Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
                                     }

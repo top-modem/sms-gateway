@@ -25,6 +25,10 @@ pub struct Sms {
     pub sim_id: String,
     pub send: bool,
     pub status: SmsStatus,
+    pub uploaded_to_platform: bool,
+    pub platform_item_id: Option<String>,
+    pub platform_uploaded_at: Option<NaiveDateTime>,
+    pub platform_response: Option<String>,
 }
 
 /// SMS row with contact name resolved — used for inbox/sent list view.
@@ -327,7 +331,8 @@ impl Sms {
 
         let sms_list = sqlx::query_as(
             r#"
-            SELECT id, contact_id, timestamp, message, sim_id, send, status
+            SELECT id, contact_id, timestamp, message, sim_id, send, status, 
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
@@ -357,7 +362,8 @@ impl Sms {
 
         let sms_list = sqlx::query_as(
             r#"
-            SELECT id, contact_id, timestamp, message, sim_id, send, status
+            SELECT id, contact_id, timestamp, message, sim_id, send, status, 
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
             WHERE contact_id = ?
             ORDER BY timestamp DESC, id DESC
@@ -430,8 +436,9 @@ impl Sms {
         let pool = get_pool()?;
         let sms_id = sqlx::query_scalar::<_, i64>(
             r#"
-            INSERT INTO sms (contact_id, timestamp, message, sim_id, send, status)
-            VALUES (?, ?, ?, ?, ?, ?) RETURNING id
+            INSERT INTO sms (contact_id, timestamp, message, sim_id, send, status,
+                             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
             "#,
         )
         .bind(&self.contact_id)
@@ -440,6 +447,10 @@ impl Sms {
         .bind(&self.sim_id)
         .bind(self.send)
         .bind(self.status as i32)
+        .bind(self.uploaded_to_platform)
+        .bind(&self.platform_item_id)
+        .bind(self.platform_uploaded_at)
+        .bind(&self.platform_response)
         .fetch_one(pool)
         .await?;
 
@@ -450,7 +461,8 @@ impl Sms {
         let mut tx = pool.begin().await?;
         let sms_list = sqlx::query_as(
             r#"
-            SELECT id, contact_id, timestamp, message, sim_id, send, status
+            SELECT id, contact_id, timestamp, message, sim_id, send, status, 
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
             WHERE contact_id = ? AND status = ?
             ORDER BY timestamp DESC
@@ -481,7 +493,8 @@ impl Sms {
         let pool = get_pool()?;
         let sms = sqlx::query_as(
             r#"
-            SELECT id, contact_id, timestamp, message, sim_id, send, status
+            SELECT id, contact_id, timestamp, message, sim_id, send, status, 
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms
             WHERE sim_id = ? AND send = 0
             ORDER BY timestamp DESC, id DESC
@@ -918,6 +931,173 @@ impl FirefoxBatchUpload {
     }
 }
 
+impl Sms {
+    /// Mark an SMS as uploaded to the platform.
+    pub async fn mark_uploaded(
+        id: i64,
+        item_id: &str,
+        response: Option<&str>,
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            "UPDATE sms SET uploaded_to_platform = 1, platform_item_id = ?, platform_uploaded_at = datetime('now'), platform_response = ? WHERE id = ?",
+        )
+        .bind(item_id)
+        .bind(response)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Query SMS uploaded for a given platform item.
+    pub async fn query_by_platform_item(item_id: &str) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let sms_list = sqlx::query_as(
+            "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
+             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+             FROM sms WHERE platform_item_id = ? ORDER BY platform_uploaded_at DESC",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(sms_list)
+    }
+
+    /// Find an incoming SMS by SIM ID and message content (latest match).
+    pub async fn find_by_sim_and_message(sim_id: &str, message: &str) -> Result<Option<Self>> {
+        let pool = get_pool()?;
+        let sms = sqlx::query_as(
+            "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
+             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+             FROM sms WHERE sim_id = ? AND message = ? AND send = 0 \
+             ORDER BY timestamp DESC LIMIT 1",
+        )
+        .bind(sim_id)
+        .bind(message)
+        .fetch_optional(pool)
+        .await?;
+        Ok(sms)
+    }
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct FirefoxPlatformItem {
+    pub id: i64,
+    pub item_id: String,
+    pub country_id: String,
+    pub phone_num: String,
+    pub iccid: Option<String>,
+    pub sim_id: Option<String>,
+    pub status: String,
+    pub created_at: Option<NaiveDateTime>,
+    pub updated_at: Option<NaiveDateTime>,
+}
+
+impl FirefoxPlatformItem {
+    pub async fn upsert(
+        item_id: &str,
+        country_id: &str,
+        phone_num: &str,
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        // Try to find SIM card info by phone number
+        let sim_info = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT id, iccid FROM sim_cards WHERE phone_number = ? LIMIT 1",
+        )
+        .bind(phone_num)
+        .fetch_optional(pool)
+        .await?;
+
+        let (sim_id, iccid) = match sim_info {
+            Some((Some(id), Some(iccid))) => (Some(id), Some(iccid)),
+            Some((Some(id), None)) => (Some(id), None),
+            _ => (None, None),
+        };
+
+        sqlx::query(
+            "INSERT INTO firefox_platform_items (item_id, country_id, phone_num, iccid, sim_id) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(item_id, country_id, phone_num) DO UPDATE SET \
+             updated_at = datetime('now')",
+        )
+        .bind(item_id)
+        .bind(country_id)
+        .bind(phone_num)
+        .bind(iccid)
+        .bind(sim_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn query_all() -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            "SELECT id, item_id, country_id, phone_num, iccid, sim_id, status, created_at, updated_at \
+             FROM firefox_platform_items ORDER BY updated_at DESC",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(items)
+    }
+
+    pub async fn query_by_item_id(item_id: &str) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            "SELECT id, item_id, country_id, phone_num, iccid, sim_id, status, created_at, updated_at \
+             FROM firefox_platform_items WHERE item_id = ? ORDER BY phone_num",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(items)
+    }
+
+    /// Find the latest item_id for a given phone number.
+    pub async fn find_latest_item_for_phone(phone_num: &str) -> Result<Option<String>> {
+        let pool = get_pool()?;
+        let result: Option<(String,)> = sqlx::query_as(
+            "SELECT item_id FROM firefox_platform_items \
+             WHERE phone_num = ? \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(phone_num)
+        .fetch_optional(pool)
+        .await?;
+        Ok(result.map(|r| r.0))
+    }
+
+    pub async fn query_statistics() -> Result<Vec<PlatformItemStat>> {
+        let pool = get_pool()?;
+        let stats = sqlx::query_as::<_, PlatformItemStat>(
+            "SELECT \
+                s.platform_item_id AS item_id, \
+                COALESCE(i.country_id, '') AS country_id, \
+                s.sim_id AS iccid, \
+                COUNT(*) AS total_sms, \
+                SUM(CASE WHEN s.uploaded_to_platform THEN 1 ELSE 0 END) AS uploaded_sms \
+             FROM sms s \
+             LEFT JOIN firefox_platform_items i ON s.platform_item_id = i.item_id \
+             WHERE s.platform_item_id IS NOT NULL \
+             GROUP BY s.platform_item_id, i.country_id, s.sim_id \
+             ORDER BY total_sms DESC",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(stats)
+    }
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct PlatformItemStat {
+    pub item_id: String,
+    pub country_id: String,
+    pub iccid: String,
+    pub total_sms: i64,
+    pub uploaded_sms: i64,
+}
+
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
 pub struct AppSetting {
     pub key: String,
@@ -1076,8 +1256,9 @@ impl ModemSMS {
         //When send is true, status defaults to Read
         let sms_id = sqlx::query_scalar::<_, i64>(
             r#"
-            INSERT INTO sms (contact_id, timestamp, message, sim_id, send, status)
-            VALUES (?, ?, ?, ?, ?, ?) RETURNING id
+            INSERT INTO sms (contact_id, timestamp, message, sim_id, send, status,
+                             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
             "#,
         )
         .bind(contact_id)
@@ -1090,6 +1271,10 @@ impl ModemSMS {
         } else {
             SmsStatus::Unread as i32
         })
+        .bind(false)
+        .bind(None::<String>)
+        .bind(None::<NaiveDateTime>)
+        .bind(None::<String>)
         .fetch_one(&mut **transaction)
         .await?;
 

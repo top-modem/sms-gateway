@@ -1001,18 +1001,17 @@ impl FirefoxPlatformItem {
         phone_num: &str,
     ) -> Result<()> {
         let pool = get_pool()?;
-        // Try to find SIM card info by phone number
-        let sim_info = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT id, iccid FROM sim_cards WHERE phone_number = ? LIMIT 1",
+        // sim_cards.id is the ICCID
+        let sim_info: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM sim_cards WHERE phone_number = ? LIMIT 1",
         )
         .bind(phone_num)
         .fetch_optional(pool)
         .await?;
 
         let (sim_id, iccid) = match sim_info {
-            Some((Some(id), Some(iccid))) => (Some(id), Some(iccid)),
-            Some((Some(id), None)) => (Some(id), None),
-            _ => (None, None),
+            Some((id,)) => (Some(id.clone()), Some(id)),
+            None => (None, None),
         };
 
         sqlx::query(

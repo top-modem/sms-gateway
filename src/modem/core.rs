@@ -884,10 +884,38 @@ impl Modem {
                                                         if let Ok(Some(db_sms)) = Sms::find_by_sim_and_message(
                                                             &sim_id, &sms.message,
                                                         ).await {
-                                                            if let Ok(Some(item_id)) = crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
+                                                            // Try to find the matching platform item from the wait list
+                                                            let mut item_id = None;
+                                                            if let Ok(wait_resp) = crate::firefox_api::get_wait_phone_list(&client, &api_key,
+                                                            ).await {
+                                                                if let Some(data) = wait_resp.data {
+                                                                    if let Some(arr) = data.as_array() {
+                                                                        for item in arr {
+                                                                            let item_phone = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("");
+                                                                            let item_country = item.get("Country_ID").and_then(|v| v.as_str()).unwrap_or("");
+                                                                            if item_phone == phone_num && item_country == country_id {
+                                                                                item_id = item.get("Item_ID").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).map(|v| v.to_string());
+                                                                                break;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+
+                                                            if let Some(item_id) = item_id {
+                                                                let _ = crate::db::FirefoxPlatformItem::upsert(
+                                                                    &item_id, country_id, phone_num,
+                                                                ).await;
                                                                 let _ = crate::db::Sms::mark_uploaded(
                                                                     db_sms.id,
                                                                     &item_id,
+                                                                    resp.data.as_deref(),
+                                                                ).await;
+                                                            } else {
+                                                                // Still mark as uploaded even if we couldn't find the item_id
+                                                                let _ = crate::db::Sms::mark_uploaded(
+                                                                    db_sms.id,
+                                                                    "unknown",
                                                                     resp.data.as_deref(),
                                                                 ).await;
                                                             }

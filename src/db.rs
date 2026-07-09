@@ -1074,13 +1074,15 @@ impl FirefoxPlatformItem {
             "SELECT \
                 s.platform_item_id AS item_id, \
                 COALESCE(i.country_id, '') AS country_id, \
+                COALESCE(sc.phone_number, i.phone_num, '') AS phone_num, \
                 s.sim_id AS iccid, \
                 COUNT(*) AS total_sms, \
                 SUM(CASE WHEN s.uploaded_to_platform THEN 1 ELSE 0 END) AS uploaded_sms \
              FROM sms s \
              LEFT JOIN firefox_platform_items i ON s.platform_item_id = i.item_id \
+             LEFT JOIN sim_cards sc ON s.sim_id = sc.id \
              WHERE s.platform_item_id IS NOT NULL \
-             GROUP BY s.platform_item_id, i.country_id, s.sim_id \
+             GROUP BY s.platform_item_id, i.country_id, sc.phone_number, i.phone_num, s.sim_id \
              ORDER BY total_sms DESC",
         )
         .fetch_all(pool)
@@ -1093,6 +1095,7 @@ impl FirefoxPlatformItem {
 pub struct PlatformItemStat {
     pub item_id: String,
     pub country_id: String,
+    pub phone_num: String,
     pub iccid: String,
     pub total_sms: i64,
     pub uploaded_sms: i64,

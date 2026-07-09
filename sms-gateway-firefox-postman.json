@@ -1,0 +1,343 @@
+{
+  "info": {
+    "_postman_id": "sms-gateway-firefox-api",
+    "name": "SMS Gateway - 火狐狸 Platform API",
+    "description": "Collection for testing the 火狐狸 (Firefox) platform integration HTTP APIs",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Settings",
+      "item": [
+        {
+          "name": "Get Firefox API Key",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/settings/firefox-api-key",
+              "host": ["{{base_url}}"],
+              "path": ["api", "settings", "firefox-api-key"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Set Firefox API Key",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"api_key\": \"{{firefox_api_key}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/settings/firefox-api-key",
+              "host": ["{{base_url}}"],
+              "path": ["api", "settings", "firefox-api-key"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Countries",
+      "item": [
+        {
+          "name": "Get Firefox Countries",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/firefox/countries",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "countries"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Upload",
+      "item": [
+        {
+          "name": "Upload Phones to Platform",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"country_id\": \"eng\",\n  \"phone_numbers\": [\n    \"7721447303\",\n    \"7770065802\",\n    \"7787905235\",\n    \"7386816448\",\n    \"7435449832\"\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/upload",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "upload"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Query Batch Status",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"batch_id\": \"{{batch_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/batch-status",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "batch-status"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Batch Upload History",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/firefox/batch-uploads",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "batch-uploads"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Delete",
+      "item": [
+        {
+          "name": "Delete Phones by Number",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"entries\": [\n    {\n      \"country_id\": \"eng\",\n      \"phone_num\": \"7721447303\"\n    },\n    {\n      \"country_id\": \"eng\",\n      \"phone_num\": \"7770065802\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/delete-batch",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "delete-batch"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Phones by Batch ID",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"batch_id\": \"{{batch_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/delete-batch-by-id",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "delete-batch-by-id"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Country",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"country_id\": \"eng\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/delete-country",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "delete-country"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete All Phones",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/delete-all",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "delete-all"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5. Query Platform",
+      "item": [
+        {
+          "name": "Get Wait Phone List",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/firefox/wait-list",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "wait-list"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Result Phone List",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/firefox/result-list?country_id=eng&phone_num=7721447303&item_id={{item_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "result-list"],
+              "query": [
+                {
+                  "key": "country_id",
+                  "value": "eng"
+                },
+                {
+                  "key": "phone_num",
+                  "value": "7721447303"
+                },
+                {
+                  "key": "item_id",
+                  "value": "{{item_id}}"
+                }
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6. Manual SMS Upload",
+      "item": [
+        {
+          "name": "Upload SMS Manually",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"country_id\": \"eng\",\n  \"phone_num\": \"7721447303\",\n  \"sms_content\": \"Your Tinder code is 426458\\ndwEzWOx6XSV\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/firefox/upload-sms",
+              "host": ["{{base_url}}"],
+              "path": ["api", "firefox", "upload-sms"]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "auth": {
+    "type": "basic",
+    "basic": [
+      {
+        "key": "username",
+        "value": "{{username}}",
+        "type": "string"
+      },
+      {
+        "key": "password",
+        "value": "{{password}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [],
+  "variable": [
+    {
+      "key": "firefox_api_key",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "username",
+      "value": "admin",
+      "type": "string"
+    },
+    {
+      "key": "password",
+      "value": "admin",
+      "type": "string"
+    },
+    {
+      "key": "batch_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "item_id",
+      "value": "1260",
+      "type": "string"
+    }
+  ]
+}

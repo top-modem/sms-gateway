@@ -210,7 +210,9 @@ pub async fn run_api(
             post(firefox_upload).with_state(modem_manager.clone()),
         )
         .route("/firefox/batch-status", post(firefox_batch_status))
+        .route("/firefox/batch-uploads", get(firefox_batch_uploads))
         .route("/firefox/delete-batch", post(firefox_delete_batch))
+        .route("/firefox/delete-batch-by-id", post(firefox_delete_batch_by_id))
         .route("/firefox/delete-country", post(firefox_delete_country))
         .route("/firefox/delete-all", post(firefox_delete_all))
         .route("/firefox/wait-list", get(firefox_wait_list))
@@ -1578,15 +1580,37 @@ async fn firefox_upload(
         Ok(results) => {
             let batch_ids: Vec<String> = results
                 .iter()
-                .filter_map(|r| r.data.clone())
+                .map(|r| r.batch_id.clone())
                 .collect();
+            let api_responses: Vec<firefox_api::ApiResponse> = results
+                .iter()
+                .map(|r| r.response.clone())
+                .collect();
+
+            // Persist each batch upload record with its own phone numbers
+            for result in &results {
+                if let Err(e) = crate::db::FirefoxBatchUpload::insert(
+                    &result.batch_id,
+                    country_id,
+                    &result.phone_numbers,
+                )
+                .await
+                {
+                    log::warn!(
+                        "Failed to persist firefox batch upload record (batch_id={}): {}",
+                        result.batch_id,
+                        e
+                    );
+                }
+            }
+
             (
                 StatusCode::OK,
                 Json(json!({
                     "message": "Upload completed",
                     "uploaded_count": phone_numbers.len(),
                     "batch_ids": batch_ids,
-                    "results": results,
+                    "results": api_responses,
                 })),
             )
                 .into_response()
@@ -1645,6 +1669,19 @@ async fn firefox_batch_status(Json(request): Json<FirefoxBatchStatusRequest>) ->
     }
 }
 
+// ─── 5b. Firefox Batch Uploads History ──────────────────────────────────
+
+async fn firefox_batch_uploads() -> Response {
+    match crate::db::FirefoxBatchUpload::query_recent(100).await {
+        Ok(uploads) => (StatusCode::OK, Json(json!(uploads))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query batch uploads: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
 // ─── 6. PhoneDeleteBatch ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1684,6 +1721,72 @@ async fn firefox_delete_batch(Json(request): Json<FirefoxDeleteBatchRequest>) ->
 
     match firefox_api::delete_phone_batch(&client, &api_key, &entries).await {
         Ok(results) => (StatusCode::OK, Json(json!({"message": "Delete completed", "results": results}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+    }
+}
+
+// ─── 6b. PhoneDeleteBatchById ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FirefoxDeleteBatchByIdRequest {
+    batch_id: String,
+}
+
+async fn firefox_delete_batch_by_id(Json(request): Json<FirefoxDeleteBatchByIdRequest>) -> Response {
+    let batch_id = request.batch_id.trim().to_string();
+    if batch_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Batch ID is required"}))).into_response();
+    }
+
+    let upload = match crate::db::FirefoxBatchUpload::query_by_batch_id(&batch_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "Batch not found"}))).into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query batch: {}", e)}))).into_response();
+        }
+    };
+
+    let phone_numbers: Vec<String> = upload
+        .phone_numbers
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if phone_numbers.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "No phone numbers in batch"}))).into_response();
+    }
+
+    let (api_key, client) = match get_firefox_client().await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let entries: Vec<(&str, &str)> = phone_numbers
+        .iter()
+        .map(|p| (upload.country_id.as_str(), p.as_str()))
+        .collect();
+
+    // Clear local country_code for deleted phone numbers
+    if let Ok(cards) = SimCard::query_all().await {
+        for phone_num in &phone_numbers {
+            for card in &cards {
+                if card.phone_number.as_deref() == Some(phone_num) {
+                    let mut c = card.clone();
+                    let _ = c.update_country_code(None).await;
+                }
+            }
+        }
+    }
+
+    match firefox_api::delete_phone_batch(&client, &api_key, &entries).await {
+        Ok(results) => {
+            // Optionally delete the local batch record after successful deletion
+            let _ = crate::db::FirefoxBatchUpload::delete_by_id(upload.id).await;
+            (StatusCode::OK, Json(json!({"message": "Delete by batch completed", "phone_numbers": phone_numbers, "results": results}))).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
     }
 }

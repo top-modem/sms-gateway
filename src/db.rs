@@ -849,6 +849,76 @@ impl SimCard {
 }
 
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct FirefoxBatchUpload {
+    pub id: i64,
+    pub batch_id: String,
+    pub country_id: String,
+    pub phone_numbers: String,
+    pub created_at: Option<chrono::NaiveDateTime>,
+}
+
+impl FirefoxBatchUpload {
+    pub async fn insert(
+        batch_id: &str,
+        country_id: &str,
+        phone_numbers: &[String],
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            "INSERT INTO firefox_batch_uploads (batch_id, country_id, phone_numbers) VALUES (?, ?, ?)",
+        )
+        .bind(batch_id)
+        .bind(country_id)
+        .bind(phone_numbers.join(","))
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn query_by_country(country_id: &str) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let uploads = sqlx::query_as(
+            "SELECT id, batch_id, country_id, phone_numbers, created_at FROM firefox_batch_uploads WHERE country_id = ? ORDER BY created_at DESC",
+        )
+        .bind(country_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(uploads)
+    }
+
+    pub async fn query_recent(limit: i64) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let uploads = sqlx::query_as(
+            "SELECT id, batch_id, country_id, phone_numbers, created_at FROM firefox_batch_uploads ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(uploads)
+    }
+
+    pub async fn query_by_batch_id(batch_id: &str) -> Result<Option<Self>> {
+        let pool = get_pool()?;
+        let upload = sqlx::query_as(
+            "SELECT id, batch_id, country_id, phone_numbers, created_at FROM firefox_batch_uploads WHERE batch_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(batch_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(upload)
+    }
+
+    pub async fn delete_by_id(id: i64) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query("DELETE FROM firefox_batch_uploads WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
 pub struct AppSetting {
     pub key: String,
     pub value: Option<String>,

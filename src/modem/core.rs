@@ -836,7 +836,13 @@ impl Modem {
             match SimCard::query_all().await {
                 Ok(cards) => {
                     if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
-                        if let (Some(country_id), Some(phone_num)) = (&card.country_code, &card.phone_number) {
+                        let country_id = card.country_code.as_deref();
+                        let phone_num = card.phone_number.as_deref();
+                        log::info!(
+                            "[{}] Preparing 火狐狸 SMS upload for SIM card: country_code={:?}, phone_number={:?}",
+                            sim_id, country_id, phone_num
+                        );
+                        if let (Some(country_id), Some(phone_num)) = (country_id, phone_num) {
                             match crate::db::AppSetting::get("firefox_api_key").await {
                                 Ok(Some(api_key)) => {
                                     match reqwest::Client::builder()
@@ -846,8 +852,13 @@ impl Modem {
                                         Ok(client) => {
                                             for sms in &sms_list {
                                                 if sms.send {
+                                                    log::debug!("[{}] Skipping outgoing SMS for 火狐狸 upload", sim_id);
                                                     continue;
                                                 }
+                                                log::info!(
+                                                    "[{}] Uploading incoming SMS to 火狐狸: phone={}, message_len={}",
+                                                    sim_id, phone_num, sms.message.len()
+                                                );
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,

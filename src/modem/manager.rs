@@ -1333,7 +1333,26 @@ impl ModemManager {
                 continue;
             }
 
-            // Any other URC (e.g. +CMTI:, +CSQ:) — log at trace level
+            if line.starts_with("+CMTI:") {
+                // New SMS arrived on the modem — trigger an immediate read/upload
+                // so the platform gets it without waiting for the periodic worker.
+                log::info!("[URC {}] incoming SMS notification: {}", sim_id, line);
+                let modem_c = modem.clone();
+                let sse_c = sse.clone();
+                let sim_id_c = sim_id.clone();
+                tokio::spawn(async move {
+                    log::info!("[URC {}] triggering immediate SMS read/upload", sim_id_c);
+                    if let Err(e) = modem_c
+                        .read_sms_async_insert(SmsType::All, sse_c, None)
+                        .await
+                    {
+                        log::warn!("[URC {}] immediate SMS read/upload failed: {}", sim_id_c, e);
+                    }
+                });
+                continue;
+            }
+
+            // Any other URC (e.g. +CSQ:) — log at trace level
             log::trace!("[URC {}] unhandled: {:?}", sim_id, line);
         }
     }

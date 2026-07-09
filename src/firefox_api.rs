@@ -205,7 +205,7 @@ async fn do_get<R: serde::de::DeserializeOwned>(
 
 // ─── Shared response type (code + data) ─────────────────────────────────
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiResponse {
     pub code: String,
     pub data: Option<String>,
@@ -231,12 +231,18 @@ struct PhoneAddEntry<'a> {
 }
 
 /// Upload a batch of phone numbers to the 火狐狸 platform (max 50 per batch).
+pub struct BatchUploadResult {
+    pub batch_id: String,
+    pub phone_numbers: Vec<String>,
+    pub response: ApiResponse,
+}
+
 pub async fn upload_phone_batch(
     client: &reqwest::Client,
     api_key: &str,
     country_id: &str,
     phone_numbers: &[String],
-) -> Result<Vec<ApiResponse>> {
+) -> Result<Vec<BatchUploadResult>> {
     const BATCH_SIZE: usize = 50;
     let mut results = Vec::new();
 
@@ -257,7 +263,12 @@ pub async fn upload_phone_batch(
             PhoneList: phone_list,
         };
         let resp: ApiResponse = do_post(client, api_key, &payload).await?;
-        results.push(resp);
+        let batch_id = resp.data.clone().unwrap_or_default();
+        results.push(BatchUploadResult {
+            batch_id,
+            phone_numbers: chunk.iter().cloned().collect(),
+            response: resp,
+        });
     }
     Ok(results)
 }
@@ -483,5 +494,14 @@ pub async fn upload_sms(
         Phone_Num: phone_num.to_string(),
         Phone_SmsContent: sms_content.to_string(),
     };
-    do_post(client, api_key, &payload).await
+    log::info!(
+        "[火狐狸平台] UploadSms request: phone={}, country_id={}, content={:?}",
+        phone_num, country_id, payload.Phone_SmsContent
+    );
+    let resp: anyhow::Result<ApiResponse> = do_post(client, api_key, &payload).await;
+    match &resp {
+        Ok(r) => log::info!("[火狐狸平台] UploadSms response: phone={}, code={}, data={:?}", phone_num, r.code, r.data),
+        Err(e) => log::warn!("[火狐狸平台] UploadSms failed: phone={}, error={}", phone_num, e),
+    }
+    resp
 }

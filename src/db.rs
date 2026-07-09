@@ -1072,16 +1072,20 @@ impl FirefoxPlatformItem {
         let stats = sqlx::query_as::<_, PlatformItemStat>(
             "SELECT \
                 s.platform_item_id AS item_id, \
-                COALESCE(i.country_id, '') AS country_id, \
-                COALESCE(sc.phone_number, i.phone_num, '') AS phone_num, \
-                s.sim_id AS iccid, \
+                COALESCE(MAX(i.country_id), '') AS country_id, \
+                COALESCE(GROUP_CONCAT(DISTINCT COALESCE(sc.phone_number, i.phone_num, '')), '') AS phone_num, \
+                COALESCE(GROUP_CONCAT(DISTINCT s.sim_id), '') AS iccid, \
                 COUNT(*) AS total_sms, \
                 SUM(CASE WHEN s.uploaded_to_platform THEN 1 ELSE 0 END) AS uploaded_sms \
              FROM sms s \
-             LEFT JOIN firefox_platform_items i ON s.platform_item_id = i.item_id \
              LEFT JOIN sim_cards sc ON s.sim_id = sc.id \
+             LEFT JOIN ( \
+                 SELECT item_id, MAX(country_id) AS country_id, MAX(phone_num) AS phone_num \
+                 FROM firefox_platform_items \
+                 GROUP BY item_id \
+             ) i ON s.platform_item_id = i.item_id \
              WHERE s.platform_item_id IS NOT NULL \
-             GROUP BY s.platform_item_id, i.country_id, sc.phone_number, i.phone_num, s.sim_id \
+             GROUP BY s.platform_item_id \
              ORDER BY total_sms DESC",
         )
         .fetch_all(pool)

@@ -8,6 +8,7 @@
   let items = $state([]);
   let statistics = $state([]);
   let waitList = $state([]);
+  let rejectionReasons = $state([]);
   let selectedRow = $state(null);
   let selectedItem = $state(null);
   let selectedItemSms = $state([]);
@@ -19,14 +20,16 @@
     loading = true;
     error = '';
     try {
-      const [itemsRes, statsRes, waitListRes] = await Promise.all([
+      const [itemsRes, statsRes, waitListRes, reasonsRes] = await Promise.all([
         apiClient.getFirefoxPlatformItems(),
         apiClient.getFirefoxPlatformStatistics(),
         apiClient.getFirefoxWaitList(),
+        apiClient.getFirefoxPlatformRejectionReasons(),
       ]);
       items = Array.isArray(itemsRes) ? itemsRes : (itemsRes?.data ?? []);
       statistics = Array.isArray(statsRes) ? statsRes : (statsRes?.data ?? []);
       waitList = Array.isArray(waitListRes?.data?.data) ? waitListRes.data.data : [];
+      rejectionReasons = Array.isArray(reasonsRes) ? reasonsRes : (reasonsRes?.data ?? []);
     } catch (e) {
       error = e?.message ?? 'Failed to load platform statistics';
     } finally {
@@ -225,6 +228,39 @@
           <div class="text-2xl font-bold text-red-600">{totalFailed}</div>
         </div>
       </div>
+
+      <section class="mb-6 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm dark:border-gray-700 dark:bg-gray-800">
+        <div class="border-b border-gray-200 px-4 py-3 dark:border-gray-700">
+          <div class="font-semibold">Platform Rejection Reason Summary</div>
+          <div class="text-xs text-gray-500 dark:text-gray-400">
+            Quick view of why uploads were rejected.
+          </div>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead class="bg-gray-50 dark:bg-gray-700/50">
+              <tr>
+                <th class="px-4 py-2 text-left font-medium">Reason</th>
+                <th class="px-4 py-2 text-right font-medium">Count</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-100 dark:divide-gray-700">
+              {#each rejectionReasons as reason}
+                <tr>
+                  <td class="px-4 py-2">{reason.reason}</td>
+                  <td class="px-4 py-2 text-right font-medium">{reason.count}</td>
+                </tr>
+              {:else}
+                <tr>
+                  <td colspan="2" class="px-4 py-4 text-center text-gray-500 dark:text-gray-400">
+                    No failed rejection data yet.
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       <div class="grid grid-cols-1 gap-6 xl:grid-cols-[1.1fr,0.9fr]">
         <div class="space-y-6">

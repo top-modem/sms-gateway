@@ -507,6 +507,28 @@ impl Sms {
         Ok(sms)
     }
 
+    /// Find the latest incoming SMS row id by SIM and message body.
+    pub async fn find_latest_incoming_id_by_sim_message(
+        sim_id: &str,
+        message: &str,
+    ) -> Result<Option<i64>> {
+        let pool = get_pool()?;
+        let sms_id = sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM sms
+            WHERE sim_id = ? AND message = ? AND send = 0
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(sim_id)
+        .bind(message)
+        .fetch_optional(pool)
+        .await?;
+        Ok(sms_id)
+    }
+
     pub async fn _update_status(&self, status: SmsStatus) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(
@@ -647,6 +669,47 @@ impl Sms {
         .await?;
         
         Ok(sms_records)
+    }
+
+    /// Normalize failed SMS attempt rows to the currently active platform item for a phone/SIM.
+    ///
+    /// This is used to repair historical rows that were previously recorded with stale item IDs.
+    pub async fn normalize_failed_item_mapping_for_phone(
+        sim_id: &str,
+        phone_num: &str,
+        active_item_id: &str,
+    ) -> Result<u64> {
+        let pool = get_pool()?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE sms
+            SET platform_item_id = ?
+            WHERE sim_id = ?
+              AND send = 0
+              AND uploaded_to_platform = 0
+              AND platform_item_id IS NOT NULL
+              AND platform_item_id != ?
+              AND timestamp > datetime('now', '-2 days')
+            "#,
+        )
+        .bind(active_item_id)
+        .bind(sim_id)
+        .bind(active_item_id)
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            log::info!(
+                "[数据修复] 已修正失败短信平台映射: sim_id={}, phone={}, active_item_id={}, affected={}",
+                sim_id,
+                phone_num,
+                active_item_id,
+                result.rows_affected()
+            );
+        }
+
+        Ok(result.rows_affected())
     }
 }
 
@@ -1230,6 +1293,40 @@ impl FirefoxPlatformItem {
         .fetch_all(pool)
         .await?;
         Ok(stats)
+    }
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct PlatformRejectionReasonStat {
+    pub reason: String,
+    pub count: i64,
+}
+
+impl Sms {
+    pub async fn query_platform_rejection_reason_summary(limit: i64) -> Result<Vec<PlatformRejectionReasonStat>> {
+        let pool = get_pool()?;
+        let rows = sqlx::query_as::<_, PlatformRejectionReasonStat>(
+            "SELECT \
+                CASE \
+                    WHEN s.platform_response LIKE '%丢弃纯数字%' THEN '丢弃纯数字' \
+                    WHEN s.platform_response LIKE '%未匹配到关键字%' THEN '未匹配到关键字' \
+                    WHEN s.platform_response LIKE '%code=0%' THEN 'Platform rejected (other)' \
+                    WHEN s.platform_response IS NULL OR TRIM(s.platform_response) = '' THEN 'Unknown failure' \
+                    ELSE 'Upload/Network error' \
+                END AS reason, \
+                COUNT(*) AS count \
+             FROM sms s \
+             WHERE s.send = 0 \
+               AND s.platform_item_id IS NOT NULL \
+               AND s.uploaded_to_platform = 0 \
+             GROUP BY reason \
+             ORDER BY count DESC \
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
     }
 }
 

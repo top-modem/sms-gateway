@@ -211,6 +211,22 @@ pub struct ApiResponse {
     pub data: Option<String>,
 }
 
+/// Some platform rejections are deterministic business-rule failures and should
+/// not be retried (e.g. keyword mismatch / pure-digit content).
+pub fn is_unretryable_platform_rejection(resp: &ApiResponse) -> bool {
+    if resp.code != "0" {
+        return false;
+    }
+
+    let Some(reason) = resp.data.as_deref() else {
+        return false;
+    };
+
+    reason.contains("未匹配到关键字")
+        || reason.contains("丢弃纯数字")
+        || reason.to_ascii_lowercase().contains("keyword")
+}
+
 // ─── 1. PhoneAddBatch ───────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

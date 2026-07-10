@@ -148,6 +148,37 @@ impl FirefoxUploadRetryItem {
         Ok(())
     }
 
+    /// Mark item as dead-letter immediately (no more retries).
+    pub async fn mark_dead_letter(
+        pool: &SqlitePool,
+        id: &str,
+        error: String,
+        response_code: Option<String>,
+    ) -> Result<()> {
+        let now = Utc::now().naive_utc();
+
+        sqlx::query(
+            r#"
+            UPDATE firefox_upload_retry_queue
+            SET retry_count = max_retries,
+                next_retry_at = ?,
+                last_error = ?,
+                last_response_code = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now)
+        .bind(&error)
+        .bind(&response_code)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Get dead-letter items (exceeded max retries)
     pub async fn get_dead_letter_items(pool: &SqlitePool, limit: i32) -> Result<Vec<Self>> {
         let items = sqlx::query_as::<_, Self>(

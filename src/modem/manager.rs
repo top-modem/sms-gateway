@@ -110,7 +110,7 @@ impl ModemManager {
 
     pub async fn initialize(config: &crate::config::AppConfig) -> anyhow::Result<Self> {
         let force_uk_mcc_to_46001 = config.settings.force_uk_mcc_to_46001.unwrap_or(true);
-        let max_concurrent = config.settings.max_concurrent_modem_init.unwrap_or(1);
+        let max_concurrent = config.settings.max_concurrent_modem_init.unwrap_or(3);
         
         // 0 or 1 = serial initialization (safest for USB hubs with shared resources)
         // 2+ = parallel initialization with semaphore to limit concurrent AT commands
@@ -408,8 +408,7 @@ impl ModemManager {
         modem.read_sms_sync_insert(sms_type).await
     }
 
-    /// Read SMS from modem, sync to DB, and return the latest incoming message.
-    /// Falls back to the database if the modem has no unread SMS.
+    /// Read SMS from modem, sync to DB, and return the latest incoming message from modem read.
     pub async fn read_sms_and_get_latest(
         &self,
         sim_id: &str,
@@ -422,8 +421,7 @@ impl ModemManager {
         let sms_list = modem.read_sms(crate::modem::SmsType::All).await?;
 
         if sms_list.is_empty() {
-            // Modem has no SMS — fall back to the latest DB record
-            return Sms::find_latest_incoming_by_sim_id(sim_id).await.map_err(Into::into);
+            return Ok(None);
         }
 
         if let Err(e) = modem.delete_all_sms().await {
@@ -437,8 +435,31 @@ impl ModemManager {
             .filter(|s| !s.send)
             .max_by_key(|s| s.timestamp);
 
-        Ok(latest.map(|sms| Sms {
-            id: 0,
+        let Some(sms) = latest else {
+            return Ok(None);
+        };
+
+        let sms_id = match Sms::find_latest_incoming_id_by_sim_message(sim_id, &sms.message).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                log::warn!(
+                    "Failed to resolve inserted SMS id for SIM {} after modem read; falling back to id=0",
+                    sim_id
+                );
+                0
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to query inserted SMS id for SIM {} after modem read: {}; falling back to id=0",
+                    sim_id,
+                    e
+                );
+                0
+            }
+        };
+
+        Ok(Some(Sms {
+            id: sms_id,
             contact_id: sms.contact,
             timestamp: sms.timestamp,
             message: sms.message,

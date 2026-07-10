@@ -22,7 +22,7 @@ read_sms_frequency = 30          # How often to check for new SMS messages
 # auto_answer_enabled = true                # Whether to auto-answer incoming calls (default true)
 # auto_answer_delay_secs = 2               # Delay before auto-answering (0=immediate, 2=default)
 # force_uk_mcc_to_46001 = true             # If MCC is 234/235, send AT+COPS=1,2,"46001" during SIM init
-# max_concurrent_modem_init = 1            # Parallel modem initialization (default 1=serial, safe). Set to 2-3 if USB hub supports it for faster startup.
+# max_concurrent_modem_init = 3            # Parallel modem initialization (default 3). Set to 1 for fully serial init on unstable USB hubs.
 
 # Webhook configuration
 webhooks_max_concurrent = 10     # Maximum concurrent webhook requests

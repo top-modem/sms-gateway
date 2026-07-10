@@ -112,6 +112,9 @@ const translations = {
     selected_count:           '{n} selected',
     btn_messages:             'Messages',
     btn_refresh:              'Refresh',
+    btn_start_service:        'Start Service',
+    btn_stop_service:         'Stop Service',
+    service_action_in_progress:'Working...',
     btn_logout:               'Logout',
     col_com_port:             'COM Port',
     col_module:               'Module',
@@ -229,6 +232,7 @@ const translations = {
     unavailable:              'Unavailable',
     no_sim_cards:             'No SIM cards found',
     err_load_sim:             'Failed to load SIM data',
+    err_service_toggle_failed:'Failed to change service status',
 
     // SimCard Info
     sim_card_information:     'SIM Card Information',
@@ -370,6 +374,9 @@ const translations = {
     selected_count:           '已选 {n}',
     btn_messages:             '消息',
     btn_refresh:              '刷新',
+    btn_start_service:        '启动服务',
+    btn_stop_service:         '停止服务',
+    service_action_in_progress:'处理中...',
     btn_logout:               '退出',
     col_com_port:             'COM端口',
     col_module:               '模块',
@@ -487,6 +494,7 @@ const translations = {
     unavailable:              '不可用',
     no_sim_cards:             '未找到SIM卡',
     err_load_sim:             '加载SIM数据失败',
+    err_service_toggle_failed:'切换服务状态失败',
 
     // SimCard Info
     sim_card_information:     'SIM卡信息',

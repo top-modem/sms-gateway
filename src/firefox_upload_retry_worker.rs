@@ -145,6 +145,10 @@ async fn retry_worker_loop() {
 }
 
 async fn process_retry_queue() -> anyhow::Result<()> {
+    if !crate::service_control::is_running() {
+        return Ok(());
+    }
+
     let pool = db::get_pool()?;
     // Get items ready for retry (limit 10 per batch)
     let items = FirefoxUploadRetryItem::get_ready_for_retry(pool, 10).await?;
@@ -211,6 +215,27 @@ async fn process_retry_queue() -> anyhow::Result<()> {
                 );
 
                 mark_retry_sms_attempt(&item, false, Some(error_msg.clone())).await;
+
+                if firefox_api::is_unretryable_platform_rejection(&resp) {
+                    warn!(
+                        "[Firefox Upload Retry] Item {} marked dead-letter immediately (non-retryable): {}",
+                        item.id, error_msg
+                    );
+                    if let Err(e) = FirefoxUploadRetryItem::mark_dead_letter(
+                        pool,
+                        &item.id,
+                        error_msg,
+                        Some(resp.code),
+                    )
+                    .await
+                    {
+                        error!(
+                            "[Firefox Upload Retry] Failed to mark item {} as dead-letter: {}",
+                            item.id, e
+                        );
+                    }
+                    continue;
+                }
 
                 if item.retry_count + 1 >= item.max_retries {
                     // Dead letter

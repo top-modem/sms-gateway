@@ -19,6 +19,7 @@ mod firefox_upload_retry;
 mod firefox_upload_retry_worker;
 mod modem;
 mod phone_number;
+mod service_control;
 mod transcribe;
 #[cfg(test)]
 mod tests;
@@ -138,6 +139,11 @@ async fn read_sms_worker(
     webhook_manager: Option<webhook::WebhookManager>,
 ) {
     loop {
+        if !crate::service_control::is_running() {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            continue;
+        }
+
         modem_manager
             .read_all_sms_async(
                 SmsType::RecUnread,
@@ -158,6 +164,11 @@ async fn recheck_fallback_worker(
     transcribe_cfg: Option<Arc<modem::manager::TranscribeConfig>>,
 ) {
     loop {
+        if !crate::service_control::is_running() {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            continue;
+        }
+
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         modem_manager
             .recheck_fallback_modems(
@@ -171,33 +182,69 @@ async fn recheck_fallback_worker(
 }
 
 async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     let poll_interval = tokio::time::Duration::from_secs(3);
     let mut processed_tasks: HashSet<String> = HashSet::new();
+    let mut no_sms_backoff_until: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut no_sms_miss_count: HashMap<String, u8> = HashMap::new();
     let mut heartbeat_count: u32 = 0;
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("[火狐狸轮询] 创建 HTTP 客户端失败: {}", e);
+            return;
+        }
+    };
 
     loop {
         tokio::time::sleep(poll_interval).await;
         heartbeat_count += 1;
+
+        if !crate::service_control::is_running() {
+            continue;
+        }
 
         let api_key = match db::AppSetting::get("firefox_api_key").await {
             Ok(Some(key)) => key,
             _ => continue,
         };
 
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("[火狐狸轮询] 创建 HTTP 客户端失败: {}", e);
-                continue;
+        let wait_list_resp = {
+            let mut last_error: Option<anyhow::Error> = None;
+            let mut response = None;
+            for attempt in 1..=3 {
+                match firefox_api::get_wait_phone_list(&client, &api_key).await {
+                    Ok(resp) => {
+                        response = Some(resp);
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < 3 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+                        }
+                    }
+                }
+            }
+            match response {
+                Some(resp) => resp,
+                None => {
+                    log::warn!(
+                        "[火狐狸轮询] 获取等待列表失败（已重试3次）: {}",
+                        last_error
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    );
+                    continue;
+                }
             }
         };
 
-        match firefox_api::get_wait_phone_list(&client, &api_key).await {
-            Ok(resp) => {
+        {
+            let resp = wait_list_resp;
                 let count = resp.data.as_ref().and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
                 if count > 0 {
                     if let Some(items) = resp.data.as_ref().and_then(|d| d.as_array()) {
@@ -220,6 +267,14 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             }
 
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
+                            let now = tokio::time::Instant::now();
+
+                            if let Some(until) = no_sms_backoff_until.get(&task_key) {
+                                if *until > now {
+                                    continue;
+                                }
+                                no_sms_backoff_until.remove(&task_key);
+                            }
 
                             // Skip if we already processed this item
                             if processed_tasks.contains(&task_key) {
@@ -232,6 +287,8 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                 let remark = result_item.get("Phone_Remark").and_then(|v| v.as_str()).unwrap_or("");
                                                 if is_ret == "True" || is_ret == "true" || !remark.is_empty() {
                                                     processed_tasks.remove(&task_key);
+                                                    no_sms_backoff_until.remove(&task_key);
+                                                    no_sms_miss_count.remove(&task_key);
                                                     log::info!("[火狐狸轮询] 任务已释放 - 号码: {}, Item_ID: {}, 备注: {}", phone_num, item_id, remark);
                                                 }
                                             }
@@ -254,9 +311,20 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 }
                             };
 
+                            if let Err(e) = db::Sms::normalize_failed_item_mapping_for_phone(&sim_id, phone_num, &item_id).await {
+                                log::error!(
+                                    "[火狐狸轮询] 修正失败短信平台映射失败 - 号码: {}, SIM: {}, Item_ID: {}, 错误: {}",
+                                    phone_num,
+                                    sim_id,
+                                    item_id,
+                                    e
+                                );
+                            }
+
                             log::info!("[火狐狸轮询] 找到 SIM: {}, 强制读取短信", sim_id);
 
                             // Read SMS from modem, sync to DB, and get the latest incoming message
+                            let mut mark_task_processed = true;
                             match modem_manager.read_sms_and_get_latest(&sim_id).await {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
@@ -298,22 +366,32 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                 );
                                             }
 
-                                            // Enqueue for retry instead of just logging
-                                            let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
-                                                sms.id,
-                                                phone_num.to_string(),
-                                                country_id.to_string(),
-                                                sms.message.clone(),
-                                                format!("Upload failed with code: {}", upload_resp.code),
-                                                Some(upload_resp.code.clone()),
-                                            );
-                                            
-                                            match firefox_upload_retry::FirefoxUploadRetryItem::insert(
-                                                &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
-                                                &retry_item
-                                            ).await {
-                                                Ok(_) => log::info!("[火狐狸轮询] 短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, code: {}", phone_num, item_id, retry_item.id, upload_resp.code),
-                                                Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                            if firefox_api::is_unretryable_platform_rejection(&upload_resp) {
+                                                log::warn!(
+                                                    "[火狐狸轮询] 短信上传失败（不可重试），不进入重试队列 - 号码: {}, Item_ID: {}, code: {}, data: {:?}",
+                                                    phone_num,
+                                                    item_id,
+                                                    upload_resp.code,
+                                                    upload_resp.data
+                                                );
+                                            } else {
+                                                // Enqueue retry only for retryable failures.
+                                                let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                    sms.id,
+                                                    phone_num.to_string(),
+                                                    country_id.to_string(),
+                                                    sms.message.clone(),
+                                                    format!("Upload failed with code: {}", upload_resp.code),
+                                                    Some(upload_resp.code.clone()),
+                                                );
+
+                                                match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                    &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                    &retry_item
+                                                ).await {
+                                                    Ok(_) => log::info!("[火狐狸轮询] 短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, code: {}", phone_num, item_id, retry_item.id, upload_resp.code),
+                                                    Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                }
                                             }
                                         },
                                         Err(e) => {
@@ -355,6 +433,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                     }
                                 }
                                 Ok(None) => {
+                                    mark_task_processed = false;
                                     log::warn!("[火狐狸轮询] 读取 SMS 后未找到短信 (SIM: {}, 号码: {})", sim_id, phone_num);
                                     // Check the result list in case platform already has content
                                     if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
@@ -406,22 +485,58 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                                         );
                                                                     }
 
-                                                                    // Enqueue for retry - using 0 as placeholder sms_id since this is from platform fallback
-                                                                    let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
-                                                                        0, // Fallback path: no local SMS record
-                                                                        phone_num.to_string(),
-                                                                        country_id.to_string(),
-                                                                        content.to_string(),
-                                                                        format!("Upload failed with code: {}", upload_resp.code),
-                                                                        Some(upload_resp.code.clone()),
-                                                                    );
-                                                                     
-                                                                    match firefox_upload_retry::FirefoxUploadRetryItem::insert(
-                                                                        &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
-                                                                        &retry_item
-                                                                    ).await {
-                                                                        Ok(_) => log::info!("[火狐狸轮询] 短信上传失败（来自平台列表），已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}", phone_num, item_id, retry_item.id),
-                                                                        Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                                    if firefox_api::is_unretryable_platform_rejection(&upload_resp) {
+                                                                        log::warn!(
+                                                                            "[火狐狸轮询] 平台列表短信上传失败（不可重试），不进入重试队列 - 号码: {}, Item_ID: {}, code: {}, data: {:?}",
+                                                                            phone_num,
+                                                                            item_id,
+                                                                            upload_resp.code,
+                                                                            upload_resp.data
+                                                                        );
+                                                                    } else {
+                                                                        let sms_id = match db::Sms::find_latest_incoming_id_by_sim_message(
+                                                                            &sim_id,
+                                                                            content,
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            Ok(Some(id)) => id,
+                                                                            Ok(None) => {
+                                                                                log::error!(
+                                                                                    "[火狐狸轮询] 平台列表短信重试入队失败：未找到SMS记录 (SIM: {}, Item_ID: {}, phone: {})",
+                                                                                    sim_id,
+                                                                                    item_id,
+                                                                                    phone_num
+                                                                                );
+                                                                                continue;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                log::error!(
+                                                                                    "[火狐狸轮询] 平台列表短信重试入队失败：查询SMS记录错误 (SIM: {}, Item_ID: {}): {}",
+                                                                                    sim_id,
+                                                                                    item_id,
+                                                                                    e
+                                                                                );
+                                                                                continue;
+                                                                            }
+                                                                        };
+
+                                                                        let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                                            sms_id,
+                                                                            phone_num.to_string(),
+                                                                            country_id.to_string(),
+                                                                            content.to_string(),
+                                                                            format!("Upload failed with code: {}", upload_resp.code),
+                                                                            Some(upload_resp.code.clone()),
+                                                                        );
+
+                                                                        match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                                            &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                                            &retry_item
+                                                                        ).await {
+                                                                            Ok(_) => log::info!("[火狐狸轮询] 短信上传失败（来自平台列表），已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}", phone_num, item_id, retry_item.id),
+                                                                            Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                                        }
                                                                     }
                                                                 },
                                                                 Err(e) => {
@@ -445,8 +560,35 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                                     }
 
                                                                     // Network error - also queue for retry
+                                                                    let sms_id = match db::Sms::find_latest_incoming_id_by_sim_message(
+                                                                        &sim_id,
+                                                                        content,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        Ok(Some(id)) => id,
+                                                                        Ok(None) => {
+                                                                            log::error!(
+                                                                                "[火狐狸轮询] 平台列表短信重试入队失败：未找到SMS记录 (SIM: {}, Item_ID: {}, phone: {})",
+                                                                                sim_id,
+                                                                                item_id,
+                                                                                phone_num
+                                                                            );
+                                                                            continue;
+                                                                        }
+                                                                        Err(e) => {
+                                                                            log::error!(
+                                                                                "[火狐狸轮询] 平台列表短信重试入队失败：查询SMS记录错误 (SIM: {}, Item_ID: {}): {}",
+                                                                                sim_id,
+                                                                                item_id,
+                                                                                e
+                                                                            );
+                                                                            continue;
+                                                                        }
+                                                                    };
+
                                                                     let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
-                                                                        0, // Fallback path: no local SMS record
+                                                                        sms_id,
                                                                         phone_num.to_string(),
                                                                         country_id.to_string(),
                                                                         content.to_string(),
@@ -470,18 +612,40 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                         }
                                     }
                                 }
-                                Err(e) => log::warn!("[火狐狸轮询] 读取/查询短信失败 (SIM: {}): {}", sim_id, e),
+                                Err(e) => {
+                                    mark_task_processed = false;
+                                    log::warn!("[火狐狸轮询] 读取/查询短信失败 (SIM: {}): {}", sim_id, e)
+                                },
                             }
 
-                            processed_tasks.insert(task_key);
+                            if mark_task_processed {
+                                no_sms_backoff_until.remove(&task_key);
+                                no_sms_miss_count.remove(&task_key);
+                                processed_tasks.insert(task_key);
+                            } else {
+                                let miss = no_sms_miss_count
+                                    .entry(task_key.clone())
+                                    .and_modify(|v| *v = (*v + 1).min(6))
+                                    .or_insert(1);
+                                let shift = (*miss as u32).saturating_sub(1);
+                                let delay_secs = (3u64.saturating_mul(1u64 << shift)).min(60);
+                                no_sms_backoff_until.insert(
+                                    task_key.clone(),
+                                    tokio::time::Instant::now()
+                                        + tokio::time::Duration::from_secs(delay_secs),
+                                );
+                                log::info!(
+                                    "[火狐狸轮询] 暂未读到短信，进入退避: 号码={}, Item_ID={}, miss_count={}, delay={}s",
+                                    phone_num,
+                                    item_id,
+                                    miss,
+                                    delay_secs
+                                );
+                            }
                         }
                     }
                 }
             }
-            Err(e) => {
-                log::warn!("[火狐狸轮询] 获取等待列表失败: {}", e);
-            }
-        }
 
         if heartbeat_count % 10 == 0 {
             log::info!("[火狐狸轮询] 运行中 (心跳), 已轮询 {} 次", heartbeat_count);

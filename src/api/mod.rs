@@ -24,6 +24,7 @@ use crate::{
     firefox_api,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
     phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
+    service_control,
     ModemManagerRef,
 };
 
@@ -125,6 +126,9 @@ pub async fn run_api(
 
     let api = Router::new()
         .route("/check", get(check))
+        .route("/service/status", get(get_service_status))
+        .route("/service/start", post(start_service))
+        .route("/service/stop", post(stop_service))
         .route("/sms", get(get_sms_paginated))
         .route("/sms", post(send_sms).with_state((modem_manager.clone(), sse_manager.clone())))
         .route("/sms/sse", get(sse_events).with_state(sse_manager.clone()))
@@ -222,6 +226,7 @@ pub async fn run_api(
         .route("/firefox/platform-items", get(firefox_platform_items))
         .route("/firefox/platform-items/{item_id}", get(firefox_platform_item_detail))
         .route("/firefox/platform-statistics", get(firefox_platform_statistics))
+        .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
         // ── Firefox upload retry queue routes ────────────────────────────
         .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
         .route("/firefox/upload-retry/queue", get(firefox_upload_retry_queue))
@@ -291,6 +296,40 @@ pub struct SmsQuery {
     /// "inbox" = received, "sent" = sent. Returns SmsRow with contact_name resolved.
     #[serde(default)]
     direction: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ServiceStatusResponse {
+    running: bool,
+}
+
+async fn get_service_status() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(ServiceStatusResponse {
+            running: service_control::is_running(),
+        }),
+    )
+}
+
+async fn start_service() -> impl IntoResponse {
+    service_control::start();
+    (
+        StatusCode::OK,
+        Json(ServiceStatusResponse {
+            running: true,
+        }),
+    )
+}
+
+async fn stop_service() -> impl IntoResponse {
+    service_control::stop();
+    (
+        StatusCode::OK,
+        Json(ServiceStatusResponse {
+            running: false,
+        }),
+    )
 }
 
 async fn get_sms_paginated(Query(query): Query<SmsQuery>) -> Response {
@@ -1984,6 +2023,17 @@ async fn firefox_platform_statistics() -> Response {
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to query statistics: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn firefox_platform_rejection_reasons() -> Response {
+    match crate::db::Sms::query_platform_rejection_reason_summary(8).await {
+        Ok(stats) => (StatusCode::OK, Json(json!(stats))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query rejection reason summary: {}", e)})),
         )
             .into_response(),
     }

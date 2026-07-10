@@ -126,6 +126,8 @@
   let isFetching = false;
   let selected   = $state(new Set());
   let hoveredRow = $state(null);
+  let serviceRunning = $state(true);
+  let serviceBusy = $state(false);
 
   // ── Network status map ────────────────────────────────────────────────────
   const netStatusKeys = {
@@ -201,10 +203,40 @@
     }
   }
 
+  async function fetchServiceStatus() {
+    try {
+      const response = await apiClient.getServiceStatus();
+      serviceRunning = !!(response?.data?.running ?? response?.running);
+    } catch {
+      // keep last known state when status polling fails
+    }
+  }
+
+  async function toggleService() {
+    if (serviceBusy) return;
+    serviceBusy = true;
+    error = '';
+    try {
+      const response = serviceRunning
+        ? await apiClient.stopService()
+        : await apiClient.startService();
+      serviceRunning = !!(response?.data?.running ?? !serviceRunning);
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_service_toggle_failed');
+    } finally {
+      serviceBusy = false;
+      await fetchServiceStatus();
+    }
+  }
+
+  async function refreshAll() {
+    await Promise.all([fetchData(), fetchServiceStatus()]);
+  }
+
   let pollTimer;
   onMount(async () => {
-    await fetchData();
-    pollTimer = setInterval(fetchData, 4000);
+    await refreshAll();
+    pollTimer = setInterval(refreshAll, 4000);
   });
 
   onDestroy(() => clearInterval(pollTimer));
@@ -297,7 +329,7 @@
         {$t('btn_messages')}
       </button>
       <button
-        onclick={() => { loading = true; error = ''; fetchData(); }}
+        onclick={() => { loading = true; error = ''; fetchData(); fetchServiceStatus(); }}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -305,6 +337,21 @@
       >
         <Icon icon="carbon:refresh" class="w-4 h-4" />
         {$t('btn_refresh')}
+      </button>
+      <button
+        onclick={toggleService}
+        disabled={serviceBusy}
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition disabled:opacity-60 disabled:cursor-not-allowed
+               border {serviceRunning
+                 ? 'border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20'
+                 : 'border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20'}"
+      >
+        <Icon icon={serviceRunning ? 'carbon:stop-filled' : 'carbon:play-filled'} class="w-4 h-4" />
+        {serviceBusy
+          ? $t('service_action_in_progress')
+          : serviceRunning
+            ? $t('btn_stop_service')
+            : $t('btn_start_service')}
       </button>
       <button
         onclick={logout}

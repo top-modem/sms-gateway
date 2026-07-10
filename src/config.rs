@@ -40,9 +40,8 @@ pub struct Settings {
     pub barcode_launcher_path: Option<String>,
     /// If true, when IMSI MCC is UK (234/235), force operator to 46001 with AT+COPS.
     pub force_uk_mcc_to_46001: Option<bool>,
-    /// Maximum number of modems to initialize concurrently (default 1 = serial). 
-    /// Increase to 2-3 if your USB hub can handle concurrent AT commands.
-    /// Set to 0 or omit for serial initialization (safest).
+    /// Maximum number of modems to initialize concurrently (default 3).
+    /// Set to 1 (or 0) for fully serial initialization if your USB hub is unstable.
     pub max_concurrent_modem_init: Option<usize>,
 }
 

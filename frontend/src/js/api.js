@@ -243,11 +243,19 @@ class ApiClient {
     }
 
     /**
+     * Get the live wait-list directly from the platform.
+     */
+    async getFirefoxWaitList() {
+        return FetchApi.get('/api/firefox/wait-list');
+    }
+
+    /**
      * Get detail of a platform item, including its SMS list.
      * @param {string} itemId
      */
-    async getFirefoxPlatformItemDetail(itemId) {
-        return FetchApi.get(`/api/firefox/platform-items/${itemId}`);
+    async getFirefoxPlatformItemDetail(itemId, simId = null) {
+        const query = simId ? { sim_id: simId } : {};
+        return FetchApi.get(`/api/firefox/platform-items/${itemId}`, query);
     }
 
     /**

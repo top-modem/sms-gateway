@@ -1936,26 +1936,44 @@ async fn firefox_platform_items() -> Response {
     }
 }
 
-async fn firefox_platform_item_detail(Path(item_id): Path<String>) -> Response {
+#[derive(Deserialize)]
+struct FirefoxPlatformItemDetailQuery {
+    sim_id: Option<String>,
+}
+
+async fn firefox_platform_item_detail(
+    Path(item_id): Path<String>,
+    Query(query): Query<FirefoxPlatformItemDetailQuery>,
+) -> Response {
     let item_id = item_id.trim().to_string();
     if item_id.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "Item ID is required"}))).into_response();
     }
 
     match crate::db::FirefoxPlatformItem::query_by_item_id(&item_id).await {
-        Ok(items) => {
-            if items.is_empty() {
-                return (StatusCode::NOT_FOUND, Json(json!({"error": "Item not found"}))).into_response();
-            }
-            match crate::db::Sms::query_by_platform_item(&item_id).await {
-                Ok(sms_list) => (StatusCode::OK, Json(json!({
+        Ok(items) => match crate::db::Sms::query_by_platform_item_and_sim(&item_id, query.sim_id.as_deref()).await {
+            Ok(sms_list) => {
+                let items = if let Some(sim_id) = query.sim_id.as_deref() {
+                    items.into_iter()
+                        .filter(|item| item.iccid.as_deref() == Some(sim_id) || item.sim_id.as_deref() == Some(sim_id))
+                        .collect::<Vec<_>>()
+                } else {
+                    items
+                };
+
+                if items.is_empty() && sms_list.is_empty() {
+                    return (StatusCode::NOT_FOUND, Json(json!({"error": "Item not found"}))).into_response();
+                }
+
+                (StatusCode::OK, Json(json!({
                     "item_id": item_id,
+                    "sim_id": query.sim_id,
                     "items": items,
                     "sms_list": sms_list,
-                }))).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query SMS: {}", e)}))).into_response(),
+                }))).into_response()
             }
-        }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query SMS: {}", e)}))).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query item: {}", e)}))).into_response(),
     }
 }

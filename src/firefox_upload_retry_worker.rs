@@ -11,6 +11,120 @@ use crate::db;
 use log::{error, info, warn};
 use std::time::Duration;
 
+async fn mark_retry_sms_attempt(
+    item: &FirefoxUploadRetryItem,
+    uploaded_to_platform: bool,
+    response: Option<String>,
+) {
+    let platform_item_id = if item.sms_id > 0 {
+        match db::get_pool() {
+            Ok(pool) => match sqlx::query_scalar::<_, Option<String>>(
+                "SELECT platform_item_id FROM sms WHERE id = ?",
+            )
+            .bind(item.sms_id)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(Some(item_id)) => item_id,
+                Ok(None) => match db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await {
+                    Ok(Some(item_id)) => item_id,
+                    Ok(None) => {
+                        warn!(
+                            "[Firefox Upload Retry] No platform item found for phone {} while updating SMS status",
+                            item.phone_number
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        error!(
+                            "[Firefox Upload Retry] Failed to resolve platform item for phone {}: {}",
+                            item.phone_number, e
+                        );
+                        return;
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        "[Firefox Upload Retry] Failed to read existing platform item for SMS {}: {}",
+                        item.sms_id, e
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                error!(
+                    "[Firefox Upload Retry] Failed to access DB pool while resolving SMS {}: {}",
+                    item.sms_id, e
+                );
+                return;
+            }
+        }
+    } else {
+        match db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await {
+        Ok(Some(item_id)) => item_id,
+        Ok(None) => {
+            warn!(
+                "[Firefox Upload Retry] No platform item found for phone {} while updating SMS status",
+                item.phone_number
+            );
+            return;
+        }
+        Err(e) => {
+            error!(
+                "[Firefox Upload Retry] Failed to resolve platform item for phone {}: {}",
+                item.phone_number, e
+            );
+            return;
+        }
+        }
+    };
+
+    if item.sms_id > 0 {
+        if let Err(e) = db::Sms::mark_platform_attempt(
+            item.sms_id,
+            &platform_item_id,
+            uploaded_to_platform,
+            response.as_deref(),
+        )
+        .await
+        {
+            error!(
+                "[Firefox Upload Retry] Failed to update SMS {} after retry result: {}",
+                item.sms_id, e
+            );
+        }
+        return;
+    }
+
+    match db::SimCard::find_by_conditions(None, None, None, Some(&item.phone_number)).await {
+        Ok(cards) => {
+            if let Some(card) = cards.first() {
+                if let Err(e) = db::Sms::mark_platform_attempt_by_phone_message(
+                    &item.phone_number,
+                    &card.id,
+                    &[item.message.clone()],
+                    Some(&platform_item_id),
+                    uploaded_to_platform,
+                    response,
+                )
+                .await
+                {
+                    error!(
+                        "[Firefox Upload Retry] Failed to update SMS by phone/message after retry result: {}",
+                        e
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "[Firefox Upload Retry] Failed to resolve SIM card for phone {}: {}",
+                item.phone_number, e
+            );
+        }
+    }
+}
+
 /// Start the retry worker background task
 pub fn start_retry_worker() {
     tokio::spawn(async move {
@@ -87,20 +201,7 @@ async fn process_retry_queue() -> anyhow::Result<()> {
                     );
                 }
 
-                // Also update the SMS record to mark as uploaded to platform
-                let _ = sqlx::query(
-                    r#"
-                    UPDATE sms
-                    SET uploaded_to_platform = 1,
-                        platform_uploaded_at = CURRENT_TIMESTAMP,
-                        platform_response = ?
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(serde_json::to_string(&resp).unwrap_or_default())
-                .bind(item.sms_id)
-                .execute(pool)
-                .await;
+                mark_retry_sms_attempt(&item, true, serde_json::to_string(&resp).ok()).await;
             }
             Ok(resp) => {
                 // Platform rejection (code != "1")
@@ -108,6 +209,8 @@ async fn process_retry_queue() -> anyhow::Result<()> {
                     "Platform rejected: code={}, data={:?}",
                     resp.code, resp.data
                 );
+
+                mark_retry_sms_attempt(&item, false, Some(error_msg.clone())).await;
 
                 if item.retry_count + 1 >= item.max_retries {
                     // Dead letter
@@ -144,6 +247,8 @@ async fn process_retry_queue() -> anyhow::Result<()> {
             Err(e) => {
                 // Network/HTTP error
                 let error_msg = format!("HTTP request failed: {}", e);
+
+                mark_retry_sms_attempt(&item, false, Some(error_msg.clone())).await;
 
                 if item.retry_count + 1 >= item.max_retries {
                     // Dead letter

@@ -210,6 +210,15 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 continue;
                             }
 
+                            if let Err(e) = db::FirefoxPlatformItem::upsert(&item_id, country_id, phone_num).await {
+                                log::error!(
+                                    "[火狐狸轮询] 刷新平台项目映射失败 - 号码: {}, Item_ID: {}, 错误: {}",
+                                    phone_num,
+                                    item_id,
+                                    e
+                                );
+                            }
+
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
 
                             // Skip if we already processed this item
@@ -252,8 +261,43 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
                                     match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
-                                        Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) if upload_resp.code == "1" => {
+                                            let response_json = serde_json::to_string(&upload_resp).ok();
+                                            if let Err(e) = db::Sms::mark_platform_attempt(
+                                                sms.id,
+                                                &item_id,
+                                                true,
+                                                response_json.as_deref(),
+                                            )
+                                            .await
+                                            {
+                                                log::error!(
+                                                    "[火狐狸轮询] 标记短信上传成功失败 (SMS ID: {}, Item_ID: {}): {}",
+                                                    sms.id,
+                                                    item_id,
+                                                    e
+                                                );
+                                            }
+                                            log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp)
+                                        }
                                         Ok(upload_resp) => {
+                                            let response_json = serde_json::to_string(&upload_resp).ok();
+                                            if let Err(e) = db::Sms::mark_platform_attempt(
+                                                sms.id,
+                                                &item_id,
+                                                false,
+                                                response_json.as_deref(),
+                                            )
+                                            .await
+                                            {
+                                                log::error!(
+                                                    "[火狐狸轮询] 标记短信上传失败失败 (SMS ID: {}, Item_ID: {}): {}",
+                                                    sms.id,
+                                                    item_id,
+                                                    e
+                                                );
+                                            }
+
                                             // Enqueue for retry instead of just logging
                                             let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
                                                 sms.id,
@@ -273,6 +317,23 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                             }
                                         },
                                         Err(e) => {
+                                            let error_message = format!("Upload failed: {}", e);
+                                            if let Err(mark_err) = db::Sms::mark_platform_attempt(
+                                                sms.id,
+                                                &item_id,
+                                                false,
+                                                Some(&error_message),
+                                            )
+                                            .await
+                                            {
+                                                log::error!(
+                                                    "[火狐狸轮询] 标记短信上传错误失败 (SMS ID: {}, Item_ID: {}): {}",
+                                                    sms.id,
+                                                    item_id,
+                                                    mark_err
+                                                );
+                                            }
+
                                             // Network error - also queue for retry
                                             let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
                                                 sms.id,
@@ -304,8 +365,47 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                         if !content.is_empty() {
                                                             log::info!("[火狐狸轮询] 从平台获取到短信内容, 上传中 - 号码: {}, Item_ID: {}", phone_num, item_id);
                                                             match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await {
-                                                                Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                                                Ok(upload_resp) if upload_resp.code == "1" => {
+                                                                    let response_json = serde_json::to_string(&upload_resp).ok();
+                                                                    if let Err(e) = db::Sms::mark_platform_attempt_by_phone_message(
+                                                                        phone_num,
+                                                                        &sim_id,
+                                                                        &[content.to_string()],
+                                                                        Some(&item_id),
+                                                                        true,
+                                                                        response_json,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        log::error!(
+                                                                            "[火狐狸轮询] 标记平台列表短信上传成功失败 (SIM: {}, Item_ID: {}): {}",
+                                                                            sim_id,
+                                                                            item_id,
+                                                                            e
+                                                                        );
+                                                                    }
+                                                                    log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp)
+                                                                }
                                                                 Ok(upload_resp) => {
+                                                                    let response_json = serde_json::to_string(&upload_resp).ok();
+                                                                    if let Err(e) = db::Sms::mark_platform_attempt_by_phone_message(
+                                                                        phone_num,
+                                                                        &sim_id,
+                                                                        &[content.to_string()],
+                                                                        Some(&item_id),
+                                                                        false,
+                                                                        response_json,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        log::error!(
+                                                                            "[火狐狸轮询] 标记平台列表短信上传失败失败 (SIM: {}, Item_ID: {}): {}",
+                                                                            sim_id,
+                                                                            item_id,
+                                                                            e
+                                                                        );
+                                                                    }
+
                                                                     // Enqueue for retry - using 0 as placeholder sms_id since this is from platform fallback
                                                                     let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
                                                                         0, // Fallback path: no local SMS record
@@ -325,6 +425,25 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                                     }
                                                                 },
                                                                 Err(e) => {
+                                                                    let error_message = format!("Upload failed: {}", e);
+                                                                    if let Err(mark_err) = db::Sms::mark_platform_attempt_by_phone_message(
+                                                                        phone_num,
+                                                                        &sim_id,
+                                                                        &[content.to_string()],
+                                                                        Some(&item_id),
+                                                                        false,
+                                                                        Some(error_message.clone()),
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        log::error!(
+                                                                            "[火狐狸轮询] 标记平台列表短信上传错误失败 (SIM: {}, Item_ID: {}): {}",
+                                                                            sim_id,
+                                                                            item_id,
+                                                                            mark_err
+                                                                        );
+                                                                    }
+
                                                                     // Network error - also queue for retry
                                                                     let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
                                                                         0, // Fallback path: no local SMS record

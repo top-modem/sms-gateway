@@ -870,15 +870,15 @@ impl Modem {
                                                             resp.data
                                                         );
 
-                                                        // Update SMS records as successfully uploaded
-                                                        let messages: Vec<String> = sms_list.iter().filter(|s| !s.send).map(|s| s.message.clone()).collect();
-                                                        
+                                                        let response_json = serde_json::to_string(&resp).ok();
                                                         if let Err(e) = crate::db::Sms::mark_uploaded_by_phone_message(
                                                             phone_num,
                                                             &sim_id,
-                                                            &messages,
-                                                            resp.data.clone(),
-                                                        ).await {
+                                                            &[sms.message.clone()],
+                                                            response_json,
+                                                        )
+                                                        .await
+                                                        {
                                                             log::error!(
                                                                 "[{}] Failed to mark SMS as uploaded after successful platform response: {}",
                                                                 sim_id,
@@ -895,6 +895,24 @@ impl Modem {
                                                             resp.code,
                                                             resp.data
                                                         );
+
+                                                        let response_json = serde_json::to_string(&resp).ok();
+                                                        if let Err(e) = crate::db::Sms::mark_platform_attempt_by_phone_message(
+                                                            phone_num,
+                                                            &sim_id,
+                                                            &[sms.message.clone()],
+                                                            None,
+                                                            false,
+                                                            response_json,
+                                                        )
+                                                        .await
+                                                        {
+                                                            log::error!(
+                                                                "[{}] Failed to mark incoming SMS as failed after platform rejection: {}",
+                                                                sim_id,
+                                                                e
+                                                            );
+                                                        }
                                                         
                                                         // Try to enqueue for retry
                                                         // Use 0 as placeholder since ModemSMS doesn't have database ID yet
@@ -924,6 +942,24 @@ impl Modem {
                                                             phone_num,
                                                             e
                                                         );
+
+                                                        let error_message = format!("Auto-upload failed: {}", e);
+                                                        if let Err(mark_err) = crate::db::Sms::mark_platform_attempt_by_phone_message(
+                                                            phone_num,
+                                                            &sim_id,
+                                                            &[sms.message.clone()],
+                                                            None,
+                                                            false,
+                                                            Some(error_message.clone()),
+                                                        )
+                                                        .await
+                                                        {
+                                                            log::error!(
+                                                                "[{}] Failed to mark incoming SMS as failed after upload error: {}",
+                                                                sim_id,
+                                                                mark_err
+                                                            );
+                                                        }
                                                         
                                                         // Try to enqueue for retry
                                                         // Use 0 as placeholder since ModemSMS doesn't have database ID yet

@@ -541,55 +541,91 @@ impl Sms {
         Ok(())
     }
 
-    /// Mark SMS records as successfully uploaded to platform
+    fn resolve_platform_item_id(
+        explicit_item_id: Option<&str>,
+        resolved_item_id: Option<String>,
+        phone_num: &str,
+    ) -> Result<String> {
+        if let Some(item_id) = explicit_item_id {
+            return Ok(item_id.to_string());
+        }
+
+        match resolved_item_id {
+            Some(item_id) => Ok(item_id),
+            None => Err(anyhow::anyhow!(
+                "No platform item found for phone_num: {}",
+                phone_num
+            )),
+        }
+    }
+
+    /// Mark SMS records with the latest platform upload attempt result.
+    pub async fn mark_platform_attempt_by_phone_message(
+        phone_num: &str,
+        sim_id: &str,
+        messages: &[String],
+        explicit_item_id: Option<&str>,
+        uploaded_to_platform: bool,
+        platform_response: Option<String>,
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        let resolved_item_id = if explicit_item_id.is_some() {
+            None
+        } else {
+            FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await?
+        };
+        let platform_item_id =
+            Self::resolve_platform_item_id(explicit_item_id, resolved_item_id, phone_num)?;
+
+        for message in messages {
+            sqlx::query(
+                r#"
+                UPDATE sms
+                SET uploaded_to_platform = ?,
+                    platform_item_id = ?,
+                    platform_uploaded_at = datetime('now'),
+                    platform_response = ?
+                WHERE id = (
+                    SELECT id
+                    FROM sms
+                    WHERE sim_id = ?
+                      AND message = ?
+                      AND send = 0
+                      AND (platform_item_id IS NULL OR platform_item_id = ?)
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                )
+                "#,
+            )
+            .bind(uploaded_to_platform)
+            .bind(&platform_item_id)
+            .bind(&platform_response)
+            .bind(sim_id)
+            .bind(message)
+            .bind(&platform_item_id)
+            .execute(pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Mark SMS records as successfully uploaded to platform.
     pub async fn mark_uploaded_by_phone_message(
         phone_num: &str,
         sim_id: &str,
         messages: &[String],
         platform_response: Option<String>,
     ) -> Result<()> {
-        let pool = get_pool()?;
-        
-        // Get the correct platform_item_id from the firefox_platform_items table
-        // (not the phone number itself)
-        let platform_item_id = match FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await? {
-            Some(item_id) => item_id,
-            None => {
-                log::warn!(
-                    "No platform item found for phone_num: {}, cannot mark SMS as uploaded",
-                    phone_num
-                );
-                return Ok(());
-            }
-        };
-        
-        // Build a query to update SMS records matching the phone, sim, and messages
-        // This handles incoming SMS that were just uploaded successfully
-        for message in messages {
-            sqlx::query(
-                r#"
-                UPDATE sms
-                SET uploaded_to_platform = 1,
-                    platform_item_id = ?,
-                    platform_uploaded_at = datetime('now'),
-                    platform_response = ?
-                WHERE sim_id = ?
-                  AND message = ?
-                  AND send = 0
-                  AND uploaded_to_platform = 0
-                  AND platform_item_id IS NULL
-                  AND timestamp > datetime('now', '-5 seconds')
-                "#,
-            )
-            .bind(&platform_item_id)
-            .bind(&platform_response)
-            .bind(sim_id)
-            .bind(message)
-            .execute(pool)
-            .await?;
-        }
-        
-        Ok(())
+        Self::mark_platform_attempt_by_phone_message(
+            phone_num,
+            sim_id,
+            messages,
+            None,
+            true,
+            platform_response,
+        )
+        .await
     }
 
     /// Find SMS records that were recently inserted for a SIM card
@@ -1005,16 +1041,18 @@ impl FirefoxBatchUpload {
 }
 
 impl Sms {
-    /// Mark an SMS as uploaded to the platform.
-    pub async fn mark_uploaded(
+    /// Mark an SMS with the latest platform upload attempt result.
+    pub async fn mark_platform_attempt(
         id: i64,
         item_id: &str,
+        uploaded_to_platform: bool,
         response: Option<&str>,
     ) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(
-            "UPDATE sms SET uploaded_to_platform = 1, platform_item_id = ?, platform_uploaded_at = datetime('now'), platform_response = ? WHERE id = ?",
+            "UPDATE sms SET uploaded_to_platform = ?, platform_item_id = ?, platform_uploaded_at = datetime('now'), platform_response = ? WHERE id = ?",
         )
+        .bind(uploaded_to_platform)
         .bind(item_id)
         .bind(response)
         .bind(id)
@@ -1023,17 +1061,42 @@ impl Sms {
         Ok(())
     }
 
-    /// Query SMS uploaded for a given platform item.
+    /// Mark an SMS as uploaded to the platform.
+    pub async fn mark_uploaded(id: i64, item_id: &str, response: Option<&str>) -> Result<()> {
+        Self::mark_platform_attempt(id, item_id, true, response).await
+    }
+
+    /// Query SMS attempts for a given platform item.
     pub async fn query_by_platform_item(item_id: &str) -> Result<Vec<Self>> {
+        Self::query_by_platform_item_and_sim(item_id, None).await
+    }
+
+    /// Query SMS attempts for a given platform item and optional SIM context.
+    pub async fn query_by_platform_item_and_sim(
+        item_id: &str,
+        sim_id: Option<&str>,
+    ) -> Result<Vec<Self>> {
         let pool = get_pool()?;
-        let sms_list = sqlx::query_as(
-            "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
-             FROM sms WHERE platform_item_id = ? ORDER BY platform_uploaded_at DESC",
-        )
-        .bind(item_id)
-        .fetch_all(pool)
-        .await?;
+        let sms_list = if let Some(sim_id) = sim_id {
+            sqlx::query_as(
+                "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
+                 uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+                 FROM sms WHERE platform_item_id = ? AND sim_id = ? ORDER BY platform_uploaded_at DESC, id DESC",
+            )
+            .bind(item_id)
+            .bind(sim_id)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
+                 uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+                 FROM sms WHERE platform_item_id = ? ORDER BY platform_uploaded_at DESC, id DESC",
+            )
+            .bind(item_id)
+            .fetch_all(pool)
+            .await?
+        };
         Ok(sms_list)
     }
 
@@ -1092,6 +1155,8 @@ impl FirefoxPlatformItem {
             "INSERT INTO firefox_platform_items (item_id, country_id, phone_num, iccid, sim_id) \
              VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT(item_id, country_id, phone_num) DO UPDATE SET \
+             iccid = excluded.iccid, \
+             sim_id = excluded.sim_id, \
              updated_at = datetime('now')",
         )
         .bind(item_id)
@@ -1147,14 +1212,17 @@ impl FirefoxPlatformItem {
         let stats = sqlx::query_as::<_, PlatformItemStat>(
             "SELECT \
                 s.platform_item_id AS item_id, \
-                COALESCE(MAX(i.country_id), '') AS country_id, \
-                COALESCE(MAX(i.phone_num), '') AS phone_num, \
+               COALESCE(MAX(i.country_id), MAX(sc.country_code), '') AS country_id, \
+               COALESCE(MAX(i.phone_num), MAX(sc.phone_number), '') AS phone_num, \
                 s.sim_id AS iccid, \
                 COUNT(*) AS total_sms, \
-                SUM(CASE WHEN s.uploaded_to_platform THEN 1 ELSE 0 END) AS uploaded_sms \
+                SUM(CASE WHEN s.uploaded_to_platform THEN 1 ELSE 0 END) AS uploaded_sms, \
+                SUM(CASE WHEN s.uploaded_to_platform THEN 0 ELSE 1 END) AS failed_sms \
              FROM sms s \
              LEFT JOIN firefox_platform_items i \
                  ON s.platform_item_id = i.item_id AND s.sim_id = i.iccid \
+             LEFT JOIN sim_cards sc \
+                 ON s.sim_id = sc.id \
              WHERE s.platform_item_id IS NOT NULL \
              GROUP BY s.platform_item_id, s.sim_id \
              ORDER BY total_sms DESC",
@@ -1173,6 +1241,7 @@ pub struct PlatformItemStat {
     pub iccid: String,
     pub total_sms: i64,
     pub uploaded_sms: i64,
+    pub failed_sms: i64,
 }
 
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]

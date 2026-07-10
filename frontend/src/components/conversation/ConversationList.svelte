@@ -106,7 +106,18 @@
 
   <!-- 鈹€鈹€ Header 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ -->
   <div class="flex items-center justify-between mb-3">
-    <h2 class="text-base font-semibold text-gray-800 dark:text-gray-200">{$t('messages')}</h2>
+    <div class="flex items-center gap-2">
+      <button
+        class="inline-flex items-center justify-center w-8 h-8 rounded-lg border border-gray-200 dark:border-zinc-700
+               text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
+        onclick={() => window.location.href = '/'}
+        aria-label="Back to Dashboard"
+        title="Back to Dashboard"
+      >
+        <Icon icon="carbon:chevron-left" class="w-5 h-5" />
+      </button>
+      <h2 class="text-base font-semibold text-gray-800 dark:text-gray-200">{$t('messages')}</h2>
+    </div>
     <button
       class="p-2 rounded-lg bg-gray-800 dark:bg-gray-200 text-gray-100 dark:text-gray-900
              hover:bg-gray-700 dark:hover:bg-gray-300 transition-all active:scale-95"

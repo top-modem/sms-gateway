@@ -72,7 +72,7 @@
         class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
         aria-label="Back"
       >
-        <Icon icon="carbon:arrow-left" class="w-5 h-5" />
+        <Icon icon="carbon:chevron-left" class="w-5 h-5" />
       </button>
       <div>
         <h1 class="text-lg font-semibold">Platform Statistics</h1>

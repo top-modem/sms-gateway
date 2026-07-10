@@ -285,7 +285,7 @@
   <!-- ── Header ─────────────────────────────────────────────────────────────── -->
   <header class="flex items-center gap-3 px-4 py-3 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800 shadow-sm">
     <button onclick={onBack} class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-zinc-800 transition">
-      <Icon icon="carbon:arrow-left" class="w-5 h-5 text-gray-600 dark:text-gray-300" />
+      <Icon icon="carbon:chevron-left" class="w-5 h-5 text-gray-600 dark:text-gray-300" />
     </button>
     <Icon icon="carbon:phone-voice" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
     <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('phone_number_title')}</h1>

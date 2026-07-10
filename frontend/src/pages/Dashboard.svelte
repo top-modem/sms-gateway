@@ -76,6 +76,7 @@
   
   <!-- 主内容区域 -->
   <div class="flex-1 bg-white dark:bg-zinc-900 flex flex-col">
+    <!-- Mobile Header -->
     <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800/70 lg:hidden sticky top-0 z-10 bg-white/90 dark:bg-zinc-900/90">
       <button
         class="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-gray-200 dark:border-zinc-700 text-slate-800 dark:text-gray-100 bg-white shadow-sm dark:bg-zinc-800 active:scale-[0.98] transition"
@@ -88,13 +89,6 @@
         <p class="text-sm text-gray-700 dark:text-gray-200 truncate max-w-[140px]">
           {$currentContact ? $currentContact.name : $t('messages')}
         </p>
-        <button
-          class="inline-flex items-center justify-center w-10 h-10 rounded-xl border border-gray-200 dark:border-zinc-700 text-slate-800 dark:text-gray-100 bg-white shadow-sm dark:bg-zinc-800 active:scale-[0.98] transition"
-          onclick={onNavigate}
-          aria-label="SIM Dashboard"
-        >
-          <Icon icon="carbon:grid" class="w-5 h-5" />
-        </button>
         <button
           class="inline-flex items-center justify-center w-10 h-10 rounded-xl border border-gray-200 dark:border-zinc-700 text-slate-800 dark:text-gray-100 bg-white shadow-sm dark:bg-zinc-800 active:scale-[0.98] transition"
           onclick={handleSimCardClick}

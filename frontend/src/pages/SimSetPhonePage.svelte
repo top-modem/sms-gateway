@@ -85,7 +85,7 @@
              text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
       aria-label="Back"
     >
-      <Icon icon="carbon:arrow-left" class="w-5 h-5" />
+      <Icon icon="carbon:chevron-left" class="w-5 h-5" />
     </button>
     <div class="flex items-center gap-2">
       <Icon icon="carbon:phone" class="w-5 h-5 text-gray-500 dark:text-gray-400" />

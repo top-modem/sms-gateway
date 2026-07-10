@@ -1351,6 +1351,20 @@ impl ModemManager {
                 continue;
             }
 
+            // MMS send completion — resolve the waiter set by Modem::send_mms().
+            if line.starts_with("+QMMSEND:") {
+                if let Some((err_code, http_code)) = Modem::parse_qmmsend(&line) {
+                    info!(
+                        "[URC {}] MMS send completed: err={}, http={}",
+                        sim_id, err_code, http_code
+                    );
+                    modem.resolve_mms_completion(err_code, http_code).await;
+                } else {
+                    error!("[URC {}] failed to parse +QMMSEND: line: {}", sim_id, line);
+                }
+                continue;
+            }
+
             // Any other URC (e.g. +CMTI:, +CSQ:) — log at trace level
             log::trace!("[URC {}] unhandled: {:?}", sim_id, line);
         }

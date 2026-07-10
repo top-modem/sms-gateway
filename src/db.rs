@@ -1602,6 +1602,231 @@ impl ModemSMS {
     }
 }
 
+/// Represents a queued/sent MMS message
+#[derive(Debug, FromRow, Deserialize, Serialize, Clone)]
+pub struct MmsMessage {
+    pub id: String,
+    pub sim_id: String,
+    pub to_number: String,
+    pub subject: Option<String>,
+    /// queued | sending | sent | failed | timeout
+    pub status: String,
+    pub quectel_err_code: Option<i32>,
+    pub http_response_code: Option<i32>,
+    pub error_message: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+impl MmsMessage {
+    /// Enqueue a new MMS send job with status "queued". Returns the new job id.
+    pub async fn insert_queued(sim_id: &str, to_number: &str, subject: Option<&str>) -> Result<String> {
+        let pool = get_pool()?;
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().naive_utc();
+        sqlx::query(
+            r#"INSERT INTO mms_messages (id, sim_id, to_number, subject, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(sim_id)
+        .bind(to_number)
+        .bind(subject)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Fetch up to `limit` jobs that are still queued, oldest first.
+    pub async fn get_queued(limit: i64) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            r#"SELECT id, sim_id, to_number, subject, status, quectel_err_code, http_response_code,
+                      error_message, created_at, updated_at
+               FROM mms_messages WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?"#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(items)
+    }
+
+    pub async fn mark_sending(id: &str) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query("UPDATE mms_messages SET status = 'sending', updated_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Record the final outcome of a send attempt.
+    pub async fn mark_result(
+        id: &str,
+        status: &str,
+        quectel_err_code: Option<i32>,
+        http_response_code: Option<i32>,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            r#"UPDATE mms_messages
+               SET status = ?, quectel_err_code = ?, http_response_code = ?, error_message = ?, updated_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(status)
+        .bind(quectel_err_code)
+        .bind(http_response_code)
+        .bind(error_message)
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn find_by_id(id: &str) -> Result<Option<Self>> {
+        let pool = get_pool()?;
+        let item = sqlx::query_as(
+            r#"SELECT id, sim_id, to_number, subject, status, quectel_err_code, http_response_code,
+                      error_message, created_at, updated_at
+               FROM mms_messages WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(item)
+    }
+
+    pub async fn query_paginated(limit: i64, offset: i64) -> Result<(Vec<Self>, i64)> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            r#"SELECT id, sim_id, to_number, subject, status, quectel_err_code, http_response_code,
+                      error_message, created_at, updated_at
+               FROM mms_messages ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mms_messages")
+            .fetch_one(pool)
+            .await?;
+        Ok((items, total))
+    }
+}
+
+/// Attachment metadata (no blob data) — safe to serialize directly in API responses.
+#[derive(Debug, FromRow, Deserialize, Serialize, Clone)]
+pub struct MmsAttachmentMeta {
+    pub id: String,
+    pub mms_id: String,
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub size_bytes: i64,
+}
+
+/// Namespace for MMS attachment blob storage/retrieval.
+pub struct MmsAttachment;
+
+impl MmsAttachment {
+    pub async fn insert(mms_id: &str, filename: &str, content_type: Option<&str>, data: &[u8]) -> Result<String> {
+        let pool = get_pool()?;
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"INSERT INTO mms_attachments (id, mms_id, filename, content_type, size_bytes, data)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(mms_id)
+        .bind(filename)
+        .bind(content_type)
+        .bind(data.len() as i64)
+        .bind(data)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn list_meta(mms_id: &str) -> Result<Vec<MmsAttachmentMeta>> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            r#"SELECT id, mms_id, filename, content_type, size_bytes
+               FROM mms_attachments WHERE mms_id = ?"#,
+        )
+        .bind(mms_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(items)
+    }
+
+    /// Fetch attachment (filename, raw bytes) pairs for a job, in insertion order.
+    pub async fn fetch_all_with_data(mms_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let pool = get_pool()?;
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            r#"SELECT filename, data FROM mms_attachments WHERE mms_id = ? ORDER BY rowid ASC"#,
+        )
+        .bind(mms_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
+}
+
+/// Per-SIM MMS profile (APN/MMSC/proxy differ by carrier).
+#[derive(Debug, FromRow, Deserialize, Serialize, Clone, Default)]
+pub struct MmsProfile {
+    pub sim_id: String,
+    pub mms_apn: Option<String>,
+    pub mms_mmsc: Option<String>,
+    pub mms_proxy_host: Option<String>,
+    pub mms_proxy_port: Option<i32>,
+}
+
+impl MmsProfile {
+    pub async fn get(sim_id: &str) -> Result<Option<Self>> {
+        let pool = get_pool()?;
+        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
+            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port FROM sim_cards WHERE id = ?"#,
+        )
+        .bind(sim_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port)| Self {
+            sim_id,
+            mms_apn,
+            mms_mmsc,
+            mms_proxy_host,
+            mms_proxy_port,
+        }))
+    }
+
+    pub async fn set(
+        sim_id: &str,
+        mms_apn: Option<&str>,
+        mms_mmsc: Option<&str>,
+        mms_proxy_host: Option<&str>,
+        mms_proxy_port: Option<i32>,
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?
+               WHERE id = ?"#,
+        )
+        .bind(mms_apn)
+        .bind(mms_mmsc)
+        .bind(mms_proxy_host)
+        .bind(mms_proxy_port)
+        .bind(sim_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+}
+
 /// Initializes SQLite database
 pub async fn db_init() -> Result<()> {
     #[cfg(debug_assertions)]

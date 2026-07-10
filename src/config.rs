@@ -43,6 +43,9 @@ pub struct Settings {
     /// Maximum number of modems to initialize concurrently (default 3).
     /// Set to 1 (or 0) for fully serial initialization if your USB hub is unstable.
     pub max_concurrent_modem_init: Option<usize>,
+    /// Seconds to pass as the `AT+QMMSEND=<timeout>` argument and to wait for the
+    /// modem's `+QMMSEND:` completion URC before giving up (default 60).
+    pub mms_send_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

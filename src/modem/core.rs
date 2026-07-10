@@ -31,6 +31,8 @@ const TERMINATORS: &[&[u8]] = &[
     b"\r\n> ",
     b"\r\n+CME ERROR",
     b"\r\n+CMS ERROR",
+    // AT+QFUPL "ready to receive binary data" prompt (used for MMS attachment upload).
+    b"CONNECT\r\n",
 ];
 
 /// Terminators that have a variable-length error code after the prefix.
@@ -79,6 +81,9 @@ pub struct Modem {
     command_task: JoinHandle<()>,
     /// If true, force COPS 46001 when IMSI MCC is 234/235.
     force_uk_mcc_to_46001: bool,
+    /// Oneshot sender for the in-flight MMS send, resolved by the URC handler when
+    /// the modem emits the async `+QMMSEND: <err>,<httprsp>` completion notification.
+    pending_mms: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32)>>>>,
 }
 
 impl Modem {
@@ -146,6 +151,7 @@ impl Modem {
             reader_task,
             command_task,
             force_uk_mcc_to_46001,
+            pending_mms: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -1621,6 +1627,184 @@ impl Modem {
             .ok_or_else(|| io::Error::other("AT+QFDWL: missing +QFDWL trailer"))?;
 
         Ok(after_connect[..trailer_pos].to_vec())
+    }
+
+    // ─── MMS (AT+QMMSCFG / AT+QMMSEDIT / AT+QMMSEND / AT+QFUPL) ────────────────
+
+    /// Upload a file to modem RAM storage using `AT+QFUPL`, used to attach images
+    /// to an MMS draft before `AT+QMMSEND`. Mirrors `send_pdu_atomic`'s two-step
+    /// pattern: hold the write lock across the setup command (wait for the
+    /// `CONNECT` prompt) and the raw data write (wait for `+QFUPL: <size>,<crc>`/`OK`).
+    pub async fn upload_file(&self, filename: &str, data: &[u8]) -> anyhow::Result<()> {
+        let setup_cmd = format!("AT+QFUPL=\"{}\",{}\r\n", filename, data.len());
+
+        let mut write_guard = self.write_half.lock().await;
+        let write = write_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Serial port not connected"))?;
+
+        // Step 1: send AT+QFUPL=... and wait for the CONNECT prompt.
+        let (tx1, rx1) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        self.reader_state.lock().await.response_tx = Some(tx1);
+        debug!("TX [{}]: {}", self.name, Self::format_log(&setup_cmd));
+        write.write_all(setup_cmd.as_bytes()).await?;
+        write.flush().await?;
+        let prompt = match tokio::time::timeout(Duration::from_secs(10), rx1).await {
+            Ok(Ok(Ok(r))) => r,
+            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+            Err(_) => {
+                self.reader_state.lock().await.response_tx = None;
+                return Err(anyhow::anyhow!("Timeout waiting for QFUPL CONNECT prompt"));
+            }
+        };
+        if !prompt.contains("CONNECT") {
+            return Err(anyhow::anyhow!(
+                "QFUPL CONNECT prompt not received: {}",
+                Self::format_log(&prompt)
+            ));
+        }
+
+        // Step 2: write the raw file bytes and wait for the +QFUPL/OK confirmation.
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        self.reader_state.lock().await.response_tx = Some(tx2);
+        debug!("TX [{}]: <QFUPL {} bytes>", self.name, data.len());
+        write.write_all(data).await?;
+        write.flush().await?;
+        let final_response = match tokio::time::timeout(Duration::from_secs(60), rx2).await {
+            Ok(Ok(Ok(r))) => r,
+            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+            Err(_) => {
+                self.reader_state.lock().await.response_tx = None;
+                return Err(anyhow::anyhow!("Timeout waiting for QFUPL completion"));
+            }
+        };
+
+        if final_response.contains("OK\r\n") && final_response.contains("+QFUPL:") {
+            Ok(())
+        } else {
+            error!(
+                "Incomplete QFUPL response: {}",
+                Self::format_log(&final_response)
+            );
+            Err(anyhow::anyhow!("Incomplete QFUPL response"))
+        }
+    }
+
+    /// Apply an MMS profile (APN/MMSC/proxy) to the modem before sending.
+    /// Mirrors the `AT+QICSGP` / `AT+QMMSCFG` sequence used by python-gsmmodem's `APNS` command.
+    pub async fn configure_mms_profile(
+        &self,
+        apn: &str,
+        mmsc: &str,
+        proxy_host: &str,
+        proxy_port: u16,
+    ) -> anyhow::Result<()> {
+        self.send_command_with_ok(&format!("AT+QICSGP=1,1,\"{}\",\"\",\"\",0\r\n", apn))
+            .await?;
+        self.send_command_with_ok("AT+QMMSCFG=\"contextid\",1\r\n").await?;
+        self.send_command_with_ok(&format!("AT+QMMSCFG=\"mmsc\",\"{}\"\r\n", mmsc))
+            .await?;
+        self.send_command_with_ok(&format!(
+            "AT+QMMSCFG=\"proxy\",\"{}\",{}\r\n",
+            proxy_host, proxy_port
+        ))
+        .await?;
+        self.send_command_with_ok("AT+QMMSCFG=\"character\",\"UTF8\"\r\n")
+            .await?;
+        Ok(())
+    }
+
+    /// Register a completion waiter for the next `+QMMSEND:` URC.
+    /// Must be called immediately before issuing `AT+QMMSEND`.
+    async fn take_mms_waiter(&self) -> tokio::sync::oneshot::Receiver<(i32, i32)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.pending_mms.lock().await = Some(tx);
+        rx
+    }
+
+    /// Called by the URC handler when a `+QMMSEND: <err>,<httprsp>` notification arrives.
+    pub async fn resolve_mms_completion(&self, err_code: i32, http_code: i32) {
+        if let Some(tx) = self.pending_mms.lock().await.take() {
+            let _ = tx.send((err_code, http_code));
+        }
+    }
+
+    /// Compose and send an MMS: clears any existing draft, sets recipient/subject,
+    /// uploads and attaches each file, then issues `AT+QMMSEND` and awaits the
+    /// asynchronous `+QMMSEND: <err>,<httprsp>` completion URC.
+    ///
+    /// Returns `(quectel_err_code, http_response_code)`. `err_code == 0` means success.
+    pub async fn send_mms(
+        &self,
+        to: &str,
+        subject: Option<&str>,
+        attachments: &[(String, Vec<u8>)],
+        send_timeout_secs: u64,
+    ) -> anyhow::Result<(i32, i32)> {
+        // Clear any stale draft first (ignore errors — there may be nothing to clear).
+        let _ = self.send_command_with_ok("AT+QMMSEDIT=0\r\n").await;
+
+        self.send_command_with_ok(&format!("AT+QMMSEDIT=1,1,\"{}\"\r\n", to))
+            .await?;
+        if let Some(subject) = subject {
+            if !subject.is_empty() {
+                self.send_command_with_ok(&format!("AT+QMMSEDIT=4,1,\"{}\"\r\n", subject))
+                    .await?;
+            }
+        }
+
+        let mut ram_names = Vec::with_capacity(attachments.len());
+        for (idx, (filename, data)) in attachments.iter().enumerate() {
+            let ram_name = format!("RAM:mms_{}_{}", idx, filename);
+            self.upload_file(&ram_name, data).await?;
+            self.send_command_with_ok(&format!("AT+QMMSEDIT=5,1,\"{}\"\r\n", ram_name))
+                .await?;
+            ram_names.push(ram_name);
+        }
+
+        let waiter = self.take_mms_waiter().await;
+        let send_result = self
+            .send_command_with_ok(&format!("AT+QMMSEND={}\r\n", send_timeout_secs))
+            .await;
+
+        let outcome = if let Err(e) = send_result {
+            *self.pending_mms.lock().await = None;
+            Err(anyhow::anyhow!("AT+QMMSEND rejected: {}", e))
+        } else {
+            match tokio::time::timeout(Duration::from_secs(send_timeout_secs + 15), waiter).await {
+                Ok(Ok((err, http))) => Ok((err, http)),
+                Ok(Err(_)) => Err(anyhow::anyhow!("MMS completion channel closed")),
+                Err(_) => {
+                    *self.pending_mms.lock().await = None;
+                    Err(anyhow::anyhow!("Timed out waiting for +QMMSEND completion"))
+                }
+            }
+        };
+
+        // Best-effort cleanup regardless of outcome — free RAM storage and clear the draft.
+        for ram_name in &ram_names {
+            let _ = self
+                .send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_name))
+                .await;
+        }
+        let _ = self.send_command("AT+QMMSEDIT=0\r\n").await;
+
+        outcome
+    }
+
+    /// Parse a `+QMMSEND: <err>,<httprsp>` URC line.
+    pub fn parse_qmmsend(line: &str) -> Option<(i32, i32)> {
+        let data = line.split(':').nth(1)?;
+        let parts: Vec<&str> = data.split(',').collect();
+        if parts.len() >= 2 {
+            let err = parts[0].trim().parse().ok()?;
+            let http = parts[1].trim().parse().ok()?;
+            Some((err, http))
+        } else {
+            None
+        }
     }
 
     /// Extract the caller number from a `+CLIP:` URC line.

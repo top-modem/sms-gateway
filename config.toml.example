@@ -23,6 +23,7 @@ read_sms_frequency = 30          # How often to check for new SMS messages
 # auto_answer_delay_secs = 2               # Delay before auto-answering (0=immediate, 2=default)
 # force_uk_mcc_to_46001 = true             # If MCC is 234/235, send AT+COPS=1,2,"46001" during SIM init
 # max_concurrent_modem_init = 3            # Parallel modem initialization (default 3). Set to 1 for fully serial init on unstable USB hubs.
+# mms_send_timeout_secs = 60               # AT+QMMSEND timeout and max wait for the +QMMSEND: completion URC (default 60)
 
 # Webhook configuration
 webhooks_max_concurrent = 10     # Maximum concurrent webhook requests

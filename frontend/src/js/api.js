@@ -283,6 +283,51 @@ class ApiClient {
     async getFirefoxPlatformRejectionReasons() {
         return FetchApi.get('/api/firefox/platform-rejection-reasons');
     }
+
+    // ── MMS (EC20/EC25 via AT+QMMSEDIT/AT+QMMSEND) ──────────────────────────
+
+    /**
+     * Enqueue a new MMS send job. Returns { id, status: "queued" } immediately;
+     * the actual send happens asynchronously in the background worker.
+     * @param {{sim_id: string, to: string, subject?: string, attachments?: {filename: string, content_type?: string, base64: string}[]}} payload
+     */
+    async sendMms(payload) {
+        return FetchApi.post('/api/mms', payload);
+    }
+
+    /**
+     * Get paginated MMS job history.
+     * @param {number} [page=1]
+     * @param {number} [perPage=20]
+     */
+    async getMmsPaginated(page = 1, perPage = 20) {
+        return FetchApi.get('/api/mms', { page, per_page: perPage });
+    }
+
+    /**
+     * Get a single MMS job with its attachment metadata.
+     * @param {string} id
+     */
+    async getMmsDetail(id) {
+        return FetchApi.get(`/api/mms/${id}`);
+    }
+
+    /**
+     * Get the stored MMS network profile (APN/MMSC/proxy) for a SIM card.
+     * @param {string} simId
+     */
+    async getMmsProfile(simId) {
+        return FetchApi.get(`/api/sim-cards/${simId}/mms-profile`);
+    }
+
+    /**
+     * Update the MMS network profile for a SIM card.
+     * @param {string} simId
+     * @param {{apn?: string, mmsc?: string, proxy_host?: string, proxy_port?: number}} payload
+     */
+    async setMmsProfile(simId, payload) {
+        return FetchApi.put(`/api/sim-cards/${simId}/mms-profile`, payload, {}, 'application/json');
+    }
 }
 
 // Export as a singleton

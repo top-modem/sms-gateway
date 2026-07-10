@@ -17,6 +17,7 @@ mod decode;
 mod firefox_api;
 mod firefox_upload_retry;
 mod firefox_upload_retry_worker;
+mod mms_worker;
 mod modem;
 mod phone_number;
 mod service_control;
@@ -117,6 +118,11 @@ async fn main() {
     tokio::spawn(firefox_poll_worker(modem_manager.clone()));
 
     firefox_upload_retry_worker::start_retry_worker();
+
+    mms_worker::start_mms_worker(
+        modem_manager.clone(),
+        config.settings.mms_send_timeout_secs.unwrap_or(60),
+    );
 
     if let Ok(_) = api::run_api(
         modem_manager.clone(),

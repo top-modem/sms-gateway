@@ -432,8 +432,24 @@ impl ModemManager {
 
         ModemSMS::bulk_insert(&sms_list).await?;
 
-        // Return the actual persisted SMS record from the database so callers have its id
-        Sms::find_latest_incoming_by_sim_id(sim_id).await.map_err(Into::into)
+        let latest = sms_list
+            .into_iter()
+            .filter(|s| !s.send)
+            .max_by_key(|s| s.timestamp);
+
+        Ok(latest.map(|sms| Sms {
+            id: 0,
+            contact_id: sms.contact,
+            timestamp: sms.timestamp,
+            message: sms.message,
+            sim_id: sms.sim_id,
+            send: sms.send,
+            status: SmsStatus::Read,
+            uploaded_to_platform: false,
+            platform_item_id: None,
+            platform_uploaded_at: None,
+            platform_response: None,
+        }))
     }
 
     pub async fn read_all_sms_async(
@@ -555,13 +571,6 @@ impl ModemManager {
             if let Some(modem) = modems.remove(&iccid) {
                 if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {
                     task.abort();
-                }
-                // Remove stale SIM card record so the dashboard doesn't show it
-                if let Err(e) = SimCard::delete_by_id(&iccid).await {
-                    log::warn!(
-                        "Failed to delete sim_cards record for {} on {}: {}",
-                        iccid, com_port, e
-                    );
                 }
                 let baud_rate = modem.baud_rate;
                 drop(modems);
@@ -1321,26 +1330,7 @@ impl ModemManager {
                 continue;
             }
 
-            if line.starts_with("+CMTI:") {
-                // New SMS arrived on the modem — trigger an immediate read/upload
-                // so the platform gets it without waiting for the periodic worker.
-                log::info!("[URC {}] incoming SMS notification: {}", sim_id, line);
-                let modem_c = modem.clone();
-                let sse_c = sse.clone();
-                let sim_id_c = sim_id.clone();
-                tokio::spawn(async move {
-                    log::info!("[URC {}] triggering immediate SMS read/upload", sim_id_c);
-                    if let Err(e) = modem_c
-                        .read_sms_async_insert(SmsType::All, sse_c, None)
-                        .await
-                    {
-                        log::warn!("[URC {}] immediate SMS read/upload failed: {}", sim_id_c, e);
-                    }
-                });
-                continue;
-            }
-
-            // Any other URC (e.g. +CSQ:) — log at trace level
+            // Any other URC (e.g. +CMTI:, +CSQ:) — log at trace level
             log::trace!("[URC {}] unhandled: {:?}", sim_id, line);
         }
     }

@@ -15,6 +15,8 @@ mod config;
 mod db;
 mod decode;
 mod firefox_api;
+mod firefox_upload_retry;
+mod firefox_upload_retry_worker;
 mod modem;
 mod phone_number;
 mod transcribe;
@@ -113,6 +115,8 @@ async fn main() {
 
     tokio::spawn(firefox_poll_worker(modem_manager.clone()));
 
+    firefox_upload_retry_worker::start_retry_worker();
+
     if let Ok(_) = api::run_api(
         modem_manager.clone(),
         &config.settings.server_host,
@@ -206,11 +210,6 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 continue;
                             }
 
-                            // Persist/refresh platform item
-                            if let Err(e) = crate::db::FirefoxPlatformItem::upsert(&item_id, country_id, phone_num).await {
-                                log::warn!("[火狐狸轮询] 保存平台 item 失败: item_id={}, phone={}, error={}", item_id, phone_num, e);
-                            }
-
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
 
                             // Skip if we already processed this item
@@ -253,15 +252,45 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Ok(Some(sms)) => {
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
                                     match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
-                                        Ok(upload_resp) if upload_resp.code == "1" => {
-                                            log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp);
-                                            let resp_data = upload_resp.data.as_deref();
-                                            if let Err(e) = crate::db::Sms::mark_uploaded(sms.id, &item_id, resp_data).await {
-                                                log::warn!("[火狐狸轮询] 标记 SMS 上传状态失败: id={}, error={}", sms.id, e);
+                                        Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
+                                        Ok(upload_resp) => {
+                                            // Enqueue for retry instead of just logging
+                                            let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                sms.id,
+                                                phone_num.to_string(),
+                                                country_id.to_string(),
+                                                sms.message.clone(),
+                                                format!("Upload failed with code: {}", upload_resp.code),
+                                                Some(upload_resp.code.clone()),
+                                            );
+                                            
+                                            match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                &retry_item
+                                            ).await {
+                                                Ok(_) => log::info!("[火狐狸轮询] 短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, code: {}", phone_num, item_id, retry_item.id, upload_resp.code),
+                                                Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
                                             }
-                                        }
-                                        Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
-                                        Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
+                                        },
+                                        Err(e) => {
+                                            // Network error - also queue for retry
+                                            let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                sms.id,
+                                                phone_num.to_string(),
+                                                country_id.to_string(),
+                                                sms.message.clone(),
+                                                format!("Upload failed: {}", e),
+                                                None,
+                                            );
+                                            
+                                            match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                &retry_item
+                                            ).await {
+                                                Ok(_) => log::info!("[火狐狸轮询] 短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, 错误: {}", phone_num, item_id, retry_item.id, e),
+                                                Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                            }
+                                        },
                                     }
                                 }
                                 Ok(None) => {
@@ -276,8 +305,44 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                             log::info!("[火狐狸轮询] 从平台获取到短信内容, 上传中 - 号码: {}, Item_ID: {}", phone_num, item_id);
                                                             match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await {
                                                                 Ok(upload_resp) if upload_resp.code == "1" => log::info!("[火狐狸轮询] 短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp),
-                                                                Ok(upload_resp) => log::warn!("[火狐狸轮询] 短信上传失败 (平台返回) - 号码: {}, Item_ID: {}, code: {}, data: {:?}", phone_num, item_id, upload_resp.code, upload_resp.data),
-                                                                Err(e) => log::warn!("[火狐狸轮询] 短信上传失败 - 号码: {}, Item_ID: {}, 错误: {}", phone_num, item_id, e),
+                                                                Ok(upload_resp) => {
+                                                                    // Enqueue for retry - using 0 as placeholder sms_id since this is from platform fallback
+                                                                    let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                                        0, // Fallback path: no local SMS record
+                                                                        phone_num.to_string(),
+                                                                        country_id.to_string(),
+                                                                        content.to_string(),
+                                                                        format!("Upload failed with code: {}", upload_resp.code),
+                                                                        Some(upload_resp.code.clone()),
+                                                                    );
+                                                                     
+                                                                    match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                                        &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                                        &retry_item
+                                                                    ).await {
+                                                                        Ok(_) => log::info!("[火狐狸轮询] 短信上传失败（来自平台列表），已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}", phone_num, item_id, retry_item.id),
+                                                                        Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                                    }
+                                                                },
+                                                                Err(e) => {
+                                                                    // Network error - also queue for retry
+                                                                    let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                                        0, // Fallback path: no local SMS record
+                                                                        phone_num.to_string(),
+                                                                        country_id.to_string(),
+                                                                        content.to_string(),
+                                                                        format!("Upload failed: {}", e),
+                                                                        None,
+                                                                    );
+                                                                     
+                                                                    match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                                        &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                                        &retry_item
+                                                                    ).await {
+                                                                        Ok(_) => log::info!("[火狐狸轮询] 短信上传失败（来自平台列表），已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}", phone_num, item_id, retry_item.id),
+                                                                        Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                                    }
+                                                                },
                                                             }
                                                         }
                                                     }

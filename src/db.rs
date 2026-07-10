@@ -540,6 +540,78 @@ impl Sms {
 
         Ok(())
     }
+
+    /// Mark SMS records as successfully uploaded to platform
+    pub async fn mark_uploaded_by_phone_message(
+        phone_num: &str,
+        sim_id: &str,
+        messages: &[String],
+        platform_response: Option<String>,
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        
+        // Get the correct platform_item_id from the firefox_platform_items table
+        // (not the phone number itself)
+        let platform_item_id = match FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await? {
+            Some(item_id) => item_id,
+            None => {
+                log::warn!(
+                    "No platform item found for phone_num: {}, cannot mark SMS as uploaded",
+                    phone_num
+                );
+                return Ok(());
+            }
+        };
+        
+        // Build a query to update SMS records matching the phone, sim, and messages
+        // This handles incoming SMS that were just uploaded successfully
+        for message in messages {
+            sqlx::query(
+                r#"
+                UPDATE sms
+                SET uploaded_to_platform = 1,
+                    platform_item_id = ?,
+                    platform_uploaded_at = datetime('now'),
+                    platform_response = ?
+                WHERE sim_id = ?
+                  AND message = ?
+                  AND send = 0
+                  AND uploaded_to_platform = 0
+                  AND platform_item_id IS NULL
+                  AND timestamp > datetime('now', '-5 seconds')
+                "#,
+            )
+            .bind(&platform_item_id)
+            .bind(&platform_response)
+            .bind(sim_id)
+            .bind(message)
+            .execute(pool)
+            .await?;
+        }
+        
+        Ok(())
+    }
+
+    /// Find SMS records that were recently inserted for a SIM card
+    pub async fn find_recent_received_sms(sim_id: &str, limit: i32) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let sms_records = sqlx::query_as(
+            r#"
+            SELECT id, contact_id, timestamp, message, sim_id, send, status, 
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
+            FROM sms
+            WHERE sim_id = ? AND send = 0 AND uploaded_to_platform = 0
+            ORDER BY timestamp DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(sim_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        
+        Ok(sms_records)
+    }
 }
 
 impl Contact {
@@ -888,6 +960,7 @@ impl FirefoxBatchUpload {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn query_by_country(country_id: &str) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let uploads = sqlx::query_as(
@@ -995,6 +1068,7 @@ pub struct FirefoxPlatformItem {
 }
 
 impl FirefoxPlatformItem {
+    #[allow(dead_code)]
     pub async fn upsert(
         item_id: &str,
         country_id: &str,
@@ -1054,6 +1128,7 @@ impl FirefoxPlatformItem {
     }
 
     /// Find the latest item_id for a given phone number.
+    #[allow(dead_code)]
     pub async fn find_latest_item_for_phone(phone_num: &str) -> Result<Option<String>> {
         let pool = get_pool()?;
         let result: Option<(String,)> = sqlx::query_as(
@@ -1415,7 +1490,7 @@ pub async fn db_init() -> Result<()> {
 }
 
 /// Retrieves the database connection pool
-fn get_pool() -> Result<&'static SqlitePool> {
+pub fn get_pool() -> Result<&'static SqlitePool> {
     POOL.get()
         .ok_or(anyhow::anyhow!("Database not initialized"))
 }

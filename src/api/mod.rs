@@ -14,6 +14,7 @@ use mime_guess::from_path;
 use reqwest::{header, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx;
 #[allow(unused_imports)]
 pub use sse_manager::{CallEvent, SseManager};
 
@@ -221,6 +222,12 @@ pub async fn run_api(
         .route("/firefox/platform-items", get(firefox_platform_items))
         .route("/firefox/platform-items/{item_id}", get(firefox_platform_item_detail))
         .route("/firefox/platform-statistics", get(firefox_platform_statistics))
+        // ── Firefox upload retry queue routes ────────────────────────────
+        .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
+        .route("/firefox/upload-retry/queue", get(firefox_upload_retry_queue))
+        .route("/firefox/upload-retry/dead-letter", get(firefox_upload_retry_dead_letter))
+        .route("/firefox/upload-retry/{id}/retry", post(firefox_upload_retry_manual))
+        .route("/firefox/upload-retry/{id}", delete(firefox_upload_retry_delete))
         // ── Voice call routes ─────────────────────────────────────────────
         .route(
             "/calls",
@@ -1983,5 +1990,65 @@ async fn set_sms_storage(
             Json(json!({"error": format!("Failed to set SMS storage: {}", e)})),
         )
             .into_response(),
+    }
+}
+
+// ─── Firefox Upload Retry Queue Handlers ─────────────────────────────────
+
+async fn firefox_upload_retry_stats() -> Response {
+    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_stats(&crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool"))).await {
+        Ok(stats) => (StatusCode::OK, Json(json!(stats))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to get queue statistics: {}", e)}))).into_response(),
+    }
+}
+
+async fn firefox_upload_retry_queue() -> Response {
+    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_ready_for_retry(&crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")), 100).await {
+        Ok(items) => (StatusCode::OK, Json(json!({"items": items, "count": items.len()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to get queue items: {}", e)}))).into_response(),
+    }
+}
+
+async fn firefox_upload_retry_dead_letter() -> Response {
+    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_dead_letter_items(&crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")), 100).await {
+        Ok(items) => (StatusCode::OK, Json(json!({"items": items, "count": items.len()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to get dead-letter items: {}", e)}))).into_response(),
+    }
+}
+
+async fn firefox_upload_retry_manual(Path(id): Path<String>) -> Response {
+    let pool = match crate::db::get_pool() {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Database error: {}", e)}))).into_response(),
+    };
+    
+    // Update the item to retry immediately
+    let now = chrono::Utc::now().naive_utc();
+    match sqlx::query(
+        "UPDATE firefox_upload_retry_queue SET next_retry_at = ? WHERE id = ?"
+    )
+    .bind(now)
+    .bind(&id)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => (StatusCode::OK, Json(json!({"message": "Item scheduled for immediate retry"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to update item: {}", e)}))).into_response(),
+    }
+}
+
+async fn firefox_upload_retry_delete(Path(id): Path<String>) -> Response {
+    let pool = match crate::db::get_pool() {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Database error: {}", e)}))).into_response(),
+    };
+    
+    match sqlx::query("DELETE FROM firefox_upload_retry_queue WHERE id = ?")
+        .bind(&id)
+        .execute(pool)
+        .await
+    {
+        Ok(_) => (StatusCode::OK, Json(json!({"message": "Item deleted from retry queue"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete item: {}", e)}))).into_response(),
     }
 }

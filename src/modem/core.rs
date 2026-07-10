@@ -840,13 +840,7 @@ impl Modem {
             match SimCard::query_all().await {
                 Ok(cards) => {
                     if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
-                        let country_id = card.country_code.as_deref();
-                        let phone_num = card.phone_number.as_deref();
-                        log::info!(
-                            "[{}] Preparing 火狐狸 SMS upload for SIM card: country_code={:?}, phone_number={:?}",
-                            sim_id, country_id, phone_num
-                        );
-                        if let (Some(country_id), Some(phone_num)) = (country_id, phone_num) {
+                        if let (Some(country_id), Some(phone_num)) = (&card.country_code, &card.phone_number) {
                             match crate::db::AppSetting::get("firefox_api_key").await {
                                 Ok(Some(api_key)) => {
                                     match reqwest::Client::builder()
@@ -856,40 +850,8 @@ impl Modem {
                                         Ok(client) => {
                                             for sms in &sms_list {
                                                 if sms.send {
-                                                    log::debug!("[{}] Skipping outgoing SMS for 火狐狸 upload", sim_id);
                                                     continue;
                                                 }
-
-                                                // Try to find the matching platform item from the wait list BEFORE uploading,
-                                                // because the platform removes the item once the SMS is received.
-                                                let mut item_id = None;
-                                                if let Ok(wait_resp) = crate::firefox_api::get_wait_phone_list(
-                                                    &client, &api_key,
-                                                ).await {
-                                                    if let Some(data) = wait_resp.data {
-                                                        if let Some(arr) = data.as_array() {
-                                                            for item in arr {
-                                                                let item_phone = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("");
-                                                                let item_country = item.get("Country_ID").and_then(|v| v.as_str()).unwrap_or("");
-                                                                if item_phone == phone_num && item_country == country_id {
-                                                                    item_id = item.get("Item_ID").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).map(|v| v.to_string());
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                if let Some(ref item_id) = item_id {
-                                                    let _ = crate::db::FirefoxPlatformItem::upsert(
-                                                        item_id, country_id, phone_num,
-                                                    ).await;
-                                                }
-
-                                                log::info!(
-                                                    "[{}] Uploading incoming SMS to 火狐狸: phone={}, message_len={}",
-                                                    sim_id, phone_num, sms.message.len()
-                                                );
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,
@@ -907,19 +869,25 @@ impl Modem {
                                                             resp.code,
                                                             resp.data
                                                         );
-                                                        // Try to find the local SMS record and mark it uploaded
-                                                        if let Ok(Some(db_sms)) = Sms::find_by_sim_and_message(
-                                                            &sim_id, &sms.message,
+
+                                                        // Update SMS records as successfully uploaded
+                                                        let messages: Vec<String> = sms_list.iter().filter(|s| !s.send).map(|s| s.message.clone()).collect();
+                                                        
+                                                        if let Err(e) = crate::db::Sms::mark_uploaded_by_phone_message(
+                                                            phone_num,
+                                                            &sim_id,
+                                                            &messages,
+                                                            resp.data.clone(),
                                                         ).await {
-                                                            let item_id_for_mark = item_id.as_deref().unwrap_or("unknown");
-                                                            let _ = crate::db::Sms::mark_uploaded(
-                                                                db_sms.id,
-                                                                item_id_for_mark,
-                                                                resp.data.as_deref(),
-                                                            ).await;
+                                                            log::error!(
+                                                                "[{}] Failed to mark SMS as uploaded after successful platform response: {}",
+                                                                sim_id,
+                                                                e
+                                                            );
                                                         }
                                                     }
-                                                    Ok(resp) => {
+                                                     Ok(resp) => {
+                                                        // Enqueue for retry instead of just logging
                                                         log::warn!(
                                                             "[{}] Failed to upload incoming SMS to 火狐狸 (platform rejected): phone={}, code={}, data={:?}",
                                                             sim_id,
@@ -927,6 +895,27 @@ impl Modem {
                                                             resp.code,
                                                             resp.data
                                                         );
+                                                        
+                                                        // Try to enqueue for retry
+                                                        // Use 0 as placeholder since ModemSMS doesn't have database ID yet
+                                                        let retry_item = crate::firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                            0,
+                                                            phone_num.to_string(),
+                                                            country_id.to_string(),
+                                                            sms.message.clone(),
+                                                            format!("Auto-upload failed with code: {}", resp.code),
+                                                            Some(resp.code.clone()),
+                                                        );
+                                                        
+                                                        if let Ok(pool) = crate::db::get_pool() {
+                                                            if let Err(e) = crate::firefox_upload_retry::FirefoxUploadRetryItem::insert(pool, &retry_item).await {
+                                                                log::error!(
+                                                                    "[{}] Failed to enqueue retry for incoming SMS: {}",
+                                                                    sim_id,
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         log::warn!(
@@ -935,6 +924,27 @@ impl Modem {
                                                             phone_num,
                                                             e
                                                         );
+                                                        
+                                                        // Try to enqueue for retry
+                                                        // Use 0 as placeholder since ModemSMS doesn't have database ID yet
+                                                        let retry_item = crate::firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                            0,
+                                                            phone_num.to_string(),
+                                                            country_id.to_string(),
+                                                            sms.message.clone(),
+                                                            format!("Auto-upload failed: {}", e),
+                                                            None,
+                                                        );
+                                                        
+                                                        if let Ok(pool) = crate::db::get_pool() {
+                                                            if let Err(e) = crate::firefox_upload_retry::FirefoxUploadRetryItem::insert(pool, &retry_item).await {
+                                                                log::error!(
+                                                                    "[{}] Failed to enqueue retry for incoming SMS: {}",
+                                                                    sim_id,
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -945,6 +955,32 @@ impl Modem {
                                                 sim_id,
                                                 e
                                             );
+                                            
+                                            // Enqueue all SMS for retry when HTTP client fails
+                                            for sms in &sms_list {
+                                                if sms.send {
+                                                    continue;
+                                                }
+                                                
+                                                let retry_item = crate::firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                    0,
+                                                    phone_num.to_string(),
+                                                    country_id.to_string(),
+                                                    sms.message.clone(),
+                                                    format!("HTTP client build failed: {}", e),
+                                                    None,
+                                                );
+                                                
+                                                if let Ok(pool) = crate::db::get_pool() {
+                                                    if let Err(enqueue_err) = crate::firefox_upload_retry::FirefoxUploadRetryItem::insert(pool, &retry_item).await {
+                                                        log::error!(
+                                                            "[{}] Failed to enqueue retry after HTTP client build failure: {}",
+                                                            sim_id,
+                                                            enqueue_err
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

@@ -357,6 +357,7 @@ pub async fn delete_phone_all(
 
 // ─── 5. PhoneBatchResult ────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BatchPhoneStatusItem {
     #[serde(rename = "Phone_Status")]
@@ -396,6 +397,7 @@ pub async fn query_batch_status(
 
 // ─── 6. GetWaitPhoneList ────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WaitPhoneItem {
     #[serde(rename = "Item_ID")]
@@ -423,6 +425,7 @@ pub async fn get_wait_phone_list(
 
 // ─── 7. GetResultPhoneList ──────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ResultPhoneItem {
     #[serde(rename = "Item_ID")]

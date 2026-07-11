@@ -4,6 +4,20 @@ use std::collections::HashMap;
 
 use crate::db::ModemSMS;
 
+/// A WAP-push SMS that looks like an MMS notification (destination port 2948).
+/// Captured separately from normal text SMS so it's never garbled through the
+/// GSM7/UCS2 decoders and never pollutes the SMS inbox. Actual WSP/MMS header
+/// decoding happens in `crate::mms_wap`.
+pub struct MmsNotificationCandidate {
+    pub sender: String,
+    // Captured for future use (e.g. showing the original notification time
+    // if it ever differs from mms_inbox.created_at); not read yet.
+    #[allow(dead_code)]
+    pub timestamp: NaiveDateTime,
+    /// Raw bytes of the WSP Push PDU (the UDH-stripped SMS user data).
+    pub raw: Vec<u8>,
+}
+
 // --------- Multipart SMS Handler ----------
 struct MultipartHandler {
     // (reference number, total parts) -> (timestamp, sender, message parts, original indices)
@@ -90,9 +104,11 @@ impl MultipartHandler {
 }
 
 // ---------- Main Parser Function ----------
-pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> Vec<ModemSMS> {
+/// Returns (regular text SMS, MMS WAP-push notification candidates).
+pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> (Vec<ModemSMS>, Vec<MmsNotificationCandidate>) {
     let mut handler = MultipartHandler::new();
     let mut messages = Vec::new();
+    let mut mms_candidates = Vec::new();
     let entry_re = Regex::new(r#"(?i)\+(CMGL): (\d+).*?\n([0-9A-Fa-f]+)"#).unwrap();
 
     let total_entries = entry_re.captures_iter(cmgl_entries).count();
@@ -196,16 +212,30 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> Vec<ModemSMS> {
                     sim_id: sim_id.to_string(),
                 });
             }
+            MessageContent::WapPush { raw } => {
+                log::info!(
+                    "检测到WAP Push/MMS通知短信: 索引{}, 来自{}, 长度{}字节",
+                    index,
+                    sender,
+                    raw.len()
+                );
+                mms_candidates.push(MmsNotificationCandidate {
+                    sender,
+                    timestamp,
+                    raw,
+                });
+            }
         }
     }
 
     log::debug!(
-        "PDU解析完成: SIM ID={}, 输入{}条短信，输出{}条完整短信",
+        "PDU解析完成: SIM ID={}, 输入{}条短信，输出{}条完整短信, {}条MMS通知",
         sim_id,
         total_entries,
-        messages.len()
+        messages.len(),
+        mms_candidates.len()
     );
-    messages
+    (messages, mms_candidates)
 }
 
 // ---------- Message Content Parsing ----------
@@ -217,15 +247,33 @@ enum MessageContent {
         content: String,
     },
     Single(String),
+    /// UDH application-port-addressed to 2948 (0x0B84) — a WAP push, almost
+    /// always an MMS notification on modern networks. `raw` is everything after
+    /// the UDH (the WSP Push PDU bytes), passed through untouched.
+    WapPush {
+        raw: Vec<u8>,
+    },
 }
 
 fn parse_message_content(bytes: &[u8], dcs: u8, _udl: usize, has_udhi: bool) -> MessageContent {
-    // Check for UDH header (indicates multipart message)
+    // Check for UDH header (indicates multipart message, or a WAP push)
     if has_udhi && bytes.len() > 1 {
         let udhl = bytes[0] as usize;
         if bytes.len() > udhl + 1 {
             let udh = &bytes[1..1 + udhl];
             let content_bytes = &bytes[1 + udhl..];
+
+            // Application port addressing, 16-bit address (IEI=0x05, IEDL=0x04):
+            // dest_port(2 bytes) + orig_port(2 bytes). WAP Push / MMS notifications
+            // are always delivered to the well-known port 2948 (0x0B84).
+            if udh.len() >= 6 && udh[0] == 0x05 && udh[1] == 0x04 {
+                let dest_port = ((udh[2] as u16) << 8) | (udh[3] as u16);
+                if dest_port == 2948 {
+                    return MessageContent::WapPush {
+                        raw: content_bytes.to_vec(),
+                    };
+                }
+            }
 
             // Check for concatenated SMS UDH: 8-bit reference (IEI=0x00, length=0x03)
             if udh.len() >= 5 && udh[0] == 0x00 && udh[1] == 0x03 {

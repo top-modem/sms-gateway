@@ -277,6 +277,9 @@ pub async fn run_api(
             "/sim-cards/{sim_id}/mms-profile",
             put(set_mms_profile),
         )
+        .route("/mms/inbox", get(get_mms_inbox_paginated))
+        .route("/mms/inbox/{id}", get(get_mms_inbox_detail))
+        .route("/mms/inbox/{id}/parts/{part_id}", get(get_mms_inbox_part))
         .layer(axum::middleware::from_fn_with_state(
             (username.to_string(), password.to_string()),
             auth::basic_auth,
@@ -1419,6 +1422,78 @@ async fn set_mms_profile(
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update MMS profile: {}", e))
             .into_response(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct PaginatedMmsInboxResponse {
+    data: Vec<crate::db::MmsInboxNotification>,
+    total: i64,
+    page: u32,
+    per_page: u32,
+}
+
+/// Phase 1: lists detected MMS WAP-push notifications (status will read
+/// "notified" until the fetch/decode phase is implemented).
+async fn get_mms_inbox_paginated(Query(query): Query<MmsQuery>) -> Response {
+    match crate::db::MmsInboxNotification::query_paginated(
+        query.per_page as i64,
+        ((query.page - 1) * query.per_page) as i64,
+    )
+    .await
+    {
+        Ok((data, total)) => Json(PaginatedMmsInboxResponse {
+            data,
+            total,
+            page: query.page,
+            per_page: query.per_page,
+        })
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list MMS inbox: {}", e))
+            .into_response(),
+    }
+}
+
+async fn get_mms_inbox_detail(Path(id): Path<String>) -> Response {
+    match crate::db::MmsInboxNotification::find_by_id(&id).await {
+        Ok(Some(item)) => {
+            let parts = crate::db::MmsInboxPart::list_meta(&id).await.unwrap_or_default();
+            Json(json!({ "notification": item, "parts": parts })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "MMS notification not found".to_string()).into_response(),
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS notification: {}", e))
+                .into_response()
+        }
+    }
+}
+
+/// Download/view a single decoded MMS part's raw bytes (image, SMIL, text, ...).
+async fn get_mms_inbox_part(Path((_id, part_id)): Path<(String, String)>) -> Response {
+    match crate::db::MmsInboxPart::fetch_data(&part_id).await {
+        Ok(Some((content_type, filename, data))) => {
+            let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            let filename = filename.unwrap_or_else(|| part_id.clone());
+            // `.leak()` returns `&'static mut str`; explicitly type as `&'static str`
+            // (a valid mut->immut reborrow) so the array elements match the `&str`
+            // header-value type axum expects -- otherwise both being `&mut str`
+            // leaves the array typed `[(HeaderName, &mut str); 2]`, which has no
+            // `IntoResponse` impl.
+            let content_type: &'static str = content_type.leak();
+            let content_disposition: &'static str =
+                format!("inline; filename=\"{}\"", filename).leak();
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CONTENT_DISPOSITION, content_disposition),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "MMS part not found".to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS part: {}", e)).into_response(),
     }
 }
 

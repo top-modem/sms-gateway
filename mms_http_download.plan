@@ -1,0 +1,180 @@
+MMS HTTP download plan
+======================
+
+STATUS: RESOLVED (2026-07-11)
+------------------------------
+End-to-end MMS content download now works on real hardware: 6/6 test notifications
+(text-only and image/GIF-containing) fetched, decoded, and stored successfully via
+the API. Root causes and fixes, in the order they were found:
+
+1. AT+QHTTPCFG="proxy" is not a supported key on this firmware (confirmed against
+   the local HTTP(S) application guide -- AT+QHTTPCFG=? only lists contextid,
+   requestheader, responseheader, sslctxid, contenttype, rspout/auto, closed/ind,
+   windowsize, closewaittime, custom_header). This is why it always failed with
+   +CME ERROR: 730 (Invalid parameter).
+2. Fix: use AT+QHTTPCFG="requestheader",1 and point AT+QHTTPURL at the carrier
+   PROXY address (not the content host) so the modem's TCP socket connects to
+   something actually reachable over the MMS APN. The custom request block sent
+   after AT+QHTTPGET carries the real absolute content URL as the request line
+   (mirrors how a standard HTTP forward proxy request works). Falls back to the
+   old direct-fetch path (no proxy) if requestheader mode fails.
+3. In requestheader mode, AT+QHTTPGET takes <rsptime>,<data_length>[,<input_time>]
+   -- the original code only sent <rsptime>, which also produced CME ERROR 730.
+4. Self-deadlock: the requestheader write sequence held `write_half`'s lock across
+   the async QHTTPGET completion wait and the subsequent AT+QHTTPREADFILE call,
+   which needs the same lock via the command processor -- fetches larger than the
+   first item hung forever. Fixed by dropping the guard right after the writes.
+4. AT+QFDWL raw-response framing treated the interim `CONNECT\r\n` prompt as a
+   valid completion terminator, so small buffers containing just `CONNECT\r\n`
+   could be dispatched before the real payload/trailer arrived. Fixed with a
+   raw-mode-specific terminator set (RAW_TERMINATORS) that excludes CONNECT.
+5. Root cause for larger MMS (100KB+, e.g. embedded images): AT+QHTTPREADFILE
+   returns `OK` as soon as the command is accepted, not once the file is actually
+   written -- issuing AT+QFDWL immediately after raced the file write and read a
+   0-byte file. Fixed by waiting for the async `+QHTTPREADFILE: <err>` completion
+   URC (new pending_http_readfile waiter, mirroring pending_http_get) before
+   calling download_file().
+6. Also removed the doomed AT+QHTTPCFG="proxy" attempt from the direct-fetch
+   fallback (dead code that only produced log noise/730 errors on this firmware).
+
+Verified via live retry against real modem (COM8, SIM 898600801926D1412749):
+c812f386 (SMIL+text), 91ff4bd1 (SMIL+jpeg 110798B), 02bad003 (SMIL+text),
+10f60912 (SMIL+text), cabdca41 (SMIL+gif 118828B+text), cbfa0765 (SMIL+text) --
+all reached status=fetched with correctly decoded parts.
+
+Goal
+----
+Make MMS inbox content download work reliably on Quectel EC20/EC25 class modems for carrier MMS APNs that require a proxy.
+
+Current confirmed findings
+--------------------------
+1. MMS notification detection already works.
+2. Existing fetch path uses AT+QHTTPURL / AT+QHTTPGET / AT+QHTTPREADFILE.
+3. Real modem logs showed:
+   - +QHTTPGET: 702
+   - direct HTTP fetch timed out
+4. The original QHTTPGET URC parser was too strict and was fixed to accept the single-value error form.
+5. Attempting:
+   AT+QHTTPCFG="proxy","10.0.0.172:80"
+   was rejected by modem with:
+   +CME ERROR: 730
+6. Quectel FAE forum guidance indicates:
+   - QMMSCFG proxy does not automatically apply to QHTTP
+   - direct "set HTTP proxy" is not effective
+   - they recommend QHTTPCFG="requestheader",1 and adding proxy information in custom HTTP headers
+7. The forum thread does NOT show a complete working GET example, so the exact requestheader flow still needs confirmation from local PDF manuals.
+
+Likely root cause
+-----------------
+The MMS APN only allows MMS retrieval through the carrier proxy (for this SIM: 10.0.0.172:80).
+AT+QHTTPGET appears to connect directly to the content_location host unless special handling is enabled.
+Because the direct path is blocked or unroutable on the MMS APN, the modem returns timeout 702.
+
+Documents to inspect
+--------------------
+Files already present in repo:
+- doc\Quectel_EC2x&EG9x&EG2x-G&EM05 series_HTTP(S)_guide?  (actual filename includes Chinese text)
+- doc\Quectel_EC2x&EG9x&EG2x-G&EM05_Series_AT_Commands_Manual_V2.0.pdf
+- doc\Quectel_LTE_Standard_TCP(IP)_应用指导_V1.0.pdf
+
+Important manual sections to extract
+------------------------------------
+1. AT+QHTTPCFG
+   - all supported keys
+   - exact behavior of "requestheader"
+   - whether GET headers are supplied through QHTTPURL payload or another step
+2. AT+QHTTPURL
+   - exact syntax in requestheader mode
+3. AT+QHTTPGET
+   - syntax
+   - completion URC formats
+4. AT+QHTTPPOST
+   - use as comparison because it accepts explicit payload length
+5. AT+QHTTPREAD / AT+QHTTPREADFILE
+6. TCP/IP commands:
+   - AT+QIOPEN
+   - AT+QISEND
+   - AT+QIRD
+   - AT+QICLOSE
+   - +QIURC formats
+
+Implementation paths
+--------------------
+Option A - Keep QHTTP and use requestheader mode
+Preferred only if manuals confirm a complete GET flow.
+
+Needed behavior:
+1. Enable custom header mode:
+   AT+QHTTPCFG="requestheader",1
+2. Build a request that causes the carrier proxy to fetch the MMS URL.
+3. Possible required request shape to test:
+   GET http://120.198.247.46:80/DFUMoT3 HTTP/1.1
+   Host: 120.198.247.46
+   X-Online-Host: 120.198.247.46
+   Proxy-Connection: Keep-Alive
+
+Open questions:
+- How Quectel expects custom GET headers to be supplied.
+- Whether QHTTPURL payload becomes the full request line in requestheader mode, or only the URL.
+- Whether Host / absolute-URI request line alone is enough.
+
+Option B - Replace QHTTP with raw TCP socket proxy fetch
+Recommended fallback if requestheader mode is incomplete or unreliable.
+
+High-level flow:
+1. Open TCP socket to MMS proxy host:port using QIOPEN on context 1.
+2. Send raw HTTP request through the proxy:
+   GET http://<content-host>:<port><path> HTTP/1.1
+   Host: <content-host>
+   Connection: close
+
+3. Read raw HTTP response using QIRD until full headers/body received.
+4. Parse status line, headers, Content-Length, and body.
+5. Store body in DB exactly like current fetch_mms_content output.
+
+Why Option B may be safer
+-------------------------
+It does not depend on undocumented or poorly documented QHTTP requestheader behavior.
+It matches how a normal HTTP forward proxy really works.
+It gives full control over the request line and headers.
+
+Code areas to update
+--------------------
+1. src\modem\core.rs
+   - current fetch_mms_content
+   - QHTTP parser and helper code
+   - possible new socket helpers:
+     - open_tcp_socket
+     - send_socket_data
+     - read_socket_data
+     - close_socket
+     - parse_http_response
+2. src\modem\manager.rs
+   - add URC handling for socket-related URCs if needed
+3. src\mms_worker.rs
+   - continue loading SIM MMS profile and pass proxy/APN info
+4. src\mms_retrieve.rs
+   - verify downloaded M-Retrieve.conf bytes decode correctly after transport works
+
+Validation checklist
+--------------------
+1. Build backend successfully.
+2. Restart service.
+3. Confirm backend listens on 0.0.0.0:8080.
+4. Trigger retry of existing notified MMS inbox rows.
+5. In logs, confirm one of:
+   - QHTTP requestheader path succeeds, or
+   - raw TCP proxy socket connects successfully
+6. Confirm fetched inbox record advances from notified/failed to fetched/decoded state.
+7. Confirm decoded parts can be viewed from API and frontend.
+8. Test at least one small MMS and one larger MMS.
+
+Useful known log signatures
+---------------------------
+- +QHTTPGET: 702 = HTTP timeout on current direct-fetch path
+- +CME ERROR: 730 after QHTTPCFG="proxy" = this parameter is not accepted on this firmware
+
+Recommended next action
+-----------------------
+First, extract the local HTTP(S) and TCP/IP PDF manual text and confirm the exact requestheader behavior for GET.
+If the manuals still do not provide a complete GET-with-proxy recipe, implement Option B (raw TCP socket through MMS proxy).

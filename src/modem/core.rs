@@ -1,5 +1,5 @@
 ﻿use chrono::{Timelike, Utc};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +38,17 @@ const TERMINATORS: &[&[u8]] = &[
 /// Terminators that have a variable-length error code after the prefix.
 /// When matched, we scan ahead for the trailing `\r\n` to include the full error message.
 const ERROR_TERMINATORS: &[&[u8]] = &[b"\r\n+CME ERROR", b"\r\n+CMS ERROR"];
+
+/// Terminators considered for raw-byte responses (e.g. `AT+QFDWL`).
+///
+/// Deliberately excludes `CONNECT\r\n` and `\r\n> `: those are interim prompts
+/// that precede the actual binary payload, not completion markers. Since raw
+/// downloads arrive over several serial reads, the `CONNECT\r\n` prompt often
+/// lands in `line_buf` on its own before any payload bytes have arrived; if it
+/// were accepted as a terminator here, the raw response would be dispatched
+/// with just `"CONNECT\r\n"` and no payload, well before the download actually
+/// completes.
+const RAW_TERMINATORS: &[&[u8]] = &[b"\r\nOK\r\n", b"\r\nERROR\r\n", b"\r\n+CME ERROR", b"\r\n+CMS ERROR"];
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -84,6 +95,16 @@ pub struct Modem {
     /// Oneshot sender for the in-flight MMS send, resolved by the URC handler when
     /// the modem emits the async `+QMMSEND: <err>,<httprsp>` completion notification.
     pending_mms: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32)>>>>,
+    /// Oneshot sender for the in-flight MMS content fetch, resolved by the URC handler
+    /// when the modem emits the async `+QHTTPGET: <err>,<httprsp>,<content_length>`
+    /// completion notification.
+    pending_http_get: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32, i64)>>>>,
+    /// Oneshot sender for the in-flight `AT+QHTTPREADFILE`, resolved by the URC handler
+    /// when the modem emits the async `+QHTTPREADFILE: <err>` completion notification.
+    /// `AT+QHTTPREADFILE` returns `OK` as soon as the command is accepted, not once the
+    /// file is actually written -- issuing `AT+QFDWL` right after that `OK` races the file
+    /// write for larger downloads (observed on real hardware as a 0-byte file via QFDWL).
+    pending_http_readfile: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<i32>>>>,
 }
 
 impl Modem {
@@ -152,6 +173,8 @@ impl Modem {
             command_task,
             force_uk_mcc_to_46001,
             pending_mms: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_http_get: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_http_readfile: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -234,7 +257,14 @@ impl Modem {
                 }
                 Ok(n) => {
                     line_buf.extend_from_slice(&raw_buf[..n]);
-                    if line_buf.len() > MAX_LINE_BUF {
+                    // Raw-byte transfers (AT+QFDWL: MMS content, call recordings) can
+                    // legitimately exceed MAX_LINE_BUF -- they're bounded by their own
+                    // timeout in download_file(), not by this guard. Clearing the buffer
+                    // mid-transfer would silently truncate the download (this previously
+                    // corrupted MMS content fetches larger than 64KB). Only apply the
+                    // overflow guard to string/URC-mode buffers.
+                    let is_raw_mode = reader_state.lock().await.raw_response_tx.is_some();
+                    if !is_raw_mode && line_buf.len() > MAX_LINE_BUF {
                         error!("Reader [{}]: buffer overflow, clearing", name);
                         let mut state = reader_state.lock().await;
                         if let Some(tx) = state.response_tx.take() {
@@ -317,8 +347,15 @@ impl Modem {
                 (state.response_tx.is_some(), state.raw_response_tx.is_some())
             };
             if has_str_tx || has_raw_tx {
-                // Command-response mode: buffer until we see a terminator
-                if let Some((term, pos)) = Self::find_terminator(line_buf) {
+                // Command-response mode: buffer until we see a terminator. Raw-byte
+                // responses (AT+QFDWL) use a restricted terminator set that excludes
+                // the interim CONNECT\r\n prompt -- see RAW_TERMINATORS.
+                let found = if has_raw_tx {
+                    Self::find_raw_terminator(line_buf)
+                } else {
+                    Self::find_terminator(line_buf)
+                };
+                if let Some((term, pos)) = found {
                     // For error terminators (e.g. +CMS ERROR), scan ahead to include
                     // the full error code (e.g. "+CMS ERROR: 500") instead of cutting
                     // off at the prefix.
@@ -469,6 +506,19 @@ impl Modem {
 
     fn find_terminator(buffer: &[u8]) -> Option<(&'static [u8], usize)> {
         TERMINATORS
+            .iter()
+            .filter_map(|&t| {
+                buffer
+                    .windows(t.len())
+                    .position(|w| w == t)
+                    .map(|pos| (t, pos))
+            })
+            .max_by_key(|&(_, pos)| pos)
+    }
+
+    /// Like `find_terminator`, but for raw-byte responses -- see `RAW_TERMINATORS`.
+    fn find_raw_terminator(buffer: &[u8]) -> Option<(&'static [u8], usize)> {
+        RAW_TERMINATORS
             .iter()
             .filter_map(|&t| {
                 buffer
@@ -802,15 +852,21 @@ impl Modem {
         webhook_manager: Option<webhook::WebhookManager>,
     ) -> anyhow::Result<()> {
         // Always read ALL messages so previously-read messages aren't missed
-        let sms_list = self.read_sms(SmsType::All).await?;
+        let (sms_list, mms_found) = self.read_sms(SmsType::All).await?;
 
-        if sms_list.is_empty() {
+        if sms_list.is_empty() && !mms_found {
             return Ok(());
         }
 
-        // Delete from modem FIRST so storage doesn't fill up
+        // Delete from modem FIRST so storage doesn't fill up. This must run
+        // even when sms_list is empty but an MMS WAP-push notification was
+        // found, otherwise notifications never get cleared from SIM storage.
         if let Err(e) = self.delete_all_sms().await {
             log::warn!("Failed to delete SMS from modem after reading: {}", e);
+        }
+
+        if sms_list.is_empty() {
+            return Ok(());
         }
 
         let webhook_future = async {
@@ -1150,7 +1206,15 @@ impl Modem {
         Ok(())
     }
 
-    pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<Vec<ModemSMS>> {
+    /// Reads all SMS from modem storage. Returns the regular SMS list plus
+    /// whether at least one MMS WAP-push notification was also found in this
+    /// batch -- callers MUST take `mms_found` into account when deciding
+    /// whether to delete modem storage (`delete_all_sms`), since MMS
+    /// notifications are stripped out of `sms_list` here and would otherwise
+    /// never be flagged for deletion when a poll returns MMS notifications
+    /// but no regular SMS, leaving them to accumulate in SIM storage forever
+    /// and potentially causing new incoming SMS/MMS to be rejected once full.
+    pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<(Vec<ModemSMS>, bool)> {
         let command = format!("AT+CMGL={}\r\n", sms_type.to_at_command_pdu());
         let response = self.send_command_with_ok(&command).await?;
 
@@ -1159,7 +1223,17 @@ impl Modem {
         if trimmed != "OK" && !trimmed.is_empty() {
             log::info!("[{}] AT+CMGL raw response: {}", sim_id, trimmed);
         }
-        Ok(parse_pdu_sms(&response, &sim_id))
+        let (sms_list, mms_candidates) = parse_pdu_sms(&response, &sim_id);
+        let mms_found = !mms_candidates.is_empty();
+        // Capture MMS WAP-push notifications *before* the caller deletes SMS from
+        // the modem (this is our only chance -- there is no "leave undeleted for
+        // retry" option like a ModemManager-based stack would have).
+        for candidate in mms_candidates {
+            if let Err(e) = crate::mms_wap::handle_notification_candidate(&sim_id, candidate).await {
+                log::warn!("[{}] Failed to process MMS WAP-push notification: {}", sim_id, e);
+            }
+        }
+        Ok((sms_list, mms_found))
     }
 
     /// Delete all SMS messages from modem storage (AT+CMGD=1,4)
@@ -1382,11 +1456,13 @@ impl Modem {
     }
 
     pub async fn read_sms_sync_insert(&self, _sms_type: SmsType) -> anyhow::Result<()> {
-        let sms_list = self.read_sms(SmsType::All).await?;
-        if !sms_list.is_empty() {
+        let (sms_list, mms_found) = self.read_sms(SmsType::All).await?;
+        if !sms_list.is_empty() || mms_found {
             if let Err(e) = self.delete_all_sms().await {
                 log::warn!("Failed to delete SMS from modem after reading: {}", e);
             }
+        }
+        if !sms_list.is_empty() {
             ModemSMS::bulk_insert(&sms_list).await?;
         }
         Ok(())
@@ -1591,7 +1667,7 @@ impl Modem {
             // write_guard drops here, releasing the write lock
         }
 
-        let raw = match tokio::time::timeout(Duration::from_secs(30), raw_rx).await {
+        let raw = match tokio::time::timeout(Duration::from_secs(60), raw_rx).await {
             Ok(Ok(result)) => result?,
             Ok(Err(_)) => {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Reader channel closed"))
@@ -1694,6 +1770,14 @@ impl Modem {
 
     /// Apply an MMS profile (APN/MMSC/proxy) to the modem before sending.
     /// Mirrors the `AT+QICSGP` / `AT+QMMSCFG` sequence used by python-gsmmodem's `APNS` command.
+    ///
+    /// `character` is deliberately set to `"ASCII"`, not `"UTF8"`. Every independent
+    /// reference implementation found (daddyfix/cellular_modem_communicator,
+    /// cmmakerclub/TEE_UC20_Shield-lib, Darthux/remote_sensor) uses ASCII and passes
+    /// TO/Title strings as plain text; UTF8 mode expects those fields hex-encoded
+    /// instead, which caused a real-hardware `+CME ERROR: 756` ("Invalid parameter")
+    /// on the subject field (the plain-digit phone number happened to still parse as
+    /// valid hex, masking the bug on the TO field).
     pub async fn configure_mms_profile(
         &self,
         apn: &str,
@@ -1711,7 +1795,11 @@ impl Modem {
             proxy_host, proxy_port
         ))
         .await?;
-        self.send_command_with_ok("AT+QMMSCFG=\"character\",\"UTF8\"\r\n")
+        self.send_command_with_ok("AT+QMMSCFG=\"character\",\"ASCII\"\r\n")
+            .await?;
+        // Disable optional MMS support fields (delivery/read reports etc.) -- matches
+        // the reference implementations above; keeps behavior simple/predictable.
+        self.send_command_with_ok("AT+QMMSCFG=\"supportfield\",0\r\n")
             .await?;
         Ok(())
     }
@@ -1804,6 +1892,512 @@ impl Modem {
             Some((err, http))
         } else {
             None
+        }
+    }
+
+    // ─── MMS content fetch (AT+QHTTPxxx) ───────────────────────────────────────
+    //
+    // The EC20/EC25 has no dedicated MMS-retrieve AT command (see `mms_wap.rs`), so
+    // fetching the M-Retrieve.conf body from a WAP-push `content_location` URL is done
+    // with Quectel's generic HTTP AT command set, mirroring how `AT+QMMSEND` already
+    // reaches the MMSC over the same APN/context. The modem performs the HTTP GET
+    // itself; the response body is saved to a RAM file and pulled to the host with the
+    // existing `download_file()` (`AT+QFDWL`, already used for call recordings).
+
+    /// Register a completion waiter for the next `+QHTTPGET:` URC.
+    /// Must be called immediately before issuing `AT+QHTTPGET`.
+    async fn take_http_waiter(&self) -> tokio::sync::oneshot::Receiver<(i32, i32, i64)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.pending_http_get.lock().await = Some(tx);
+        rx
+    }
+
+    /// Called by the URC handler when a `+QHTTPGET: <err>,<httprsp>,<content_length>`
+    /// notification arrives.
+    pub async fn resolve_http_get_completion(&self, err_code: i32, http_code: i32, content_length: i64) {
+        if let Some(tx) = self.pending_http_get.lock().await.take() {
+            let _ = tx.send((err_code, http_code, content_length));
+        }
+    }
+
+    /// Register a completion waiter for the next `+QHTTPREADFILE:` URC.
+    /// Must be called immediately before issuing `AT+QHTTPREADFILE`.
+    async fn take_http_readfile_waiter(&self) -> tokio::sync::oneshot::Receiver<i32> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.pending_http_readfile.lock().await = Some(tx);
+        rx
+    }
+
+    /// Called by the URC handler when a `+QHTTPREADFILE: <err>` notification arrives.
+    pub async fn resolve_http_readfile_completion(&self, err_code: i32) {
+        if let Some(tx) = self.pending_http_readfile.lock().await.take() {
+            let _ = tx.send(err_code);
+        }
+    }
+
+    /// Parse a `+QHTTPREADFILE: <err>` URC line.
+    pub fn parse_qhttpreadfile(line: &str) -> Option<i32> {
+        line.split(':').nth(1)?.trim().parse().ok()
+    }
+
+    /// Issue `AT+QHTTPREADFILE`, wait for its async `+QHTTPREADFILE: <err>` completion
+    /// URC (not just the immediate `OK`, which only confirms the command was accepted),
+    /// then pull the file to the host with `download_file()`.
+    ///
+    /// Skipping the completion wait races the modem's internal file write for larger
+    /// downloads: `AT+QFDWL` issued right after `OK` can see a still-empty (0-byte) file
+    /// if the actual write hasn't finished yet -- observed on real hardware for MMS
+    /// content in the 100KB+ range (small content_location bodies complete fast enough
+    /// that the race is rarely hit).
+    async fn readfile_then_download(&self, ram_file: &str, timeout_secs: u64) -> anyhow::Result<Vec<u8>> {
+        let waiter = self.take_http_readfile_waiter().await;
+        if let Err(e) = self
+            .send_command_with_ok(&format!("AT+QHTTPREADFILE=\"{}\",{}\r\n", ram_file, timeout_secs))
+            .await
+        {
+            *self.pending_http_readfile.lock().await = None;
+            return Err(anyhow::anyhow!("AT+QHTTPREADFILE failed: {}", e));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), waiter).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(err_code)) => {
+                return Err(anyhow::anyhow!("AT+QHTTPREADFILE completed with err={}", err_code));
+            }
+            Ok(Err(_)) => return Err(anyhow::anyhow!("QHTTPREADFILE completion channel closed")),
+            Err(_) => {
+                *self.pending_http_readfile.lock().await = None;
+                return Err(anyhow::anyhow!("Timed out waiting for +QHTTPREADFILE completion"));
+            }
+        }
+
+        self.download_file(ram_file).await.map_err(anyhow::Error::from)
+    }
+
+    /// Parse a `+QHTTPGET: <err>[,<httprsp>,<content_length>]` URC line. On
+    /// real EC20 firmware, error completions arrive as a bare `<err>` with no
+    /// httprsp/content_length (e.g. `+QHTTPGET: 702` = HTTP(S) timeout, per
+    /// Quectel's extended HTTP error table); only successful GETs (`<err>=0`)
+    /// include the extra fields.
+    pub fn parse_qhttpget(line: &str) -> Option<(i32, i32, i64)> {
+        let data = line.split(':').nth(1)?;
+        let parts: Vec<&str> = data.split(',').collect();
+        let err = parts.first()?.trim().parse().ok()?;
+        let http = parts
+            .get(1)
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(-1);
+        let len = parts
+            .get(2)
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(-1);
+        Some((err, http, len))
+    }
+
+    /// `AT+QHTTPURL=<len>,<timeout>` two-step: wait for the `CONNECT` prompt, then write
+    /// the raw URL bytes. Mirrors `upload_file`'s two-step pattern (setup command that
+    /// waits for a prompt, then a raw payload write), holding the write lock across both
+    /// steps so no other AT command can slip in and corrupt the modem's input state.
+    async fn send_http_url(&self, url: &str, timeout_secs: u64) -> anyhow::Result<()> {
+        let setup_cmd = format!("AT+QHTTPURL={},{}\r\n", url.len(), timeout_secs);
+
+        let mut write_guard = self.write_half.lock().await;
+        let write = write_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Serial port not connected"))?;
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        self.reader_state.lock().await.response_tx = Some(tx1);
+        debug!("TX [{}]: {}", self.name, Self::format_log(&setup_cmd));
+        write.write_all(setup_cmd.as_bytes()).await?;
+        write.flush().await?;
+        let prompt = match tokio::time::timeout(Duration::from_secs(10), rx1).await {
+            Ok(Ok(Ok(r))) => r,
+            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+            Err(_) => {
+                self.reader_state.lock().await.response_tx = None;
+                return Err(anyhow::anyhow!("Timeout waiting for QHTTPURL CONNECT prompt"));
+            }
+        };
+        if !prompt.contains("CONNECT") {
+            return Err(anyhow::anyhow!(
+                "QHTTPURL CONNECT prompt not received: {}",
+                Self::format_log(&prompt)
+            ));
+        }
+
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        self.reader_state.lock().await.response_tx = Some(tx2);
+        debug!("TX [{}]: <QHTTPURL {} bytes>", self.name, url.len());
+        write.write_all(url.as_bytes()).await?;
+        write.flush().await?;
+        let final_response = match tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), rx2).await {
+            Ok(Ok(Ok(r))) => r,
+            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+            Err(_) => {
+                self.reader_state.lock().await.response_tx = None;
+                return Err(anyhow::anyhow!("Timeout waiting for QHTTPURL completion"));
+            }
+        };
+
+        if final_response.contains("OK\r\n") {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "QHTTPURL rejected: {}",
+                Self::format_log(&final_response)
+            ))
+        }
+    }
+
+    /// Parse an absolute HTTP URL into host, port, and path components.
+    fn parse_http_url(url: &str) -> anyhow::Result<(String, u16, String)> {
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| anyhow::anyhow!("MMS content URL is missing a scheme: {}", url))?;
+        anyhow::ensure!(scheme.eq_ignore_ascii_case("http"), "unsupported MMS URL scheme: {}", scheme);
+
+        let (authority, path) = match rest.find('/') {
+            Some(pos) => (&rest[..pos], &rest[pos..]),
+            None => (rest, "/"),
+        };
+        anyhow::ensure!(!authority.is_empty(), "MMS content URL has an empty host: {}", url);
+
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                (host.to_string(), port.parse::<u16>()?)
+            }
+            _ => (authority.to_string(), 80),
+        };
+
+        Ok((host, port, path.to_string()))
+    }
+
+    /// Build a minimal GET request block for Quectel `requestheader` mode.
+    ///
+    /// This module's `AT+QHTTPCFG` has no `"proxy"` key (confirmed against the
+    /// local HTTP(S) application guide: the only settable keys are contextid,
+    /// requestheader, responseheader, sslctxid, contenttype, rspout/auto,
+    /// closed/ind, windowsize, closewaittime, custom_header), so proxy routing
+    /// has to happen the way a real HTTP forward proxy works: the request line
+    /// carries the absolute content URL while the TCP connection itself (set via
+    /// `AT+QHTTPURL`, see `fetch_mms_content_via_requestheader`) targets the proxy.
+    fn build_requestheader_get(url: &str) -> anyhow::Result<String> {
+        let (host, port, _path) = Self::parse_http_url(url)?;
+        let authority = if port == 80 { host.clone() } else { format!("{}:{}", host, port) };
+
+        Ok(format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Online-Host: {}\r\nProxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n",
+            url,
+            authority,
+            host,
+        ))
+    }
+
+    /// Try fetching MMS content through Quectel `requestheader` mode.
+    ///
+    /// Since this firmware has no dedicated HTTP proxy config key, the modem's
+    /// TCP connection is pointed at the proxy itself via `AT+QHTTPURL`, while the
+    /// custom request block sent after `AT+QHTTPGET` carries the real absolute
+    /// content URL as the request line -- mirroring how a standard HTTP forward
+    /// proxy request is built.
+    async fn fetch_mms_content_via_requestheader(
+        &self,
+        url: &str,
+        proxy_host: &str,
+        proxy_port: u16,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        const CONTEXT_ID: u8 = 1;
+
+        self.send_command_with_ok("AT+QHTTPCFG=\"requestheader\",1\r\n")
+            .await?;
+        self.send_command_with_ok(&format!("AT+QHTTPCFG=\"contextid\",{}\r\n", CONTEXT_ID))
+            .await?;
+
+        if let Err(e) = self
+            .send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID))
+            .await
+        {
+            debug!(
+                "AT+QIACT={} did not return OK in requestheader mode (likely already active): {}",
+                CONTEXT_ID, e
+            );
+        }
+
+        // Connect the modem's HTTP socket to the carrier's MMS proxy, not the
+        // content host -- the content host is typically unreachable directly
+        // over the MMS APN (this is what produced the `+QHTTPGET: 702` timeouts).
+        let proxy_url = format!("http://{}:{}/", proxy_host, proxy_port);
+        self.send_http_url(&proxy_url, timeout_secs).await?;
+
+        let request_headers = Self::build_requestheader_get(url)?;
+        let waiter = self.take_http_waiter().await;
+
+        // In requestheader mode AT+QHTTPGET takes <rsptime>,<data_length>[,<input_time>]
+        // -- omitting <data_length> is rejected with +CME ERROR: 730 (Invalid parameter).
+        let setup_cmd = format!("AT+QHTTPGET={},{}\r\n", timeout_secs, request_headers.len());
+        let mut write_guard = self.write_half.lock().await;
+        let write = write_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Serial port not connected"))?;
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        self.reader_state.lock().await.response_tx = Some(tx1);
+        debug!("TX [{}]: {}", self.name, Self::format_log(&setup_cmd));
+        write.write_all(setup_cmd.as_bytes()).await?;
+        write.flush().await?;
+
+        let prompt = match tokio::time::timeout(Duration::from_secs(10), rx1).await {
+            Ok(Ok(Ok(r))) => r,
+            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+            Err(_) => {
+                self.reader_state.lock().await.response_tx = None;
+                return Err(anyhow::anyhow!("Timeout waiting for QHTTPGET requestheader prompt"));
+            }
+        };
+        if !prompt.contains("CONNECT") && !prompt.contains("> ") {
+            return Err(anyhow::anyhow!(
+                "QHTTPGET requestheader prompt not received: {}",
+                Self::format_log(&prompt)
+            ));
+        }
+
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<io::Result<String>>();
+        self.reader_state.lock().await.response_tx = Some(tx2);
+        debug!(
+            "TX [{}]: <QHTTPGET request headers {} bytes>",
+            self.name,
+            request_headers.len()
+        );
+        write.write_all(request_headers.as_bytes()).await?;
+        write.flush().await?;
+        // Release the write lock now -- everything after this point (awaiting the
+        // completion URC, then AT+QHTTPREADFILE/AT+QFDEL via send_command_with_ok)
+        // needs to acquire this same lock through the command processor task. Holding
+        // it here would deadlock that task against ourselves.
+        drop(write_guard);
+
+        let final_response = match tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), rx2).await {
+            Ok(Ok(Ok(r))) => r,
+            Ok(Ok(Err(e))) => return Err(e.into()),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+            Err(_) => {
+                self.reader_state.lock().await.response_tx = None;
+                return Err(anyhow::anyhow!("Timeout waiting for QHTTPGET requestheader completion"));
+            }
+        };
+
+        if !final_response.contains("OK\r\n") {
+            return Err(anyhow::anyhow!(
+                "QHTTPGET requestheader rejected: {}",
+                Self::format_log(&final_response)
+            ));
+        }
+
+        let (err_code, http_code, _content_length) =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), waiter).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => return Err(anyhow::anyhow!("HTTP GET completion channel closed")),
+                Err(_) => {
+                    *self.pending_http_get.lock().await = None;
+                    return Err(anyhow::anyhow!("Timed out waiting for +QHTTPGET completion"));
+                }
+            };
+
+        if err_code != 0 {
+            return Err(anyhow::anyhow!(
+                "AT+QHTTPGET failed: err={} ({})",
+                err_code,
+                Self::describe_qhttp_error(err_code)
+            ));
+        }
+        if !(200..300).contains(&http_code) {
+            return Err(anyhow::anyhow!("MMS content fetch HTTP error: {}", http_code));
+        }
+
+        let port_tag: String = self
+            .com_port
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let ram_file = format!("RAM:mmsdl_hdr_{}.bin", port_tag);
+        let result = self
+            .readfile_then_download(&ram_file, timeout_secs)
+            .await;
+
+        let _ = self.send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_file)).await;
+        result
+    }
+
+    /// Fetch an MMS content URL (a WAP-push `content_location`, e.g. the M-Retrieve.conf
+    /// body) over the modem's configured MMS APN context and return the raw response body.
+    ///
+    /// Sequence: bind the HTTP module to context 1 (already configured for MMS by
+    /// `configure_mms_profile`) → point it at the carrier's MMS proxy (same one used for
+    /// sending, if configured — MMS APNs are typically walled off from the open internet
+    /// and only reachable via this proxy) → ensure the context is active → set the URL →
+    /// issue GET and await the async completion URC → save the body to a RAM file → pull
+    /// it to the host with `download_file()` → clean up the RAM file.
+    pub async fn fetch_mms_content(
+        &self,
+        url: &str,
+        proxy_host: Option<&str>,
+        proxy_port: Option<u16>,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        const CONTEXT_ID: u8 = 1;
+        // Include the COM port in the RAM filename so concurrent fetches on different
+        // modems in the same process don't collide (PID alone is shared across all
+        // modem instances in this process).
+        let port_tag: String = self
+            .com_port
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let ram_file = format!("RAM:mmsdl_{}.bin", port_tag);
+
+        // EC20/EC25 needs an explicit HTTP session start before QHTTPURL/QHTTPGET.
+        // Best-effort: Quectel firmware returns ERROR (not OK) when the HTTP service
+        // is already initialized (e.g. left open by a previous fetch attempt), so a
+        // failure here does not necessarily mean the HTTP stack is unusable.
+        if let Err(e) = self.send_command_with_ok("AT+QHTTPINIT\r\n").await {
+            debug!(
+                "AT+QHTTPINIT did not return OK on {} (likely already initialized): {}",
+                self.com_port, e
+            );
+        }
+
+        if let (Some(host), Some(port)) = (proxy_host, proxy_port) {
+            match self
+                .fetch_mms_content_via_requestheader(url, host, port, timeout_secs)
+                .await
+            {
+                Ok(bytes) => {
+                    let _ = self.send_command("AT+QHTTPTERM\r\n").await;
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    warn!(
+                        "requestheader-based MMS fetch failed for {} on {}: {} -- falling back to direct QHTTP",
+                        url,
+                        self.com_port,
+                        e
+                    );
+                }
+            }
+        } else {
+            debug!("No MMS proxy configured for this SIM; fetching content_location directly");
+        }
+
+        let fetch_result = async {
+            self.send_command_with_ok(&format!("AT+QHTTPCFG=\"contextid\",{}\r\n", CONTEXT_ID))
+                .await?;
+
+            // Note: this firmware's AT+QHTTPCFG has no "proxy" key (confirmed against the
+            // local HTTP(S) application guide -- only contextid/requestheader/responseheader/
+            // sslctxid/contenttype/rspout,auto/closed,ind/windowsize/closewaittime/custom_header
+            // are supported), so there is no way to make this direct-fetch fallback route
+            // through the MMS proxy. It only succeeds when content_location's host happens
+            // to be reachable directly over the MMS APN; the requestheader-based attempt
+            // above is what actually goes through the proxy.
+
+            // Activate the PDP context if not already active. Quectel firmware returns an
+            // error (rather than OK) when re-activating an already-active context, so this
+            // is best-effort: MMS send already exercises this same context/APN successfully,
+            // so a failure here most likely just means it's already up.
+            if let Err(e) = self
+                .send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID))
+                .await
+            {
+                debug!(
+                    "AT+QIACT={} did not return OK (likely already active): {}",
+                    CONTEXT_ID, e
+                );
+            }
+
+            self.send_http_url(url, timeout_secs).await?;
+
+            // AT+QHTTPGET only accepts the request; completion arrives asynchronously as a
+            // `+QHTTPGET: <err>,<httprsp>,<content_length>` URC (mirrors +QMMSEND).
+            let waiter = self.take_http_waiter().await;
+            if let Err(e) = self
+                .send_command_with_ok(&format!("AT+QHTTPGET={}\r\n", timeout_secs))
+                .await
+            {
+                *self.pending_http_get.lock().await = None;
+                return Err(anyhow::anyhow!("AT+QHTTPGET rejected: {}", e));
+            }
+
+            let (err_code, http_code, _content_length) =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), waiter).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => return Err(anyhow::anyhow!("HTTP GET completion channel closed")),
+                    Err(_) => {
+                        *self.pending_http_get.lock().await = None;
+                        return Err(anyhow::anyhow!("Timed out waiting for +QHTTPGET completion"));
+                    }
+                };
+
+            if err_code != 0 {
+                return Err(anyhow::anyhow!(
+                    "AT+QHTTPGET failed: err={} ({})",
+                    err_code,
+                    Self::describe_qhttp_error(err_code)
+                ));
+            }
+            if !(200..300).contains(&http_code) {
+                return Err(anyhow::anyhow!("MMS content fetch HTTP error: {}", http_code));
+            }
+
+            let result = self.readfile_then_download(&ram_file, timeout_secs).await;
+
+            // Best-effort cleanup regardless of outcome — free RAM storage.
+            let _ = self.send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_file)).await;
+
+            result
+        }
+        .await;
+
+        let _ = self.send_command("AT+QHTTPTERM\r\n").await;
+
+        fetch_result
+    }
+
+    /// Human-readable description for Quectel's extended HTTP(S) `<err>` codes
+    /// (701-723 range) returned directly in the `+QHTTPGET:`/`+QHTTPPOST:` URC on
+    /// this firmware, for clearer logs. Falls back to a generic label for codes
+    /// outside the documented table (e.g. the low 0-19 basic-error range).
+    fn describe_qhttp_error(err: i32) -> &'static str {
+        match err {
+            0 => "success",
+            701 => "HTTP(S) unknown error",
+            702 => "HTTP(S) timeout",
+            703 => "HTTP(S) busy",
+            704 => "HTTP(S) UART busy",
+            705 => "HTTP(S) no GET/POST/PUT requests",
+            706 => "HTTP(S) network busy",
+            707 => "HTTP(S) network open failed",
+            708 => "HTTP(S) network no configuration",
+            709 => "HTTP(S) network deactivated",
+            710 => "HTTP(S) network error",
+            711 => "HTTP(S) URL error",
+            712 => "HTTP(S) empty URL",
+            713 => "HTTP(S) IP address error",
+            714 => "HTTP(S) DNS error",
+            715 => "HTTP(S) socket create error",
+            716 => "HTTP(S) socket connect error",
+            717 => "HTTP(S) socket read error",
+            718 => "HTTP(S) socket write error",
+            719 => "HTTP(S) socket closed",
+            720 => "HTTP(S) data encode error",
+            721 => "HTTP(S) data decode error",
+            722 => "HTTP(S) read timeout",
+            723 => "HTTP(S) response failed",
+            _ => "unknown error",
         }
     }
 

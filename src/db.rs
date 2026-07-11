@@ -1827,6 +1827,297 @@ impl MmsProfile {
     }
 }
 
+/// A detected MMS WAP-push notification (phase 1: detect + store) whose content
+/// may since have been fetched and decoded (phase 2, see `mms_retrieve.rs`).
+#[derive(Debug, FromRow, Deserialize, Serialize, Clone)]
+pub struct MmsInboxNotification {
+    pub id: String,
+    pub sim_id: String,
+    pub sender: String,
+    pub transaction_id: String,
+    pub content_location: Option<String>,
+    pub message_size: Option<i64>,
+    pub message_class: Option<String>,
+    pub expiry_at: Option<NaiveDateTime>,
+    /// notified | fetching | fetched | failed | expired
+    pub status: String,
+    pub error_message: Option<String>,
+    pub retry_count: i32,
+    pub next_retry_at: Option<NaiveDateTime>,
+    /// Populated once the content has been fetched and decoded (status = "fetched").
+    pub subject: Option<String>,
+    pub from_address: Option<String>,
+    pub fetched_at: Option<NaiveDateTime>,
+    #[serde(skip_serializing)]
+    // Kept for re-processing if the decoder in mms_wap.rs/mms_retrieve.rs is
+    // fixed later; not useful to API consumers.
+    #[allow(dead_code)]
+    pub notification_raw: Vec<u8>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+impl MmsInboxNotification {
+    /// Insert a newly-seen notification, or refresh an existing one if the carrier
+    /// re-sent the same (sim_id, transaction_id) — common when the network retries
+    /// delivery before we've fetched the content.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_or_update(
+        sim_id: &str,
+        transaction_id: &str,
+        sender: &str,
+        content_location: Option<&str>,
+        message_size: Option<i64>,
+        expiry_at: Option<NaiveDateTime>,
+        message_class: Option<&str>,
+        notification_raw: &[u8],
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        let now = chrono::Utc::now().naive_utc();
+
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT id FROM mms_inbox WHERE sim_id = ? AND transaction_id = ?")
+                .bind(sim_id)
+                .bind(transaction_id)
+                .fetch_optional(pool)
+                .await?;
+
+        if let Some(id) = existing {
+            sqlx::query(
+                r#"UPDATE mms_inbox
+                   SET sender = ?, content_location = ?, message_size = ?, expiry_at = ?,
+                       message_class = ?, notification_raw = ?, updated_at = ?
+                   WHERE id = ?"#,
+            )
+            .bind(sender)
+            .bind(content_location)
+            .bind(message_size)
+            .bind(expiry_at)
+            .bind(message_class)
+            .bind(notification_raw)
+            .bind(now)
+            .bind(&id)
+            .execute(pool)
+            .await?;
+        } else {
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                r#"INSERT INTO mms_inbox
+                   (id, sim_id, sender, transaction_id, content_location, message_size,
+                    message_class, expiry_at, status, retry_count, notification_raw, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'notified', 0, ?, ?, ?)"#,
+            )
+            .bind(&id)
+            .bind(sim_id)
+            .bind(sender)
+            .bind(transaction_id)
+            .bind(content_location)
+            .bind(message_size)
+            .bind(message_class)
+            .bind(expiry_at)
+            .bind(notification_raw)
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn query_paginated(limit: i64, offset: i64) -> Result<(Vec<Self>, i64)> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
+                      message_class, expiry_at, status, error_message, retry_count, next_retry_at,
+                      subject, from_address, fetched_at, notification_raw, created_at, updated_at
+               FROM mms_inbox ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mms_inbox")
+            .fetch_one(pool)
+            .await?;
+        Ok((items, total))
+    }
+
+    pub async fn find_by_id(id: &str) -> Result<Option<Self>> {
+        let pool = get_pool()?;
+        let item = sqlx::query_as(
+            r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
+                      message_class, expiry_at, status, error_message, retry_count, next_retry_at,
+                      subject, from_address, fetched_at, notification_raw, created_at, updated_at
+               FROM mms_inbox WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(item)
+    }
+
+    /// Fetch up to `limit` notifications eligible for a content-fetch attempt:
+    /// newly notified, or previously failed but due for retry, and not yet past
+    /// their expiry (the MMSC will have discarded expired content anyway).
+    pub async fn get_fetchable(limit: i64) -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let now = chrono::Utc::now().naive_utc();
+        let items = sqlx::query_as(
+            r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
+                      message_class, expiry_at, status, error_message, retry_count, next_retry_at,
+                      subject, from_address, fetched_at, notification_raw, created_at, updated_at
+               FROM mms_inbox
+               WHERE status IN ('notified', 'failed')
+                 AND content_location IS NOT NULL
+                 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                 AND (expiry_at IS NULL OR expiry_at > ?)
+               ORDER BY created_at ASC
+               LIMIT ?"#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(items)
+    }
+
+    /// Mark any still-fetchable notifications that are now past their expiry as
+    /// "expired" so the worker stops retrying content the MMSC has discarded.
+    pub async fn expire_overdue() -> Result<u64> {
+        let pool = get_pool()?;
+        let now = chrono::Utc::now().naive_utc();
+        let result = sqlx::query(
+            r#"UPDATE mms_inbox SET status = 'expired', updated_at = ?
+               WHERE status IN ('notified', 'failed') AND expiry_at IS NOT NULL AND expiry_at <= ?"#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn mark_fetching(id: &str) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query("UPDATE mms_inbox SET status = 'fetching', updated_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_fetched(id: &str, subject: Option<&str>, from_address: Option<&str>) -> Result<()> {
+        let pool = get_pool()?;
+        let now = chrono::Utc::now().naive_utc();
+        sqlx::query(
+            r#"UPDATE mms_inbox
+               SET status = 'fetched', subject = ?, from_address = ?, fetched_at = ?,
+                   error_message = NULL, next_retry_at = NULL, updated_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(subject)
+        .bind(from_address)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a failed fetch attempt. `next_retry_at = None` means retries are
+    /// exhausted -- the row stays in "failed" but will no longer be picked up by
+    /// `get_fetchable()`.
+    pub async fn mark_fetch_failed(id: &str, error_message: &str, next_retry_at: Option<NaiveDateTime>) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            r#"UPDATE mms_inbox
+               SET status = 'failed', error_message = ?, retry_count = retry_count + 1,
+                   next_retry_at = ?, updated_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(error_message)
+        .bind(next_retry_at)
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// One decoded part of a fetched MMS (SMIL, text, image, ...). Metadata-only
+/// variant (no blob) is used for list views; `fetch_data` retrieves the bytes.
+#[derive(Debug, FromRow, Deserialize, Serialize, Clone)]
+pub struct MmsInboxPartMeta {
+    pub id: String,
+    pub inbox_id: String,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    pub size_bytes: i64,
+}
+
+/// Namespace for fetched MMS part storage/retrieval.
+pub struct MmsInboxPart;
+
+impl MmsInboxPart {
+    pub async fn insert(inbox_id: &str, content_type: &str, filename: Option<&str>, data: &[u8]) -> Result<String> {
+        let pool = get_pool()?;
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"INSERT INTO mms_inbox_parts (id, inbox_id, content_type, filename, size_bytes, data, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(inbox_id)
+        .bind(content_type)
+        .bind(filename)
+        .bind(data.len() as i64)
+        .bind(data)
+        .bind(chrono::Utc::now().naive_utc())
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Replace any previously stored parts for this notification (used when a
+    /// retry succeeds after a partial failure, so stale parts don't linger).
+    pub async fn delete_all_for_inbox(inbox_id: &str) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query("DELETE FROM mms_inbox_parts WHERE inbox_id = ?")
+            .bind(inbox_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_meta(inbox_id: &str) -> Result<Vec<MmsInboxPartMeta>> {
+        let pool = get_pool()?;
+        let items = sqlx::query_as(
+            r#"SELECT id, inbox_id, content_type, filename, size_bytes
+               FROM mms_inbox_parts WHERE inbox_id = ? ORDER BY rowid ASC"#,
+        )
+        .bind(inbox_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(items)
+    }
+
+    /// Fetch a single part's raw bytes + content type, for a download/view endpoint.
+    pub async fn fetch_data(part_id: &str) -> Result<Option<(Option<String>, Option<String>, Vec<u8>)>> {
+        let pool = get_pool()?;
+        let row: Option<(Option<String>, Option<String>, Vec<u8>)> = sqlx::query_as(
+            r#"SELECT content_type, filename, data FROM mms_inbox_parts WHERE id = ?"#,
+        )
+        .bind(part_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
+    }
+}
+
 /// Initializes SQLite database
 pub async fn db_init() -> Result<()> {
     #[cfg(debug_assertions)]

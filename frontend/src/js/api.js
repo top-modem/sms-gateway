@@ -328,6 +328,49 @@ class ApiClient {
     async setMmsProfile(simId, payload) {
         return FetchApi.put(`/api/sim-cards/${simId}/mms-profile`, payload, {}, 'application/json');
     }
+
+    /**
+     * Get paginated MMS inbox notifications (phase 1: detected WAP-push
+     * notifications; content fetch/decode is a later phase, so status will
+     * read "notified" for now).
+     * @param {number} [page=1]
+     * @param {number} [perPage=20]
+     */
+    async getMmsInboxPaginated(page = 1, perPage = 20) {
+        return FetchApi.get('/api/mms/inbox', { page, per_page: perPage });
+    }
+
+    /**
+     * Get a single MMS inbox notification.
+     * @param {string} id
+     */
+    async getMmsInboxDetail(id) {
+        return FetchApi.get(`/api/mms/inbox/${id}`);
+    }
+
+    /**
+     * Fetch a decoded MMS inbox part's raw bytes as a Blob (image, SMIL, text, ...).
+     * Uses a plain authenticated fetch rather than FetchApi since the response
+     * body is binary, not JSON.
+     * @param {string} inboxId
+     * @param {string} partId
+     * @returns {Promise<Blob>}
+     */
+    async getMmsInboxPartBlob(inboxId, partId) {
+        const auth = sessionStorage.getItem('auth');
+        const headers = {};
+        if (auth) {
+            try {
+                const { token } = JSON.parse(auth);
+                if (token) headers['Authorization'] = `Basic ${token}`;
+            } catch (_) { /* ignore malformed auth entry */ }
+        }
+        const response = await fetch(`/api/mms/inbox/${inboxId}/parts/${partId}`, { headers });
+        if (!response.ok) {
+            throw new Error(`Failed to fetch MMS part (${response.status})`);
+        }
+        return response.blob();
+    }
 }
 
 // Export as a singleton

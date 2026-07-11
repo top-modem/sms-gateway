@@ -375,7 +375,7 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        modem.read_sms(sms_type).await.map_err(Into::into)
+        modem.read_sms(sms_type).await.map(|(list, _)| list).map_err(Into::into)
     }
 
     pub async fn read_sms_async_insert(
@@ -418,14 +418,20 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        let sms_list = modem.read_sms(crate::modem::SmsType::All).await?;
+        let (sms_list, mms_found) = modem.read_sms(crate::modem::SmsType::All).await?;
 
-        if sms_list.is_empty() {
+        if sms_list.is_empty() && !mms_found {
             return Ok(None);
         }
 
+        // Delete even if sms_list is empty but an MMS WAP-push notification
+        // was found, so notifications don't accumulate in SIM storage forever.
         if let Err(e) = modem.delete_all_sms().await {
             log::warn!("Failed to delete SMS from modem after reading: {}", e);
+        }
+
+        if sms_list.is_empty() {
+            return Ok(None);
         }
 
         ModemSMS::bulk_insert(&sms_list).await?;
@@ -1361,6 +1367,36 @@ impl ModemManager {
                     modem.resolve_mms_completion(err_code, http_code).await;
                 } else {
                     error!("[URC {}] failed to parse +QMMSEND: line: {}", sim_id, line);
+                }
+                continue;
+            }
+
+            // MMS content fetch (AT+QHTTPGET) completion — resolve the waiter set by
+            // Modem::fetch_mms_content().
+            if line.starts_with("+QHTTPGET:") {
+                if let Some((err_code, http_code, content_length)) = Modem::parse_qhttpget(&line) {
+                    info!(
+                        "[URC {}] MMS content HTTP GET completed: err={}, http={}, len={}",
+                        sim_id, err_code, http_code, content_length
+                    );
+                    modem
+                        .resolve_http_get_completion(err_code, http_code, content_length)
+                        .await;
+                } else {
+                    error!("[URC {}] failed to parse +QHTTPGET: line: {}", sim_id, line);
+                }
+                continue;
+            }
+
+            // AT+QHTTPREADFILE completion — resolve the waiter set by
+            // Modem::readfile_then_download(). `OK` from the command itself only means
+            // the request was accepted; the file isn't actually ready until this URC.
+            if line.starts_with("+QHTTPREADFILE:") {
+                if let Some(err_code) = Modem::parse_qhttpreadfile(&line) {
+                    info!("[URC {}] QHTTPREADFILE completed: err={}", sim_id, err_code);
+                    modem.resolve_http_readfile_completion(err_code).await;
+                } else {
+                    error!("[URC {}] failed to parse +QHTTPREADFILE: line: {}", sim_id, line);
                 }
                 continue;
             }

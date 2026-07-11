@@ -43,9 +43,22 @@
   let detailAttachments = $state([]);
   let detailOpen = $state(false);
 
+  // ── Inbox: detected notifications + fetched content (subject/from/parts) ──
+  let inbox = $state([]);
+  let inboxTotal = $state(0);
+  let inboxPage = $state(1);
+  let inboxPerPage = 20;
+  let inboxLoading = $state(true);
+  let inboxError = $state('');
+  let inboxDetailItem = $state(null);
+  let inboxDetailParts = $state([]);
+  let inboxDetailLoading = $state(false);
+  let inboxDetailOpen = $state(false);
+
   let pollTimer = null;
 
   const totalPages = $derived(Math.max(1, Math.ceil(historyTotal / historyPerPage)));
+  const inboxTotalPages = $derived(Math.max(1, Math.ceil(inboxTotal / inboxPerPage)));
   const totalAttachmentBytes = $derived(attachments.reduce((sum, a) => sum + a.size, 0));
 
   async function loadSims() {
@@ -99,10 +112,10 @@
     profileSuccess = '';
     try {
       const payload = {
-        apn: profileApn.trim() || null,
-        mmsc: profileMmsc.trim() || null,
-        proxy_host: profileProxyHost.trim() || null,
-        proxy_port: profileProxyPort.trim() ? Number(profileProxyPort.trim()) : null,
+        apn: String(profileApn ?? '').trim() || null,
+        mmsc: String(profileMmsc ?? '').trim() || null,
+        proxy_host: String(profileProxyHost ?? '').trim() || null,
+        proxy_port: String(profileProxyPort ?? '').trim() ? Number(String(profileProxyPort).trim()) : null,
       };
       await apiClient.setMmsProfile(selectedSimId, payload);
       profileSuccess = $t('msg_profile_saved');
@@ -276,6 +289,89 @@
     return history.some((job) => job.status === 'queued' || job.status === 'sending');
   }
 
+  async function loadInbox(page = inboxPage) {
+    inboxLoading = true;
+    inboxError = '';
+    try {
+      const res = await apiClient.getMmsInboxPaginated(page, inboxPerPage);
+      const body = res?.data ?? res ?? {};
+      inbox = body.data ?? [];
+      inboxTotal = body.total ?? 0;
+      inboxPage = body.page ?? page;
+    } catch (e) {
+      console.error('Failed to load MMS inbox:', e);
+      inboxError = e?.message ?? 'Failed to load MMS inbox';
+    } finally {
+      inboxLoading = false;
+    }
+  }
+
+  async function openInboxDetail(item) {
+    inboxDetailItem = item;
+    inboxDetailParts = [];
+    inboxDetailOpen = true;
+    inboxDetailLoading = true;
+    try {
+      const res = await apiClient.getMmsInboxDetail(item.id);
+      const body = res?.data ?? res ?? {};
+      inboxDetailItem = body.notification ?? item;
+      inboxDetailParts = body.parts ?? [];
+    } catch (e) {
+      console.error('Failed to load MMS inbox detail:', e);
+    } finally {
+      inboxDetailLoading = false;
+    }
+  }
+
+  function closeInboxDetail() {
+    inboxDetailOpen = false;
+    inboxDetailItem = null;
+    inboxDetailParts = [];
+  }
+
+  async function viewInboxPart(part) {
+    if (!inboxDetailItem) return;
+    try {
+      const blob = await apiClient.getMmsInboxPartBlob(inboxDetailItem.id, part.id);
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      // Give the new tab time to load the resource before revoking it.
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (e) {
+      console.error('Failed to load MMS part:', e);
+    }
+  }
+
+  function inboxStatusBadgeClass(status) {
+    switch (status) {
+      case 'fetched':
+        return 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300';
+      case 'failed':
+      case 'expired':
+        return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300';
+      case 'fetching':
+        return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300';
+      default:
+        return 'bg-gray-100 text-gray-700 dark:bg-gray-700/50 dark:text-gray-300';
+    }
+  }
+
+  function inboxStatusLabel(status) {
+    switch (status) {
+      case 'notified': return $t('mms_inbox_status_notified');
+      case 'fetching': return $t('mms_inbox_status_fetching');
+      case 'fetched': return $t('mms_inbox_status_fetched');
+      case 'failed': return $t('mms_inbox_status_failed');
+      case 'expired': return $t('mms_inbox_status_expired');
+      default: return status;
+    }
+  }
+
+  function formatMmsSize(bytes) {
+    if (bytes === null || bytes === undefined) return '-';
+    return formatBytes(bytes);
+  }
+
   $effect(() => {
     if (selectedSimId) {
       loadProfile(selectedSimId);
@@ -285,6 +381,7 @@
   onMount(() => {
     loadSims();
     loadHistory(1);
+    loadInbox(1);
     // Light polling so queued/sending jobs update to sent/failed without manual refresh.
     pollTimer = setInterval(() => {
       if (hasPendingJobs()) {
@@ -298,7 +395,7 @@
   });
 </script>
 
-<div class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+<div class="h-dvh overflow-y-auto bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
   <div class="sticky top-0 z-10 border-b border-gray-200 dark:border-gray-700 bg-white/90 dark:bg-gray-800/90 backdrop-blur">
     <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
       <div class="flex items-center gap-3">
@@ -315,7 +412,7 @@
         </div>
       </div>
       <button
-        onclick={() => loadHistory(historyPage)}
+        onclick={() => { loadHistory(historyPage); loadInbox(inboxPage); }}
         class="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-blue-700"
       >
         <Icon icon="carbon:renew" class="h-4 w-4" />
@@ -523,7 +620,9 @@
                 <label for="mms-proxy-port" class="mb-1 block text-xs font-medium text-gray-700 dark:text-gray-300">{$t('mms_proxy_port_label')}</label>
                 <input
                   id="mms-proxy-port"
-                  type="number"
+                  type="text"
+                  inputmode="numeric"
+                  pattern="[0-9]*"
                   bind:value={profileProxyPort}
                   class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900
                          focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500
@@ -580,7 +679,7 @@
           >
             <Icon icon="carbon:chevron-left" class="h-3.5 w-3.5" />
           </button>
-          <span>{historyPage} / {totalPages}</span>
+          <span>{historyPage} / {totalPages} · {historyTotal} total</span>
           <button
             onclick={() => loadHistory(historyPage + 1)}
             disabled={historyPage >= totalPages || historyLoading}
@@ -651,7 +750,191 @@
       {/if}
     </section>
   </div>
+
+  <!-- ── Inbox: detected MMS notifications + fetched/decoded content ── -->
+  <div class="mx-auto max-w-7xl px-4 pb-6">
+    <section class="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm dark:border-gray-700 dark:bg-gray-800">
+      <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-gray-700">
+        <div>
+          <div class="font-semibold">{$t('mms_inbox_title')}</div>
+          <div class="text-xs text-gray-500 dark:text-gray-400">{$t('mms_inbox_desc')}</div>
+        </div>
+        <div class="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+          <button
+            onclick={() => loadInbox(inboxPage - 1)}
+            disabled={inboxPage <= 1 || inboxLoading}
+            class="rounded-lg border border-gray-200 p-1.5 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700"
+            aria-label="Previous page"
+          >
+            <Icon icon="carbon:chevron-left" class="h-3.5 w-3.5" />
+          </button>
+          <span>{inboxPage} / {inboxTotalPages} · {inboxTotal} total</span>
+          <button
+            onclick={() => loadInbox(inboxPage + 1)}
+            disabled={inboxPage >= inboxTotalPages || inboxLoading}
+            class="rounded-lg border border-gray-200 p-1.5 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700"
+            aria-label="Next page"
+          >
+            <Icon icon="carbon:chevron-right" class="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {#if inboxLoading && inbox.length === 0}
+        <div class="flex h-40 items-center justify-center text-gray-500">
+          <Icon icon="carbon:loading" class="mr-2 h-6 w-6 animate-spin" />
+          Loading...
+        </div>
+      {:else if inboxError}
+        <div class="p-4 text-sm text-red-600 dark:text-red-400">{inboxError}</div>
+      {:else}
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead class="bg-gray-50 dark:bg-gray-700/50">
+              <tr>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_time')}</th>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_sender')}</th>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_transaction_id')}</th>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_size')}</th>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_status')}</th>
+                <th class="px-4 py-2 text-right font-medium"></th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-100 dark:divide-gray-700">
+              {#each inbox as item (item.id)}
+                <tr class="align-top hover:bg-gray-50 dark:hover:bg-gray-700/40">
+                  <td class="whitespace-nowrap px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
+                    {formatDate(item.created_at)}
+                  </td>
+                  <td class="px-4 py-3">{item.sender}</td>
+                  <td class="max-w-[220px] truncate px-4 py-3 font-mono text-xs" title={item.transaction_id}>
+                    {item.transaction_id}
+                  </td>
+                  <td class="px-4 py-3">{formatMmsSize(item.message_size)}</td>
+                  <td class="px-4 py-3">
+                    <span class={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${inboxStatusBadgeClass(item.status)}`}>
+                      {inboxStatusLabel(item.status)}
+                    </span>
+                  </td>
+                  <td class="px-4 py-3 text-right">
+                    <button
+                      onclick={() => openInboxDetail(item)}
+                      class="rounded-lg border border-gray-200 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50
+                             dark:border-zinc-700 dark:text-gray-300 dark:hover:bg-zinc-800"
+                    >
+                      {$t('btn_view')}
+                    </button>
+                  </td>
+                </tr>
+              {:else}
+                <tr>
+                  <td colspan="6" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                    {$t('mms_inbox_no_data')}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </section>
+  </div>
 </div>
+
+<Modal isOpen={inboxDetailOpen} onClose={closeInboxDetail} maxWidth="max-w-lg">
+  <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-zinc-700">
+    <div class="font-semibold text-gray-800 dark:text-gray-100">{$t('mms_inbox_detail_title')}</div>
+    <button onclick={closeInboxDetail} class="rounded-lg p-1.5 hover:bg-gray-100 dark:hover:bg-zinc-800" aria-label="Close">
+      <Icon icon="carbon:close" class="h-4 w-4" />
+    </button>
+  </div>
+  <div class="flex-1 overflow-auto p-4 text-sm">
+    {#if inboxDetailItem}
+      <dl class="space-y-2">
+        <div class="flex justify-between gap-4">
+          <dt class="text-gray-500 dark:text-gray-400">{$t('col_sender')}</dt>
+          <dd class="font-medium">{inboxDetailItem.sender}</dd>
+        </div>
+        {#if inboxDetailItem.subject}
+          <div class="flex justify-between gap-4">
+            <dt class="text-gray-500 dark:text-gray-400">{$t('mms_inbox_subject_label')}</dt>
+            <dd class="break-all font-medium">{inboxDetailItem.subject}</dd>
+          </div>
+        {/if}
+        {#if inboxDetailItem.from_address}
+          <div class="flex justify-between gap-4">
+            <dt class="text-gray-500 dark:text-gray-400">{$t('mms_inbox_from_label')}</dt>
+            <dd class="break-all font-medium">{inboxDetailItem.from_address}</dd>
+          </div>
+        {/if}
+        <div class="flex justify-between gap-4">
+          <dt class="text-gray-500 dark:text-gray-400">{$t('col_transaction_id')}</dt>
+          <dd class="break-all font-mono text-xs">{inboxDetailItem.transaction_id}</dd>
+        </div>
+        <div>
+          <dt class="mb-1 text-gray-500 dark:text-gray-400">{$t('col_content_location')}</dt>
+          <dd class="break-all rounded-lg bg-gray-50 p-2 font-mono text-xs dark:bg-zinc-900">
+            {inboxDetailItem.content_location || '-'}
+          </dd>
+        </div>
+        <div class="flex justify-between gap-4">
+          <dt class="text-gray-500 dark:text-gray-400">{$t('col_size')}</dt>
+          <dd class="font-medium">{formatMmsSize(inboxDetailItem.message_size)}</dd>
+        </div>
+        <div class="flex justify-between gap-4">
+          <dt class="text-gray-500 dark:text-gray-400">{$t('col_expiry')}</dt>
+          <dd class="font-medium">{formatDate(inboxDetailItem.expiry_at)}</dd>
+        </div>
+        <div class="flex justify-between gap-4">
+          <dt class="text-gray-500 dark:text-gray-400">{$t('col_status')}</dt>
+          <dd>
+            <span class={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${inboxStatusBadgeClass(inboxDetailItem.status)}`}>
+              {inboxStatusLabel(inboxDetailItem.status)}
+            </span>
+          </dd>
+        </div>
+        {#if inboxDetailItem.error_message}
+          <div>
+            <dt class="mb-1 text-gray-500 dark:text-gray-400">{$t('col_error')}</dt>
+            <dd class="break-words rounded-lg bg-red-50 p-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
+              {inboxDetailItem.error_message}
+            </dd>
+          </div>
+        {/if}
+        {#if inboxDetailItem.status === 'fetched' || inboxDetailParts.length > 0}
+          <div>
+            <dt class="mb-1 text-gray-500 dark:text-gray-400">{$t('mms_inbox_parts_label')}</dt>
+            <dd>
+              {#if inboxDetailLoading}
+                <span class="text-xs text-gray-400 dark:text-gray-500">…</span>
+              {:else if inboxDetailParts.length > 0}
+                <ul class="space-y-1">
+                  {#each inboxDetailParts as part (part.id)}
+                    <li class="flex items-center justify-between gap-2 rounded-lg bg-gray-50 px-2.5 py-1.5 text-xs dark:bg-zinc-900">
+                      <span class="min-w-0 flex-1 truncate" title={part.content_type}>
+                        {part.filename || part.content_type}
+                      </span>
+                      <span class="shrink-0 text-gray-400 dark:text-gray-500">{formatBytes(part.size_bytes)}</span>
+                      <button
+                        type="button"
+                        class="shrink-0 font-medium text-blue-600 hover:underline dark:text-blue-400"
+                        onclick={() => viewInboxPart(part)}
+                      >
+                        {$t('mms_inbox_view_part')}
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {:else}
+                <span class="text-xs text-gray-400 dark:text-gray-500">{$t('mms_inbox_no_parts')}</span>
+              {/if}
+            </dd>
+          </div>
+        {/if}
+      </dl>
+    {/if}
+  </div>
+</Modal>
 
 <Modal isOpen={detailOpen} onClose={closeDetail} maxWidth="max-w-lg">
   <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-zinc-700">

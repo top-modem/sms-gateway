@@ -311,6 +311,29 @@ const translations = {
     mms_err_code_label:       'Quectel Error Code',
     mms_http_code_label:      'HTTP Response Code',
     mms_no_active_sims:       'No active SIM cards detected. Make sure the modem is connected.',
+
+    // MMS inbox: detects incoming MMS WAP-push notifications, then fetches and
+    // decodes the actual content over AT+QHTTPxxx (the EC20/EC25 have no native
+    // MMS-receive AT command).
+    mms_inbox_title:          'MMS Inbox',
+    mms_inbox_desc:           'Detected incoming MMS notifications and their fetched content.',
+    mms_inbox_no_data:        'No MMS notifications received yet.',
+    col_sender:               'From',
+    col_transaction_id:       'Transaction ID',
+    col_content_location:     'Content Location',
+    col_size:                 'Size',
+    col_expiry:               'Expires',
+    mms_inbox_status_notified: 'Notified',
+    mms_inbox_status_fetching: 'Fetching',
+    mms_inbox_status_fetched:  'Fetched',
+    mms_inbox_status_failed:   'Failed',
+    mms_inbox_status_expired:  'Expired',
+    mms_inbox_detail_title:    'MMS Notification Detail',
+    mms_inbox_subject_label:  'Subject',
+    mms_inbox_from_label:     'MMS From',
+    mms_inbox_parts_label:    'Content',
+    mms_inbox_no_parts:       'No content fetched yet.',
+    mms_inbox_view_part:      'View',
   },
 
   zh: {
@@ -622,6 +645,28 @@ const translations = {
     mms_err_code_label:       'Quectel 错误码',
     mms_http_code_label:      'HTTP 响应码',
     mms_no_active_sims:       '未检测到活动的SIM卡，请确认调制解调器已连接。',
+
+    // MMS 收件箱：检测彩信WAP-push通知，并通过AT+QHTTPxxx抓取、解码实际内容
+    // （EC20/EC25模块没有原生彩信接收AT命令）。
+    mms_inbox_title:          '彩信收件箱',
+    mms_inbox_desc:           '检测到的彩信通知及已抓取的内容。',
+    mms_inbox_no_data:        '暂未收到彩信通知。',
+    col_sender:               '发件人',
+    col_transaction_id:       '事务ID',
+    col_content_location:     '内容地址',
+    col_size:                 '大小',
+    col_expiry:               '过期时间',
+    mms_inbox_status_notified: '已通知',
+    mms_inbox_status_fetching: '抓取中',
+    mms_inbox_status_fetched:  '已抓取',
+    mms_inbox_status_failed:   '失败',
+    mms_inbox_status_expired:  '已过期',
+    mms_inbox_detail_title:    '彩信通知详情',
+    mms_inbox_subject_label:  '主题',
+    mms_inbox_from_label:     '彩信发件人',
+    mms_inbox_parts_label:    '内容',
+    mms_inbox_no_parts:       '尚未抓取到内容。',
+    mms_inbox_view_part:      '查看',
   },
 };
 

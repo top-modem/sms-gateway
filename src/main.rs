@@ -17,6 +17,8 @@ mod decode;
 mod firefox_api;
 mod firefox_upload_retry;
 mod firefox_upload_retry_worker;
+mod mms_wap;
+mod mms_retrieve;
 mod mms_worker;
 mod modem;
 mod phone_number;

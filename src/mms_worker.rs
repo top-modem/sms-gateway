@@ -4,12 +4,17 @@
 /// seconds) and waiting for the modem's async `+QMMSEND: <err>,<httprsp>` URC (up to
 /// `mms_send_timeout_secs`), so jobs are processed one at a time per poll tick rather
 /// than blocking the HTTP request that created them (see POST /api/mms).
-use crate::db::{MmsAttachment, MmsMessage, MmsProfile};
+use crate::db::{MmsAttachment, MmsInboxNotification, MmsInboxPart, MmsMessage, MmsProfile};
 use crate::ModemManagerRef;
 use log::{error, info, warn};
 use std::time::Duration;
 
 /// Start the MMS worker background task.
+///
+/// `send_timeout_secs` is reused as both the outgoing send timeout and the
+/// inbox content-fetch timeout (AT+QHTTPGET/AT+QHTTPREADFILE) -- both talk to
+/// the same MMSC/APN over similar-latency HTTP round-trips, so a single
+/// configured value is sufficient for now.
 pub fn start_mms_worker(
     modem_manager: ModemManagerRef,
     send_timeout_secs: u64,
@@ -31,6 +36,10 @@ async fn mms_worker_loop(modem_manager: ModemManagerRef, send_timeout_secs: u64)
 
         if let Err(e) = process_queue(&modem_manager, send_timeout_secs).await {
             error!("[MMS Worker] Error processing queue: {}", e);
+        }
+
+        if let Err(e) = process_inbox_queue(&modem_manager, send_timeout_secs).await {
+            error!("[MMS Worker] Error processing inbox fetch queue: {}", e);
         }
     }
 }
@@ -164,4 +173,145 @@ async fn process_queue(modem_manager: &ModemManagerRef, send_timeout_secs: u64) 
     }
 
     Ok(())
+}
+
+/// Retry backoff schedule (seconds) for MMS content-fetch failures, matching
+/// asterisk-chan-modemmanager's `mms_txn` retry policy: a quick first retry,
+/// then backing off. `retry_count` (0-based, before this attempt) indexes into
+/// this array; once exhausted the row stays "failed" and is no longer retried.
+const RETRY_BACKOFF_SECS: [i64; 3] = [30, 120, 600];
+
+/// Fetch and decode the content for MMS notifications that are due (newly
+/// notified, or failed and past their retry backoff). Reuses the AT-port-only
+/// `AT+QHTTPxxx` fetch mechanism (`Modem::fetch_mms_content`) -- see
+/// `mms_retrieve.rs` for the M-Retrieve.conf decoder.
+async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs: u64) -> anyhow::Result<()> {
+    if let Ok(n) = MmsInboxNotification::expire_overdue().await {
+        if n > 0 {
+            info!("[MMS Worker] Expired {} overdue MMS notification(s)", n);
+        }
+    }
+
+    let items = MmsInboxNotification::get_fetchable(5).await?;
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    for item in items {
+        let url = match item.content_location.as_deref() {
+            Some(u) => u,
+            None => continue, // excluded by the query already, but be defensive
+        };
+
+        info!(
+            "[MMS Worker] Fetching MMS content {} (sim={}, txn={}, attempt={})",
+            item.id, item.sim_id, item.transaction_id, item.retry_count + 1
+        );
+
+        if let Err(e) = MmsInboxNotification::mark_fetching(&item.id).await {
+            error!("[MMS Worker] Failed to mark {} as fetching: {}", item.id, e);
+            continue;
+        }
+
+        let modem = match modem_manager.get_modem(&item.sim_id).await {
+            Some(m) => m,
+            None => {
+                warn!("[MMS Worker] {}: modem for SIM {} not available", item.id, item.sim_id);
+                fail_and_schedule_retry(&item, "Modem not available").await;
+                continue;
+            }
+        };
+
+        // The generic HTTP module needs the carrier's MMS proxy explicitly (it does not
+        // share AT+QMMSCFG's proxy setting) since MMS APNs are typically only routable
+        // through that proxy, not the open internet -- see Modem::fetch_mms_content.
+        let (proxy_host, proxy_port) = match MmsProfile::get(&item.sim_id).await {
+            Ok(Some(profile)) => (
+                profile.mms_proxy_host,
+                profile.mms_proxy_port.map(|p| p as u16),
+            ),
+            Ok(None) => (None, None),
+            Err(e) => {
+                warn!("[MMS Worker] {}: failed to load MMS profile: {}", item.id, e);
+                (None, None)
+            }
+        };
+
+        let bytes = match modem
+            .fetch_mms_content(url, proxy_host.as_deref(), proxy_port, fetch_timeout_secs)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!("[MMS Worker] {}: content fetch failed: {}", item.id, e);
+                fail_and_schedule_retry(&item, &e.to_string()).await;
+                continue;
+            }
+        };
+
+        let conf = match crate::mms_retrieve::decode_retrieve_conf(&bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("[MMS Worker] {}: failed to decode M-Retrieve.conf: {}", item.id, e);
+                fail_and_schedule_retry(&item, &format!("Decode failed: {}", e)).await;
+                continue;
+            }
+        };
+
+        if let Err(e) = MmsInboxPart::delete_all_for_inbox(&item.id).await {
+            warn!("[MMS Worker] {}: failed to clear stale parts before insert: {}", item.id, e);
+        }
+
+        let mut store_err = None;
+        for (idx, part) in conf.parts.iter().enumerate() {
+            let filename = part.filename.clone().unwrap_or_else(|| {
+                let ext = mime_guess::get_mime_extensions_str(&part.content_type)
+                    .and_then(|exts| exts.first())
+                    .copied()
+                    .unwrap_or("bin");
+                format!("part{}.{}", idx, ext)
+            });
+            if let Err(e) = MmsInboxPart::insert(&item.id, &part.content_type, Some(&filename), &part.data).await {
+                store_err = Some(e);
+                break;
+            }
+        }
+
+        match store_err {
+            None => match MmsInboxNotification::mark_fetched(&item.id, conf.subject.as_deref(), conf.from.as_deref()).await {
+                Ok(()) => info!(
+                    "[MMS Worker] {} fetched successfully: {} part(s), subject={:?}",
+                    item.id,
+                    conf.parts.len(),
+                    conf.subject
+                ),
+                Err(e) => error!("[MMS Worker] {}: failed to mark fetched: {}", item.id, e),
+            },
+            Some(e) => {
+                error!("[MMS Worker] {}: failed to store MMS parts: {}", item.id, e);
+                fail_and_schedule_retry(&item, &format!("Failed to store parts: {}", e)).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Record a failed fetch attempt and schedule the next retry per
+/// `RETRY_BACKOFF_SECS`, or give up (leave `next_retry_at` unset) once
+/// attempts are exhausted.
+async fn fail_and_schedule_retry(item: &MmsInboxNotification, error_message: &str) {
+    let next_retry_at = RETRY_BACKOFF_SECS
+        .get(item.retry_count as usize)
+        .map(|&secs| chrono::Utc::now().naive_utc() + chrono::Duration::seconds(secs));
+    if next_retry_at.is_none() {
+        warn!(
+            "[MMS Worker] {}: retry attempts exhausted ({} tries), giving up",
+            item.id,
+            item.retry_count + 1
+        );
+    }
+    if let Err(e) = MmsInboxNotification::mark_fetch_failed(&item.id, error_message, next_retry_at).await {
+        error!("[MMS Worker] {}: failed to record fetch failure: {}", item.id, e);
+    }
 }

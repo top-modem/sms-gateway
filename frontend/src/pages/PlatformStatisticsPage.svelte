@@ -171,8 +171,8 @@
   });
 </script>
 
-<div class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
-  <div class="sticky top-0 z-10 border-b border-gray-200 dark:border-gray-700 bg-white/90 dark:bg-gray-800/90 backdrop-blur">
+<div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+  <header class="shrink-0 z-10 border-b border-gray-200 dark:border-gray-700 bg-white/90 dark:bg-gray-800/90 backdrop-blur">
     <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
       <div class="flex items-center gap-3">
         <button
@@ -197,10 +197,11 @@
         Refresh
       </button>
     </div>
-  </div>
+  </header>
 
-  <div class="mx-auto max-w-7xl p-4">
-    {#if loading}
+  <div class="flex-1 overflow-auto">
+    <div class="mx-auto max-w-7xl p-4">
+      {#if loading}
       <div class="flex h-64 items-center justify-center text-gray-500">
         <Icon icon="carbon:loading" class="mr-2 h-8 w-8 animate-spin" />
         Loading...
@@ -415,5 +416,6 @@
         </section>
       </div>
     {/if}
+  </div>
   </div>
 </div>

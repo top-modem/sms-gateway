@@ -756,6 +756,25 @@ struct BarcodeScanResponse {
     invalid_lines: Vec<BarcodeInvalidLine>,
 }
 
+fn candidate_base_dirs() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            bases.push(exe_dir.to_path_buf());
+            if let Some(parent) = exe_dir.parent() {
+                bases.push(parent.to_path_buf());
+                if let Some(grandparent) = parent.parent() {
+                    bases.push(grandparent.to_path_buf());
+                }
+            }
+        }
+    }
+    bases
+}
+
 fn resolve_barcode_output_file(configured: Option<&str>) -> PathBuf {
     if let Some(path) = configured {
         let trimmed = path.trim();
@@ -764,16 +783,33 @@ fn resolve_barcode_output_file(configured: Option<&str>) -> PathBuf {
         }
     }
 
+    let bases = candidate_base_dirs();
     let candidates = [
+        PathBuf::from("bar_code/dist/号码.txt"),
+        PathBuf::from("bar_code/号码.txt"),
+        PathBuf::from("号码.txt"),
         PathBuf::from("../bar_code/dist/号码.txt"),
         PathBuf::from("../bar_code/号码.txt"),
-        PathBuf::from("./号码.txt"),
+        PathBuf::from("../号码.txt"),
+        PathBuf::from("../../bar_code/dist/号码.txt"),
+        PathBuf::from("../../bar_code/号码.txt"),
+        PathBuf::from("../../号码.txt"),
     ];
 
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("../bar_code/dist/号码.txt"))
+    for base in &bases {
+        for candidate in &candidates {
+            let full = base.join(candidate);
+            if full.exists() {
+                return full;
+            }
+        }
+    }
+
+    bases
+        .first()
+        .cloned()
+        .unwrap_or_else(PathBuf::new)
+        .join("bar_code/dist/号码.txt")
 }
 
 fn resolve_barcode_launcher_file(configured: Option<&str>) -> PathBuf {
@@ -784,16 +820,124 @@ fn resolve_barcode_launcher_file(configured: Option<&str>) -> PathBuf {
         }
     }
 
+    let bases = candidate_base_dirs();
     let candidates = [
+        PathBuf::from("bar_code/dist/扫码枪录入程序.exe"),
+        PathBuf::from("bar_code/扫码枪录入程序.exe"),
+        PathBuf::from("扫码枪录入程序.exe"),
         PathBuf::from("../bar_code/dist/扫码枪录入程序.exe"),
         PathBuf::from("../bar_code/扫码枪录入程序.exe"),
-        PathBuf::from("./扫码枪录入程序.exe"),
+        PathBuf::from("../扫码枪录入程序.exe"),
+        PathBuf::from("../../bar_code/dist/扫码枪录入程序.exe"),
+        PathBuf::from("../../bar_code/扫码枪录入程序.exe"),
+        PathBuf::from("../../扫码枪录入程序.exe"),
     ];
 
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("../bar_code/dist/扫码枪录入程序.exe"))
+    for base in &bases {
+        for candidate in &candidates {
+            let full = base.join(candidate);
+            if full.exists() {
+                return full;
+            }
+        }
+    }
+
+    bases
+        .first()
+        .cloned()
+        .unwrap_or_else(PathBuf::new)
+        .join("bar_code/dist/扫码枪录入程序.exe")
+}
+
+#[cfg(windows)]
+mod barcode_scanner {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, TRUE};
+    use windows_sys::Win32::System::Threading::{GetProcessId, WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    pub struct ForegroundProcess {
+        h_process: usize,
+    }
+
+    impl Drop for ForegroundProcess {
+        fn drop(&mut self) {
+            if self.h_process != 0 {
+                unsafe { CloseHandle(self.h_process as HANDLE); }
+                self.h_process = 0;
+            }
+        }
+    }
+
+    impl ForegroundProcess {
+        pub fn spawn(path: &Path) -> io::Result<Self> {
+            let abs_path = std::fs::canonicalize(path)
+                .unwrap_or_else(|_| path.to_path_buf());
+            let file_wide: Vec<u16> = abs_path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let verb_wide: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+
+            let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+            sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+            sei.lpVerb = verb_wide.as_ptr() as *const u16;
+            sei.lpFile = file_wide.as_ptr() as *const u16;
+            sei.nShow = SW_SHOWNORMAL;
+            sei.hwnd = null_mut();
+
+            let success = unsafe { ShellExecuteExW(&mut sei) };
+            if success == TRUE && !sei.hProcess.is_null() {
+                Ok(ForegroundProcess { h_process: sei.hProcess as usize })
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        pub fn id(&self) -> u32 {
+            unsafe { GetProcessId(self.h_process as HANDLE) }
+        }
+
+        pub fn wait(mut self) -> io::Result<()> {
+            unsafe {
+                WaitForSingleObject(self.h_process as HANDLE, INFINITE);
+                CloseHandle(self.h_process as HANDLE);
+                self.h_process = 0;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod barcode_scanner {
+    use std::io;
+    use std::path::Path;
+    use std::process::{Child, Command};
+
+    pub struct ForegroundProcess {
+        child: Child,
+    }
+
+    impl ForegroundProcess {
+        pub fn spawn(path: &Path) -> io::Result<Self> {
+            Ok(ForegroundProcess {
+                child: Command::new(path).spawn()?,
+            })
+        }
+
+        pub fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        pub fn wait(mut self) -> io::Result<()> {
+            let _ = self.child.wait()?;
+            Ok(())
+        }
+    }
 }
 
 fn normalize_msisdn(raw: &str) -> String {
@@ -919,12 +1063,16 @@ async fn phone_numbers_barcode_launch(State(state): State<BarcodeState>) -> Resp
             .into_response();
     }
 
-    match std::process::Command::new(&launcher_path).spawn() {
-        Ok(child) => (
-            StatusCode::OK,
-            Json(json!({"message": "Barcode scanner launched", "pid": child.id(), "path": launcher_str})),
-        )
-            .into_response(),
+    match barcode_scanner::ForegroundProcess::spawn(&launcher_path) {
+        Ok(process) => {
+            let pid = process.id();
+            drop(process);
+            (
+                StatusCode::OK,
+                Json(json!({"message": "Barcode scanner launched", "pid": pid, "path": launcher_str})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("Failed to launch barcode scanner: {}", e)})),
@@ -945,7 +1093,7 @@ async fn phone_numbers_barcode_run(State(state): State<BarcodeState>) -> Respons
             .into_response();
     }
 
-    let mut child = match std::process::Command::new(&launcher_path).spawn() {
+    let process = match barcode_scanner::ForegroundProcess::spawn(&launcher_path) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -956,10 +1104,10 @@ async fn phone_numbers_barcode_run(State(state): State<BarcodeState>) -> Respons
         }
     };
 
-    let pid = child.id();
-    let wait_result = tokio::task::spawn_blocking(move || child.wait()).await;
+    let pid = process.id();
+    let wait_result = tokio::task::spawn_blocking(move || process.wait()).await;
     match wait_result {
-        Ok(Ok(_status)) => {
+        Ok(Ok(())) => {
             let scan_resp = phone_numbers_barcode_scan(State(state)).await;
             let mut response = scan_resp.into_response();
             response

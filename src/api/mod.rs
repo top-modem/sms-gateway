@@ -2064,6 +2064,9 @@ async fn firefox_delete_all() -> Response {
         }
     }
 
+    // Clear local upload history so the poll worker stops querying
+    let _ = crate::db::FirefoxBatchUpload::delete_all().await;
+
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
         Err(e) => return e,

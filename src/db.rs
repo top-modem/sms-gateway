@@ -1093,10 +1093,26 @@ impl FirefoxBatchUpload {
         Ok(upload)
     }
 
+    pub async fn exists() -> Result<bool> {
+        let pool = get_pool()?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firefox_batch_uploads")
+            .fetch_one(pool)
+            .await?;
+        Ok(count > 0)
+    }
+
     pub async fn delete_by_id(id: i64) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query("DELETE FROM firefox_batch_uploads WHERE id = ?")
             .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_all() -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query("DELETE FROM firefox_batch_uploads")
             .execute(pool)
             .await?;
         Ok(())

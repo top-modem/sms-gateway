@@ -218,6 +218,20 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
             _ => continue,
         };
 
+        match db::FirefoxBatchUpload::exists().await {
+            Ok(false) => {
+                if heartbeat_count % 20 == 1 {
+                    log::info!("[火狐狸轮询] 跳过平台查询：本地无号码上传记录");
+                }
+                continue;
+            }
+            Err(e) => {
+                log::warn!("[火狐狸轮询] 检查上传记录失败: {}", e);
+                continue;
+            }
+            Ok(true) => {}
+        }
+
         let wait_list_resp = {
             let mut last_error: Option<anyhow::Error> = None;
             let mut response = None;

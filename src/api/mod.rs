@@ -1,5 +1,5 @@
 use fancy_regex::Regex;
-use std::{collections::HashSet, convert::Infallible, path::PathBuf, sync::Arc, sync::OnceLock, time::Duration};
+use std::{convert::Infallible, sync::Arc, sync::OnceLock, time::Duration};
 
 use axum::{
     extract::{Path, Query, State},
@@ -20,7 +20,7 @@ pub use sse_manager::{CallEvent, SseManager};
 
 use crate::{
     config::SmsStorage,
-    db::{AppSetting, Call, Contact, Conversation, SimCard, Sms},
+    db::{AppSetting, BarcodeScan, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
     phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
@@ -35,12 +35,6 @@ static PHONE_NUMBER_TASK: OnceLock<TaskHandle> = OnceLock::new();
 struct CallState {
     mm: ModemManagerRef,
     sse: Arc<SseManager>,
-}
-
-#[derive(Clone)]
-struct BarcodeState {
-    output_file: Option<String>,
-    launcher_path: Option<String>,
 }
 
 fn decode_sms_center(sms_center: &str) -> String {
@@ -116,14 +110,7 @@ pub async fn run_api(
     username: &str,
     password: &str,
     sse_manager: Arc<SseManager>,
-    barcode_output_file: Option<String>,
-    barcode_launcher_path: Option<String>,
 ) -> anyhow::Result<()> {
-    let barcode_state = BarcodeState {
-        output_file: barcode_output_file,
-        launcher_path: barcode_launcher_path,
-    };
-
     let api = Router::new()
         .route("/check", get(check))
         .route("/service/status", get(get_service_status))
@@ -183,15 +170,19 @@ pub async fn run_api(
         )
         .route(
             "/phone-numbers/barcode-scan",
-            get(phone_numbers_barcode_scan).with_state(barcode_state.clone()),
+            post(phone_numbers_barcode_scan).with_state(modem_manager.clone()),
         )
         .route(
-            "/phone-numbers/barcode-scan/launch",
-            post(phone_numbers_barcode_launch).with_state(barcode_state.clone()),
+            "/phone-numbers/barcode-scans",
+            get(phone_numbers_barcode_scans).with_state(modem_manager.clone()),
         )
         .route(
-            "/phone-numbers/barcode-scan/run",
-            post(phone_numbers_barcode_run).with_state(barcode_state.clone()),
+            "/phone-numbers/barcode-scans",
+            delete(phone_numbers_barcode_scans_clear).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/phone-numbers/barcode-scans/import",
+            post(phone_numbers_barcode_scans_import).with_state(modem_manager.clone()),
         )
         .route(
             "/phone-numbers/call-exchange",
@@ -734,210 +725,33 @@ fn get_phone_number_task() -> &'static TaskHandle {
 }
 
 #[derive(Serialize)]
-struct BarcodeScanEntry {
+struct BarcodeScanResponse {
+    id: i64,
+    iccid: String,
+    msisdn: String,
+    phone_number: Option<String>,
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BarcodeScanRequest {
     iccid: String,
     msisdn: String,
 }
 
-#[derive(Serialize)]
-struct BarcodeInvalidLine {
-    line_no: usize,
-    raw: String,
-    reason: String,
+fn validate_barcode_iccid(iccid: &str) -> bool {
+    let digits: String = iccid.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.starts_with("8944") && digits.len() == 20
 }
 
-#[derive(Serialize)]
-struct BarcodeScanResponse {
-    source_file: String,
-    total_lines: usize,
-    valid_count: usize,
-    invalid_count: usize,
-    entries: Vec<BarcodeScanEntry>,
-    invalid_lines: Vec<BarcodeInvalidLine>,
-}
-
-fn candidate_base_dirs() -> Vec<PathBuf> {
-    let mut bases = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        bases.push(cwd);
+fn validate_barcode_msisdn(msisdn: &str) -> bool {
+    let digits: String = msisdn.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 11 {
+        return false;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            bases.push(exe_dir.to_path_buf());
-            if let Some(parent) = exe_dir.parent() {
-                bases.push(parent.to_path_buf());
-                if let Some(grandparent) = parent.parent() {
-                    bases.push(grandparent.to_path_buf());
-                }
-            }
-        }
-    }
-    bases
-}
-
-fn resolve_barcode_output_file(configured: Option<&str>) -> PathBuf {
-    if let Some(path) = configured {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-
-    let bases = candidate_base_dirs();
-    let candidates = [
-        PathBuf::from("bar_code/dist/号码.txt"),
-        PathBuf::from("bar_code/号码.txt"),
-        PathBuf::from("号码.txt"),
-        PathBuf::from("../bar_code/dist/号码.txt"),
-        PathBuf::from("../bar_code/号码.txt"),
-        PathBuf::from("../号码.txt"),
-        PathBuf::from("../../bar_code/dist/号码.txt"),
-        PathBuf::from("../../bar_code/号码.txt"),
-        PathBuf::from("../../号码.txt"),
-    ];
-
-    for base in &bases {
-        for candidate in &candidates {
-            let full = base.join(candidate);
-            if full.exists() {
-                return full;
-            }
-        }
-    }
-
-    bases
-        .first()
-        .cloned()
-        .unwrap_or_else(PathBuf::new)
-        .join("bar_code/dist/号码.txt")
-}
-
-fn resolve_barcode_launcher_file(configured: Option<&str>) -> PathBuf {
-    if let Some(path) = configured {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-
-    let bases = candidate_base_dirs();
-    let candidates = [
-        PathBuf::from("bar_code/dist/扫码枪录入程序.exe"),
-        PathBuf::from("bar_code/扫码枪录入程序.exe"),
-        PathBuf::from("扫码枪录入程序.exe"),
-        PathBuf::from("../bar_code/dist/扫码枪录入程序.exe"),
-        PathBuf::from("../bar_code/扫码枪录入程序.exe"),
-        PathBuf::from("../扫码枪录入程序.exe"),
-        PathBuf::from("../../bar_code/dist/扫码枪录入程序.exe"),
-        PathBuf::from("../../bar_code/扫码枪录入程序.exe"),
-        PathBuf::from("../../扫码枪录入程序.exe"),
-    ];
-
-    for base in &bases {
-        for candidate in &candidates {
-            let full = base.join(candidate);
-            if full.exists() {
-                return full;
-            }
-        }
-    }
-
-    bases
-        .first()
-        .cloned()
-        .unwrap_or_else(PathBuf::new)
-        .join("bar_code/dist/扫码枪录入程序.exe")
-}
-
-#[cfg(windows)]
-mod barcode_scanner {
-    use std::ffi::OsStr;
-    use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, TRUE};
-    use windows_sys::Win32::System::Threading::{GetProcessId, WaitForSingleObject, INFINITE};
-    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    pub struct ForegroundProcess {
-        h_process: usize,
-    }
-
-    impl Drop for ForegroundProcess {
-        fn drop(&mut self) {
-            if self.h_process != 0 {
-                unsafe { CloseHandle(self.h_process as HANDLE); }
-                self.h_process = 0;
-            }
-        }
-    }
-
-    impl ForegroundProcess {
-        pub fn spawn(path: &Path) -> io::Result<Self> {
-            let abs_path = std::fs::canonicalize(path)
-                .unwrap_or_else(|_| path.to_path_buf());
-            let file_wide: Vec<u16> = abs_path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let verb_wide: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
-
-            let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-            sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-            sei.lpVerb = verb_wide.as_ptr() as *const u16;
-            sei.lpFile = file_wide.as_ptr() as *const u16;
-            sei.nShow = SW_SHOWNORMAL;
-            sei.hwnd = null_mut();
-
-            let success = unsafe { ShellExecuteExW(&mut sei) };
-            if success == TRUE && !sei.hProcess.is_null() {
-                Ok(ForegroundProcess { h_process: sei.hProcess as usize })
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-
-        pub fn id(&self) -> u32 {
-            unsafe { GetProcessId(self.h_process as HANDLE) }
-        }
-
-        pub fn wait(mut self) -> io::Result<()> {
-            unsafe {
-                WaitForSingleObject(self.h_process as HANDLE, INFINITE);
-                CloseHandle(self.h_process as HANDLE);
-                self.h_process = 0;
-            }
-            Ok(())
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod barcode_scanner {
-    use std::io;
-    use std::path::Path;
-    use std::process::{Child, Command};
-
-    pub struct ForegroundProcess {
-        child: Child,
-    }
-
-    impl ForegroundProcess {
-        pub fn spawn(path: &Path) -> io::Result<Self> {
-            Ok(ForegroundProcess {
-                child: Command::new(path).spawn()?,
-            })
-        }
-
-        pub fn id(&self) -> u32 {
-            self.child.id()
-        }
-
-        pub fn wait(mut self) -> io::Result<()> {
-            let _ = self.child.wait()?;
-            Ok(())
-        }
-    }
+    ["077", "071", "073", "074", "075", "078", "079"]
+        .iter()
+        .any(|prefix| digits.starts_with(prefix))
 }
 
 fn normalize_msisdn(raw: &str) -> String {
@@ -956,176 +770,130 @@ fn normalize_msisdn(raw: &str) -> String {
     }
 }
 
-async fn phone_numbers_barcode_scan(State(state): State<BarcodeState>) -> Response {
-    let output_path = resolve_barcode_output_file(state.output_file.as_deref());
-    let source_file = output_path.to_string_lossy().to_string();
+async fn phone_numbers_barcode_scan(
+    State(mm): State<ModemManagerRef>,
+    Json(request): Json<BarcodeScanRequest>,
+) -> Response {
+    let iccid: String = request.iccid.chars().filter(|c| c.is_ascii_digit()).collect();
+    let msisdn: String = request.msisdn.chars().filter(|c| c.is_ascii_digit()).collect();
 
-    if !output_path.exists() {
-        let response = BarcodeScanResponse {
-            source_file,
-            total_lines: 0,
-            valid_count: 0,
-            invalid_count: 0,
-            entries: Vec::new(),
-            invalid_lines: Vec::new(),
-        };
-        return (StatusCode::OK, Json(response)).into_response();
+    if !validate_barcode_iccid(&iccid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid ICCID: must be 20 digits starting with 8944"})),
+        )
+            .into_response();
     }
 
-    let bytes = match tokio::fs::read(&output_path).await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Failed to read barcode output file: {}", e)})),
-            )
-                .into_response();
-        }
-    };
+    if !validate_barcode_msisdn(&msisdn) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid MSISDN: must be 11 digits starting with 077/071/073/074/075/078/079"})),
+        )
+            .into_response();
+    }
 
-    let content = match String::from_utf8(bytes) {
+    if mm.get_modem(&iccid).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Scanned ICCID is not detected in any COM port"})),
+        )
+            .into_response();
+    }
+
+    match BarcodeScan::upsert(&iccid, &msisdn).await {
+        Ok(_) => (StatusCode::OK, Json(json!({"iccid": iccid, "msisdn": msisdn}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to save scan: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn phone_numbers_barcode_scans() -> Response {
+    match BarcodeScan::list_unimported().await {
+        Ok(rows) => {
+            let response: Vec<BarcodeScanResponse> = rows
+                .into_iter()
+                .map(|r| BarcodeScanResponse {
+                    id: r.id,
+                    iccid: r.iccid,
+                    msisdn: r.msisdn,
+                    phone_number: r.phone_number,
+                    created_at: r.created_at.map(|dt| dt.to_string()),
+                })
+                .collect();
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to list scans: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn phone_numbers_barcode_scans_clear() -> Response {
+    match BarcodeScan::delete_all().await {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "cleared"}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to clear scans: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn phone_numbers_barcode_scans_import(
+    State(mm): State<ModemManagerRef>,
+) -> Response {
+    let scans = match BarcodeScan::list_unimported().await {
         Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).to_string(),
-    };
-
-    let mut entries = Vec::new();
-    let mut invalid_lines = Vec::new();
-    let mut seen = HashSet::<(String, String)>::new();
-    let mut total_lines = 0usize;
-
-    for (idx, line) in content.lines().enumerate() {
-        let raw = line.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        total_lines += 1;
-
-        let mut parts = raw.splitn(2, ',').map(|s| s.trim());
-        let iccid_raw = parts.next().unwrap_or_default();
-        let msisdn_raw = parts.next().unwrap_or_default();
-
-        if iccid_raw.is_empty() || msisdn_raw.is_empty() {
-            invalid_lines.push(BarcodeInvalidLine {
-                line_no: idx + 1,
-                raw: raw.to_string(),
-                reason: "Expected format ICCID,MSISDN".to_string(),
-            });
-            continue;
-        }
-
-        let iccid: String = iccid_raw.chars().filter(|c| c.is_ascii_digit()).collect();
-        let msisdn = normalize_msisdn(msisdn_raw);
-
-        if !iccid.starts_with("8944") || iccid.len() != 20 {
-            invalid_lines.push(BarcodeInvalidLine {
-                line_no: idx + 1,
-                raw: raw.to_string(),
-                reason: "Invalid ICCID".to_string(),
-            });
-            continue;
-        }
-
-        if msisdn.trim_start_matches('+').is_empty() {
-            invalid_lines.push(BarcodeInvalidLine {
-                line_no: idx + 1,
-                raw: raw.to_string(),
-                reason: "Invalid MSISDN".to_string(),
-            });
-            continue;
-        }
-
-        if seen.insert((iccid.clone(), msisdn.clone())) {
-            entries.push(BarcodeScanEntry { iccid, msisdn });
-        }
-    }
-
-    let response = BarcodeScanResponse {
-        source_file,
-        total_lines,
-        valid_count: entries.len(),
-        invalid_count: invalid_lines.len(),
-        entries,
-        invalid_lines,
-    };
-
-    (StatusCode::OK, Json(response)).into_response()
-}
-
-async fn phone_numbers_barcode_launch(State(state): State<BarcodeState>) -> Response {
-    let launcher_path = resolve_barcode_launcher_file(state.launcher_path.as_deref());
-    let launcher_str = launcher_path.to_string_lossy().to_string();
-
-    if !launcher_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Barcode scanner executable not found: {}", launcher_str)})),
-        )
-            .into_response();
-    }
-
-    match barcode_scanner::ForegroundProcess::spawn(&launcher_path) {
-        Ok(process) => {
-            let pid = process.id();
-            drop(process);
-            (
-                StatusCode::OK,
-                Json(json!({"message": "Barcode scanner launched", "pid": pid, "path": launcher_str})),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Failed to launch barcode scanner: {}", e)})),
-        )
-            .into_response(),
-    }
-}
-
-async fn phone_numbers_barcode_run(State(state): State<BarcodeState>) -> Response {
-    let launcher_path = resolve_barcode_launcher_file(state.launcher_path.as_deref());
-    let launcher_str = launcher_path.to_string_lossy().to_string();
-
-    if !launcher_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Barcode scanner executable not found: {}", launcher_str)})),
-        )
-            .into_response();
-    }
-
-    let process = match barcode_scanner::ForegroundProcess::spawn(&launcher_path) {
-        Ok(c) => c,
         Err(e) => {
             return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Failed to launch barcode scanner: {}", e)})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to list scans: {}", e)})),
             )
                 .into_response();
         }
     };
 
-    let pid = process.id();
-    let wait_result = tokio::task::spawn_blocking(move || process.wait()).await;
-    match wait_result {
-        Ok(Ok(())) => {
-            let scan_resp = phone_numbers_barcode_scan(State(state)).await;
-            let mut response = scan_resp.into_response();
-            response
-                .headers_mut()
-                .insert("x-barcode-scanner-pid", header::HeaderValue::from_str(&pid.to_string()).unwrap_or(header::HeaderValue::from_static("0")));
-            response
+    let mut imported_ids = Vec::new();
+    let mut failed = None;
+
+    for scan in scans {
+        let normalized = normalize_msisdn(&scan.msisdn);
+        if let Err(e) = mm.set_sim_phone_number(&scan.iccid, &normalized).await {
+            failed = Some(json!({
+                "iccid": scan.iccid,
+                "error": format!("Failed to write phone number to SIM: {}", e),
+            }));
+            break;
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Barcode scanner process wait failed: {}", e)})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Barcode scanner task join failed: {}", e)})),
-        )
-            .into_response(),
+        imported_ids.push(scan.id);
     }
+
+    if let Some(err) = failed {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": err,
+                "imported_count": imported_ids.len(),
+            })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = BarcodeScan::mark_imported(&imported_ids).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to mark scans imported: {}", e)})),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, Json(json!({"imported_count": imported_ids.len()}))).into_response()
 }
 
 async fn phone_numbers_import(

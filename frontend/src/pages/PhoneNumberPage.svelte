@@ -7,7 +7,7 @@
   let { onBack = () => {} } = $props();
 
   // ── State ──────────────────────────────────────────────────────────────────
-  let activeTab = $state('import'); // 'import' | 'call' | 'sms' | 'ussd'
+  let activeTab = $state('import'); // 'import' | 'barcode' | 'call' | 'sms' | 'ussd'
   let sims = $state([]);
   let simCards = $state([]);
   let loading = $state(true);
@@ -18,12 +18,18 @@
   let importText = $state('');
   let importPreview = $state([]);
   let importRunning = $state(false);
-  let scanRunning = $state(false);
-  let scanSummary = $state('');
+
+  // Barcode tab
+  let barcodeIccid = $state('');
+  let barcodeMsisdn = $state('');
+  let barcodeScans = $state([]);
+  let barcodeLoading = $state(false);
+  let barcodeImporting = $state(false);
+  let iccidInput = $state(null);
+  let msisdnInput = $state(null);
 
   // Exchange tabs
   let exchangeRunning = $state(false);
-
   // USSD tab
   let ussdCode = $state('*100#');
   let ussdRunning = $state(false);
@@ -108,6 +114,15 @@
     pollStatus();
   }
 
+  function setActiveTab(tabId) {
+    activeTab = tabId;
+    error = '';
+    if (tabId === 'barcode') {
+      fetchBarcodeScans();
+      setTimeout(() => iccidInput?.focus(), 50);
+    }
+  }
+
   // ── Import tab ─────────────────────────────────────────────────────────────
   function parseImportText(text) {
     const lines = text.split(/\r?\n/).filter(l => l.trim());
@@ -167,45 +182,88 @@
     }
   }
 
-  async function scanBarcode() {
-    scanRunning = true;
+  // ── Barcode tab ────────────────────────────────────────────────────────────
+  function validateBarcodeIccid(value) {
+    const digits = String(value ?? '').replace(/\D/g, '');
+    return digits.startsWith('8944') && digits.length === 20;
+  }
+
+  function validateBarcodeMsisdn(value) {
+    const digits = String(value ?? '').replace(/\D/g, '');
+    if (digits.length !== 11) return false;
+    return ['077', '071', '073', '074', '075', '078', '079'].some(p => digits.startsWith(p));
+  }
+
+  function sanitizeBarcodeInput(value, maxLen) {
+    return String(value ?? '').replace(/\D/g, '').slice(0, maxLen);
+  }
+
+  function onIccidInput(e) {
+    barcodeIccid = sanitizeBarcodeInput(e.target.value, 20);
+    e.target.value = barcodeIccid;
+    if (validateBarcodeIccid(barcodeIccid)) {
+      msisdnInput?.focus();
+    }
+  }
+
+  function onMsisdnInput(e) {
+    barcodeMsisdn = sanitizeBarcodeInput(e.target.value, 11);
+    e.target.value = barcodeMsisdn;
+    if (validateBarcodeMsisdn(barcodeMsisdn)) {
+      submitBarcodeScan();
+    }
+  }
+
+  async function submitBarcodeScan() {
+    if (!validateBarcodeIccid(barcodeIccid) || !validateBarcodeMsisdn(barcodeMsisdn)) {
+      return;
+    }
+    barcodeLoading = true;
     error = '';
-    scanSummary = '';
-
     try {
-      const res = await apiClient.runBarcodeScannerAndRead();
-      const payload = res?.data ?? res ?? {};
-      const rows = Array.isArray(payload.entries) ? payload.entries : [];
-      const invalidCount = payload.invalid_count ?? 0;
-
-      if (rows.length === 0) {
-        scanSummary = $t('barcode_scan_empty');
-        return;
-      }
-
-      const existing = parseImportText(importText);
-      const seen = new Set(existing.map(e => `${e.iccid},${e.msisdn}`));
-
-      for (const row of rows) {
-        const normalizedMsisdn = normalizeMsisdn(row.msisdn);
-        const key = `${row.iccid},${normalizedMsisdn}`;
-        if (!seen.has(key)) {
-          existing.push({ iccid: row.iccid, msisdn: normalizedMsisdn });
-          seen.add(key);
-        }
-      }
-
-      importText = existing.map(e => `${e.iccid},${e.msisdn}`).join('\n');
-      updatePreview();
-
-      scanSummary = $t('barcode_scan_launched_loaded', {
-        n: rows.length,
-        invalid: invalidCount,
-      });
+      await apiClient.barcodeScan(barcodeIccid, barcodeMsisdn);
+      barcodeIccid = '';
+      barcodeMsisdn = '';
+      iccidInput?.focus();
+      await fetchBarcodeScans();
     } catch (e) {
       error = e?.data?.error ?? e?.message ?? $t('barcode_scan_error');
     } finally {
-      scanRunning = false;
+      barcodeLoading = false;
+    }
+  }
+
+  async function fetchBarcodeScans() {
+    try {
+      const res = await apiClient.getBarcodeScans();
+      barcodeScans = Array.isArray(res) ? res : (res?.data ?? []);
+    } catch (e) {
+      console.error('Failed to load barcode scans:', e);
+    }
+  }
+
+  async function clearBarcodeScans() {
+    try {
+      await apiClient.clearBarcodeScans();
+      await fetchBarcodeScans();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('barcode_scan_clear_error');
+    }
+  }
+
+  async function importBarcodeScans() {
+    if (barcodeScans.length === 0) return;
+    barcodeImporting = true;
+    error = '';
+    try {
+      const res = await apiClient.importBarcodeScans();
+      await fetchBarcodeScans();
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('barcode_import_error');
+      await fetchBarcodeScans();
+    } finally {
+      barcodeImporting = false;
     }
   }
 
@@ -296,12 +354,13 @@
     <div class="flex gap-1 overflow-x-auto">
       {#each [
         { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },
+        { id: 'barcode', label: $t('phone_tab_barcode') ?? 'Barcode Scan', icon: 'carbon:scan' },
         { id: 'call', label: $t('phone_tab_call'), icon: 'carbon:phone-outgoing' },
         { id: 'sms', label: $t('phone_tab_sms'), icon: 'carbon:send-alt' },
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
       ] as tab}
         <button
-          onclick={() => { activeTab = tab.id; error = ''; }}
+          onclick={() => setActiveTab(tab.id)}
           class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 transition
                  {activeTab === tab.id
                    ? 'border-blue-500 text-blue-600 dark:text-blue-400'
@@ -390,26 +449,8 @@
                 {#if taskStatus.running && taskStatus.task_type === 'import'}
                   <div>{$t('import_progress', { done: taskStatus.done, total: taskStatus.total })}</div>
                 {/if}
-                {#if scanSummary}
-                  <div>{scanSummary}</div>
-                {/if}
               </div>
               <div class="flex items-center gap-2">
-                <button
-                  onclick={scanBarcode}
-                  disabled={scanRunning}
-                  class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
-                         text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-zinc-800
-                         hover:bg-gray-200 dark:hover:bg-zinc-700
-                         disabled:opacity-50 disabled:cursor-not-allowed transition"
-                >
-                  {#if scanRunning}
-                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
-                  {:else}
-                    <Icon icon="carbon:scan" class="w-4 h-4" />
-                  {/if}
-                  {$t('btn_scan_barcode')}
-                </button>
                 <button
                   onclick={startImport}
                   disabled={importRunning || importPreview.length === 0}
@@ -424,6 +465,110 @@
                 </button>
               </div>
             </div>
+          </div>
+
+        <!-- Barcode scan -->
+        {:else if activeTab === 'barcode'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label for="barcodeIccid" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  ICCID (20 digits, 8944...)
+                </label>
+                <input
+                  id="barcodeIccid"
+                  type="text"
+                  bind:this={iccidInput}
+                  value={barcodeIccid}
+                  oninput={onIccidInput}
+                  onkeydown={(e) => { if (e.key === 'Enter') msisdnInput?.focus(); }}
+                  inputmode="numeric"
+                  maxlength="20"
+                  placeholder="8944100030..."
+                  class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                />
+              </div>
+              <div>
+                <label for="barcodeMsisdn" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  MSISDN (11 digits, 077/071/073...)
+                </label>
+                <input
+                  id="barcodeMsisdn"
+                  type="text"
+                  bind:this={msisdnInput}
+                  value={barcodeMsisdn}
+                  oninput={onMsisdnInput}
+                  onkeydown={(e) => { if (e.key === 'Enter') submitBarcodeScan(); }}
+                  inputmode="numeric"
+                  maxlength="11"
+                  placeholder="07770065802"
+                  class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                />
+              </div>
+            </div>
+
+            <div class="flex items-center justify-between">
+              <div class="text-sm text-gray-500 dark:text-gray-400">
+                {#if barcodeLoading}
+                  <span class="inline-flex items-center gap-1">
+                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                    Saving scan...
+                  </span>
+                {:else}
+                  {barcodeScans.length} scan(s) buffered
+                {/if}
+              </div>
+              <div class="flex items-center gap-2">
+                <button
+                  onclick={clearBarcodeScans}
+                  disabled={barcodeScans.length === 0 || barcodeImporting}
+                  class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
+                         text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-zinc-800
+                         hover:bg-gray-200 dark:hover:bg-zinc-700
+                         disabled:opacity-50 disabled:cursor-not-allowed transition"
+                >
+                  <Icon icon="carbon:trash-can" class="w-4 h-4" />
+                  Clear
+                </button>
+                <button
+                  onclick={importBarcodeScans}
+                  disabled={barcodeScans.length === 0 || barcodeImporting}
+                  class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                >
+                  {#if barcodeImporting}
+                    <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                  {:else}
+                    <Icon icon="carbon:document-import" class="w-4 h-4" />
+                  {/if}
+                  Import Scans
+                </button>
+              </div>
+            </div>
+
+            {#if barcodeScans.length > 0}
+              <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800">
+                <table class="min-w-full text-sm">
+                  <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
+                    <tr>
+                      <th class="px-3 py-2 text-left font-medium">ICCID</th>
+                      <th class="px-3 py-2 text-left font-medium">Scanned MSISDN</th>
+                      <th class="px-3 py-2 text-left font-medium">Current DB Phone</th>
+                      <th class="px-3 py-2 text-left font-medium">Scanned At</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                    {#each barcodeScans as scan}
+                      <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                        <td class="px-3 py-2 font-mono text-xs">{scan.iccid}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{scan.msisdn}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{scan.phone_number ?? '-'}</td>
+                        <td class="px-3 py-2 text-gray-500 dark:text-gray-400">{scan.created_at ?? '-'}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {/if}
           </div>
 
         <!-- Call / SMS exchange -->

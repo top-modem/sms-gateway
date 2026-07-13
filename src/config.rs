@@ -34,10 +34,6 @@ pub struct Settings {
     pub auto_answer_delay_secs: Option<u64>,
     /// Enable or disable auto-answering of incoming calls (default true = enabled).
     pub auto_answer_enabled: Option<bool>,
-    /// Optional path to barcode scanner output file (e.g. ../bar_code/号码.txt).
-    pub barcode_output_file: Option<String>,
-    /// Optional path to barcode scanner executable.
-    pub barcode_launcher_path: Option<String>,
     /// If true, when IMSI MCC is UK (234/235), force operator to 46001 with AT+COPS.
     pub force_uk_mcc_to_46001: Option<bool>,
     /// Maximum number of modems to initialize concurrently (default 3).

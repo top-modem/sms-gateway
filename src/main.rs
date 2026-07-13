@@ -133,8 +133,6 @@ async fn main() {
         &config.settings.username.unwrap(),
         &config.settings.password.unwrap(),
         sse_manager.clone(),
-        config.settings.barcode_output_file.clone(),
-        config.settings.barcode_launcher_path.clone(),
     )
     .await
     {};

@@ -1297,6 +1297,81 @@ impl FirefoxPlatformItem {
 }
 
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct BarcodeScan {
+    pub id: i64,
+    pub iccid: String,
+    pub msisdn: String,
+    pub imported: bool,
+    pub created_at: Option<NaiveDateTime>,
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct BarcodeScanRow {
+    pub id: i64,
+    pub iccid: String,
+    pub msisdn: String,
+    pub imported: bool,
+    pub created_at: Option<NaiveDateTime>,
+    pub phone_number: Option<String>,
+}
+
+impl BarcodeScan {
+    pub async fn upsert(iccid: &str, msisdn: &str) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            "INSERT INTO barcode_scans (iccid, msisdn) \
+             VALUES (?, ?) \
+             ON CONFLICT(iccid) DO UPDATE SET \
+             msisdn = excluded.msisdn, \
+             imported = 0, \
+             created_at = datetime('now')",
+        )
+        .bind(iccid)
+        .bind(msisdn)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_unimported() -> Result<Vec<BarcodeScanRow>> {
+        let pool = get_pool()?;
+        let rows = sqlx::query_as::<_, BarcodeScanRow>(
+            "SELECT bs.id, bs.iccid, bs.msisdn, bs.imported, bs.created_at, sc.phone_number \
+             FROM barcode_scans bs \
+             LEFT JOIN sim_cards sc ON bs.iccid = sc.id \
+             WHERE bs.imported = 0 \
+             ORDER BY bs.created_at DESC",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn mark_imported(ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let pool = get_pool()?;
+        let mut query_builder = QueryBuilder::new(
+            "UPDATE barcode_scans SET imported = 1 WHERE id IN ("
+        );
+        let mut separated = query_builder.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        query_builder.build().execute(pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_all() -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query("DELETE FROM barcode_scans").execute(pool).await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
 pub struct PlatformRejectionReasonStat {
     pub reason: String,
     pub count: i64,

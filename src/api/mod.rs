@@ -130,6 +130,10 @@ pub async fn run_api(
             get(refresh_sim_sms).with_state(modem_manager.clone()),
         )
         .route(
+            "/sims/refresh-all",
+            get(refresh_all_sim_cache).with_state(modem_manager.clone()),
+        )
+        .route(
             "/at/{com_port}",
             post(send_at_command_handler).with_state(modem_manager.clone()),
         )
@@ -453,6 +457,8 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
 
     // 并发获取所有调制解调器信息，带超时控制
     let sim_ids = sim_ids.await;
+    // Refresh cache from DB so SIM swaps are reflected immediately on dashboard
+    modem_manager.refresh_sim_cache(&sim_ids).await;
     let modem_futures: Vec<_> = sim_ids
         .iter()
         .map(|sim_id| {
@@ -699,6 +705,13 @@ async fn refresh_sim_sms(
         Ok(_) => (StatusCode::OK).into_response(),
         Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     }
+}
+
+async fn refresh_all_sim_cache(State(modem_manager): State<ModemManagerRef>) -> Response {
+    let sim_ids = modem_manager.get_sim_ids().await;
+    modem_manager.refresh_sim_cache(&sim_ids).await;
+    log::info!("[refresh-all-sim-cache] Refreshed cache for {} active SIM(s)", sim_ids.len());
+    Json(json!({"refreshed": sim_ids.len(), "sim_ids": sim_ids})).into_response()
 }
 
 async fn check() -> impl IntoResponse {

@@ -63,7 +63,7 @@ pub struct ModemManager {
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
 }
 
-const SIM_PROBE_FAILURE_THRESHOLD: u8 = 3;
+const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
 
 impl ModemManager {
     async fn initialize_single_modem_safe(
@@ -605,6 +605,11 @@ impl ModemManager {
                 if !unavailable.iter().any(|(p, _)| p == &com_port) {
                     unavailable.push((com_port.clone(), baud_rate));
                 }
+                // Remove demoted SIM from cache so dashboard doesn't show stale data
+                let mut cache = self.sim_cards_cache.write().await;
+                if cache.remove(&iccid).is_some() {
+                    log::info!("[recheck] Removed demoted SIM {} from cache (port {})", iccid, com_port);
+                }
             }
         }
 
@@ -647,9 +652,20 @@ impl ModemManager {
                     if is_new {
                         self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
                     }
-                    if let Some(sim) = self.get_sim_card_cached(&sim_id).await {
-                        let mut cache = self.sim_cards_cache.write().await;
-                        cache.insert(sim_id.clone(), sim);
+                    // Query DB for the latest SIM info and update cache
+                    match SimCard::find_by_conditions(Some(&sim_id), None, None, None).await {
+                        Ok(cards) => {
+                            if let Some(card) = cards.into_iter().next() {
+                                let mut cache = self.sim_cards_cache.write().await;
+                                cache.insert(sim_id.clone(), card);
+                                log::info!("[recheck] Updated cache for reconnected SIM {} on port {}", sim_id, com_port);
+                            } else {
+                                log::warn!("[recheck] Reconnected SIM {} not found in DB, cache not updated", sim_id);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("[recheck] Failed to query DB for reconnected SIM {}: {}", sim_id, e);
+                        }
                     }
                     if let Some(modem) = self.get_modem(&sim_id).await {
                         let handle = tokio::spawn(Self::run_urc_handler(
@@ -924,6 +940,24 @@ impl ModemManager {
         cache.insert(sim_card.id.clone(), sim_card);
     }
 
+    /// Refresh the in-memory SIM cache for the given SIM IDs from the database.
+    pub async fn refresh_sim_cache(&self, sim_ids: &[String]) {
+        if sim_ids.is_empty() {
+            return;
+        }
+        let refs: Vec<&str> = sim_ids.iter().map(|s| s.as_str()).collect();
+        match SimCard::get_by_ids(&refs).await {
+            Ok(cards) => {
+                let mut cache = self.sim_cards_cache.write().await;
+                for (sim_id, card) in cards {
+                    cache.insert(sim_id, card);
+                }
+            }
+            Err(e) => {
+                log::warn!("[refresh_sim_cache] Failed to refresh SIM cache: {}", e);
+            }
+        }
+    }
     // ─── Voice call delegation ────────────────────────────────────────────────
 
     /// Initiate an outbound call and record it in the DB.

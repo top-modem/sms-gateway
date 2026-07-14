@@ -817,13 +817,25 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
+        log::info!("[SIM:{}] Writing phone number {} to SIM own-number phonebook", sim_id, phone_number);
         modem.write_phone_number(phone_number).await.map_err(anyhow::Error::from)?;
 
         // Update DB and in-memory cache so the dashboard shows the new number immediately.
-        if let Ok(cards) = SimCard::find_by_conditions(Some(sim_id), None, None, None).await {
-            if let Some(mut card) = cards.into_iter().next() {
-                let _ = card.update_phone_number(Some(phone_number.to_string())).await;
-                self.update_sim_cache(card).await;
+        match SimCard::find_by_conditions(Some(sim_id), None, None, None).await {
+            Ok(cards) => {
+                if let Some(mut card) = cards.into_iter().next() {
+                    if let Err(e) = card.update_phone_number(Some(phone_number.to_string())).await {
+                        log::warn!("[SIM:{}] Wrote phone number to SIM but failed to update local DB: {}", sim_id, e);
+                    } else {
+                        self.update_sim_cache(card).await;
+                        log::info!("[SIM:{}] Phone number {} saved to SIM and local DB/cache updated", sim_id, phone_number);
+                    }
+                } else {
+                    log::warn!("[SIM:{}] Wrote phone number to SIM but no local DB record found to update", sim_id);
+                }
+            }
+            Err(e) => {
+                log::warn!("[SIM:{}] Wrote phone number to SIM but failed to query local DB: {}", sim_id, e);
             }
         }
 

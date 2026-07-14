@@ -606,15 +606,23 @@ impl Modem {
             .is_some_and(|v| v.starts_with("234") || v.starts_with("235"));
 
         if let Some(iccid) = iccid {
-            match SimCard::find_or_create_with_phone(&iccid, imsi, phone_number).await {
+            match SimCard::find_or_create_with_phone(&iccid, imsi.clone(), phone_number).await {
                 Ok(_) => {
                     *self.sim_id.write().await = Some(iccid.clone());
                     info!(
-                        "SIM card initialized for device {}: ICCID={}",
-                        self.name, iccid
+                        "SIM card initialized for device {}: ICCID={}, IMSI={}",
+                        self.name,
+                        iccid,
+                        imsi.as_deref().unwrap_or("unknown")
                     );
 
                     if should_force_china_unicom {
+                        info!(
+                            "Forcing operator 46001 for UK MCC SIM on device {}: ICCID={}, IMSI={}",
+                            self.name,
+                            iccid,
+                            imsi.as_deref().unwrap_or("unknown")
+                        );
                         if let Err(e) = self.send_cops_command().await {
                             log::warn!(
                                 "Failed to force operator 46001 for UK MCC SIM on device {}: {}",

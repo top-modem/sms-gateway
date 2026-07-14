@@ -113,6 +113,7 @@ pub async fn run_api(
 ) -> anyhow::Result<()> {
     let api = Router::new()
         .route("/check", get(check))
+        .route("/diagnostics", get(diagnostics).with_state(modem_manager.clone()))
         .route("/service/status", get(get_service_status))
         .route("/service/start", post(start_service))
         .route("/service/stop", post(stop_service))
@@ -704,6 +705,86 @@ async fn check() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
+async fn diagnostics(State(mm): State<ModemManagerRef>) -> impl IntoResponse {
+    let start = crate::server_start_time();
+    let uptime_secs = start.elapsed().as_secs();
+
+    let sim_cards = match SimCard::query_all().await {
+        Ok(cards) => cards,
+        Err(e) => {
+            log::warn!("[diagnostics] Failed to query SIM cards: {}", e);
+            Vec::new()
+        }
+    };
+
+    let sim_ids = mm.get_sim_ids().await;
+    let mut modems = Vec::new();
+    for sim_id in &sim_ids {
+        let (com_port, model) = match mm.get_modem(sim_id).await {
+            Some(modem) => (modem.com_port.clone(), modem.get_modem_model().await.ok().flatten()),
+            None => ("N/A".to_string(), None),
+        };
+        modems.push(json!({
+            "sim_id": sim_id,
+            "com_port": com_port,
+            "model": model,
+        }));
+    }
+
+    let platform_upload_count = crate::db::FirefoxBatchUpload::exists().await.unwrap_or(false) as i64;
+    let platform_upload_count = if platform_upload_count > 0 {
+        match crate::db::FirefoxBatchUpload::query_recent(1000).await {
+            Ok(v) => v.len() as i64,
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
+    let platform_item_count = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firefox_platform_items")
+        .fetch_one(&*crate::db::get_pool().expect("No DB pool"))
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[diagnostics] Failed to count platform items: {}", e);
+            0
+        }
+    };
+
+    let pending_sms_count = match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sms WHERE send = 0 AND uploaded_to_platform = 0"
+    )
+    .fetch_one(&*crate::db::get_pool().expect("No DB pool"))
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[diagnostics] Failed to count pending SMS: {}", e);
+            0
+        }
+    };
+
+    Json(json!({
+        "server_start_time": start.elapsed().as_secs(),
+        "uptime_seconds": uptime_secs,
+        "service_running": crate::service_control::is_running(),
+        "modem_count": modems.len(),
+        "modems": modems,
+        "sim_card_count": sim_cards.len(),
+        "sim_cards": sim_cards.iter().map(|s| json!({
+            "id": s.id,
+            "imsi": s.imsi,
+            "phone_number": s.phone_number,
+            "country_code": s.country_code,
+            "alias": s.alias,
+        })).collect::<Vec<_>>(),
+        "platform_batch_upload_count": platform_upload_count,
+        "platform_item_count": platform_item_count,
+        "pending_sms_upload_count": pending_sms_count,
+    }))
+}
+
 #[derive(Deserialize)]
 struct PhoneNumberImportEntry {
     iccid: String,
@@ -851,6 +932,7 @@ async fn phone_numbers_barcode_scans_import(
     let scans = match BarcodeScan::list_unimported().await {
         Ok(s) => s,
         Err(e) => {
+            log::error!("[barcode-import] Failed to list unimported scans: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("Failed to list scans: {}", e)})),
@@ -859,12 +941,16 @@ async fn phone_numbers_barcode_scans_import(
         }
     };
 
+    log::info!("[barcode-import] Starting import of {} scanned rows", scans.len());
+
     let mut imported_ids = Vec::new();
     let mut failed = None;
 
-    for scan in scans {
+    for scan in &scans {
         let normalized = normalize_msisdn(&scan.msisdn);
+        log::info!("[barcode-import] Importing ICCID={} MSISDN={} (normalized={})", scan.iccid, scan.msisdn, normalized);
         if let Err(e) = mm.set_sim_phone_number(&scan.iccid, &normalized).await {
+            log::error!("[barcode-import] Failed to write MSISDN for ICCID={}: {}", scan.iccid, e);
             failed = Some(json!({
                 "iccid": scan.iccid,
                 "error": format!("Failed to write phone number to SIM: {}", e),
@@ -872,9 +958,11 @@ async fn phone_numbers_barcode_scans_import(
             break;
         }
         imported_ids.push(scan.id);
+        log::info!("[barcode-import] Successfully imported ICCID={}", scan.iccid);
     }
 
     if let Some(err) = failed {
+        log::warn!("[barcode-import] Aborted after {} successful imports due to failure", imported_ids.len());
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({
@@ -886,6 +974,7 @@ async fn phone_numbers_barcode_scans_import(
     }
 
     if let Err(e) = BarcodeScan::mark_imported(&imported_ids).await {
+        log::error!("[barcode-import] Failed to mark {} scans as imported: {}", imported_ids.len(), e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to mark scans imported: {}", e)})),
@@ -893,6 +982,7 @@ async fn phone_numbers_barcode_scans_import(
             .into_response();
     }
 
+    log::info!("[barcode-import] Completed: {} scans imported and marked", imported_ids.len());
     (StatusCode::OK, Json(json!({"imported_count": imported_ids.len()}))).into_response()
 }
 
@@ -2054,27 +2144,47 @@ async fn firefox_delete_country(Json(request): Json<FirefoxDeleteCountryRequest>
 // ─── 8. PhoneDeleteAll ───────────────────────────────────────────────────
 
 async fn firefox_delete_all() -> Response {
+    log::info!("[platform-delete-all] Starting delete-all from platform");
+
     // Clear local country_code for all SIMs
+    let mut cleared_sims = 0usize;
     if let Ok(cards) = SimCard::query_all().await {
         for card in &cards {
             if card.country_code.is_some() {
                 let mut c = card.clone();
-                let _ = c.update_country_code(None).await;
+                if let Err(e) = c.update_country_code(None).await {
+                    log::warn!("[platform-delete-all] Failed to clear country_code for SIM {}: {}", card.id, e);
+                } else {
+                    cleared_sims += 1;
+                }
             }
         }
     }
+    log::info!("[platform-delete-all] Cleared country_code for {} SIM(s)", cleared_sims);
 
     // Clear local upload history so the poll worker stops querying
-    let _ = crate::db::FirefoxBatchUpload::delete_all().await;
+    match crate::db::FirefoxBatchUpload::delete_all().await {
+        Ok(_) => log::info!("[platform-delete-all] Cleared local firefox_batch_uploads history"),
+        Err(e) => log::warn!("[platform-delete-all] Failed to clear local firefox_batch_uploads history: {}", e),
+    }
 
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => {
+            log::error!("[platform-delete-all] Cannot get Firefox API client: {:?}", e);
+            return e;
+        }
     };
 
     match firefox_api::delete_phone_all(&client, &api_key).await {
-        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+        Ok(result) => {
+            log::info!("[platform-delete-all] Platform delete-all completed: {:?}", result);
+            (StatusCode::OK, Json(json!(result))).into_response()
+        }
+        Err(e) => {
+            log::error!("[platform-delete-all] Platform delete-all failed: {}", e);
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response()
+        }
     }
 }
 

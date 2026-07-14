@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, sync::LazyLock, time::Instant};
 
 use api::SseManager;
 use db::db_init;
@@ -9,6 +9,13 @@ use log::LevelFilter;
 use modem::{ModemManager, SmsType};
 use modem::manager::TranscribeConfig;
 use structopt::StructOpt;
+
+static SERVER_START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Returns the instant the server process started.
+pub fn server_start_time() -> Instant {
+    *SERVER_START_TIME
+}
 
 mod api;
 mod config;
@@ -265,9 +272,12 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
 
         {
             let resp = wait_list_resp;
-                let count = resp.data.as_ref().and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
-                if count > 0 {
-                    if let Some(items) = resp.data.as_ref().and_then(|d| d.as_array()) {
+            let count = resp.data.as_ref().and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
+            if count > 0 {
+                log::info!("[火狐狸轮询] 平台等待列表返回 {} 个号码", count);
+            }
+            if count > 0 {
+                if let Some(items) = resp.data.as_ref().and_then(|d| d.as_array()) {
                         for item in items {
                             let phone_num = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("?");
                             let country_id = item.get("Country_ID").and_then(|v| v.as_str()).unwrap_or("?");

@@ -150,8 +150,19 @@ pub struct ModemInfo {
 
 impl ModemInfo {
     pub fn from_response(response: &str) -> Option<Self> {
-        let model = response.trim().to_string();
-        if !model.is_empty() && !model.contains("ERROR") {
+        let model = response
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| {
+                !l.is_empty()
+                    && !l.starts_with("AT+")
+                    && !l.starts_with("OK")
+                    && !l.starts_with("ERROR")
+                    && !l.contains("+CME ERROR")
+                    && !l.contains("+CMS ERROR")
+            })?
+            .to_string();
+        if !model.is_empty() {
             Some(ModemInfo { model })
         } else {
             None

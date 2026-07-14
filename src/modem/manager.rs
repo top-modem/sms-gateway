@@ -817,7 +817,17 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        modem.write_phone_number(phone_number).await.map_err(Into::into)
+        modem.write_phone_number(phone_number).await.map_err(anyhow::Error::from)?;
+
+        // Update DB and in-memory cache so the dashboard shows the new number immediately.
+        if let Ok(cards) = SimCard::find_by_conditions(Some(sim_id), None, None, None).await {
+            if let Some(mut card) = cards.into_iter().next() {
+                let _ = card.update_phone_number(Some(phone_number.to_string())).await;
+                self.update_sim_cache(card).await;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn send_ussd(&self, sim_id: &str, code: &str) -> anyhow::Result<String> {

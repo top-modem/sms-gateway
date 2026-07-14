@@ -643,9 +643,17 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
         }));
     }
 
-    // Append stubs for ports that failed to open at startup
+    // Append stubs for ports that failed to open at startup, but avoid duplicates
+    // with ports that have since reconnected.
     let unavailable_ports = modem_manager.unavailable_ports.read().await.clone();
+    let active_ports: std::collections::HashSet<String> = details
+        .iter()
+        .filter_map(|d| d.get("com_port").and_then(|v| v.as_str()).map(String::from))
+        .collect();
     for (com_port, baud_rate) in unavailable_ports {
+        if active_ports.contains(&com_port) {
+            continue;
+        }
         details.push(json!({
             "available": false,
             "sim_id": null,

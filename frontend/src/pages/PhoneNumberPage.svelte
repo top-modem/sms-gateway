@@ -354,7 +354,7 @@
     <div class="flex gap-1 overflow-x-auto">
       {#each [
         { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },
-        { id: 'barcode', label: $t('phone_tab_barcode') ?? 'Barcode Scan', icon: 'carbon:scan' },
+        { id: 'barcode', label: $t('phone_tab_barcode'), icon: 'carbon:scan' },
         { id: 'call', label: $t('phone_tab_call'), icon: 'carbon:phone-outgoing' },
         { id: 'sms', label: $t('phone_tab_sms'), icon: 'carbon:send-alt' },
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
@@ -473,7 +473,7 @@
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label for="barcodeIccid" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  ICCID (20 digits, 8944...)
+                  {$t('barcode_iccid_label')}
                 </label>
                 <input
                   id="barcodeIccid"
@@ -484,13 +484,13 @@
                   onkeydown={(e) => { if (e.key === 'Enter') msisdnInput?.focus(); }}
                   inputmode="numeric"
                   maxlength="20"
-                  placeholder="8944100030..."
+                  placeholder={$t('barcode_iccid_ph')}
                   class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
                 />
               </div>
               <div>
                 <label for="barcodeMsisdn" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  MSISDN (11 digits, 077/071/073...)
+                  {$t('barcode_msisdn_label')}
                 </label>
                 <input
                   id="barcodeMsisdn"
@@ -501,7 +501,7 @@
                   onkeydown={(e) => { if (e.key === 'Enter') submitBarcodeScan(); }}
                   inputmode="numeric"
                   maxlength="11"
-                  placeholder="07770065802"
+                  placeholder={$t('barcode_msisdn_ph')}
                   class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
                 />
               </div>
@@ -512,10 +512,10 @@
                 {#if barcodeLoading}
                   <span class="inline-flex items-center gap-1">
                     <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
-                    Saving scan...
+                    {$t('barcode_saving')}
                   </span>
                 {:else}
-                  {barcodeScans.length} scan(s) buffered
+                  {$t('barcode_scans_buffered', { n: barcodeScans.length })}
                 {/if}
               </div>
               <div class="flex items-center gap-2">
@@ -528,7 +528,7 @@
                          disabled:opacity-50 disabled:cursor-not-allowed transition"
                 >
                   <Icon icon="carbon:trash-can" class="w-4 h-4" />
-                  Clear
+                  {$t('barcode_clear')}
                 </button>
                 <button
                   onclick={importBarcodeScans}
@@ -537,10 +537,11 @@
                 >
                   {#if barcodeImporting}
                     <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                    {$t('barcode_importing')}
                   {:else}
                     <Icon icon="carbon:document-import" class="w-4 h-4" />
+                    {$t('barcode_import_scans')}
                   {/if}
-                  Import Scans
                 </button>
               </div>
             </div>
@@ -550,10 +551,10 @@
                 <table class="min-w-full text-sm">
                   <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
                     <tr>
-                      <th class="px-3 py-2 text-left font-medium">ICCID</th>
-                      <th class="px-3 py-2 text-left font-medium">Scanned MSISDN</th>
-                      <th class="px-3 py-2 text-left font-medium">Current DB Phone</th>
-                      <th class="px-3 py-2 text-left font-medium">Scanned At</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_iccid')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_msisdn')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_current_phone')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_scanned_at')}</th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">

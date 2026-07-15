@@ -69,6 +69,7 @@
         return {
           key: buildRowKey(itemId, cachedItem?.iccid || stat?.iccid || '', phoneNum),
           item_id: itemId || 'unknown',
+          item_name: cachedItem?.item_name || '',
           country_id: countryId || cachedItem?.country_id || stat?.country_id || '',
           phone_num: phoneNum || cachedItem?.phone_num || stat?.phone_num || '',
           iccid: cachedItem?.iccid || stat?.iccid || '',
@@ -96,6 +97,7 @@
       .map((stat) => ({
         key: buildRowKey(stat.item_id, stat.iccid, stat.phone_num),
         item_id: stat.item_id || 'unknown',
+        item_name: stat.item_name || '',
         country_id: stat.country_id || '',
         phone_num: stat.phone_num || '',
         iccid: stat.iccid || '',
@@ -278,6 +280,7 @@
                 <thead class="bg-gray-50 dark:bg-gray-700/50">
                   <tr>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_item_id')}</th>
+                    <th class="px-4 py-2 text-left font-medium">{$t('col_item_name')}</th>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_phone_number')}</th>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_country')}</th>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_iccid')}</th>
@@ -290,6 +293,7 @@
                   {#each currentRows as row (row.key)}
                     <tr class={getRowClass(row)} onclick={() => selectRow(row)}>
                       <td class="px-4 py-3 font-mono">{row.item_id}</td>
+                      <td class="px-4 py-3">{row.item_name || '-'}</td>
                       <td class="px-4 py-3">{row.phone_num || '-'}</td>
                       <td class="px-4 py-3">{row.country_id || '-'}</td>
                       <td class="px-4 py-3 font-mono text-xs text-gray-500 dark:text-gray-400">{row.iccid || '-'}</td>
@@ -299,7 +303,7 @@
                     </tr>
                   {:else}
                     <tr>
-                      <td colspan="7" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                      <td colspan="8" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
                         {$t('no_current_items')}
                       </td>
                     </tr>
@@ -325,6 +329,7 @@
                   <thead class="bg-amber-50 dark:bg-amber-900/10">
                     <tr>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_item_id')}</th>
+                    <th class="px-4 py-2 text-left font-medium">{$t('col_item_name')}</th>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_phone_number')}</th>
                     <th class="px-4 py-2 text-left font-medium">{$t('col_iccid')}</th>
                     <th class="px-4 py-2 text-right font-medium">{$t('col_attempts')}</th>
@@ -336,6 +341,7 @@
                     {#each legacyRows as row (row.key)}
                       <tr class={getRowClass(row)} onclick={() => selectRow(row)}>
                         <td class="px-4 py-3 font-mono">{row.item_id}</td>
+                        <td class="px-4 py-3">{row.item_name || '-'}</td>
                         <td class="px-4 py-3">{row.phone_num || '-'}</td>
                         <td class="px-4 py-3 font-mono text-xs text-gray-500 dark:text-gray-400">{row.iccid || '-'}</td>
                         <td class="px-4 py-3 text-right">{row.total_sms}</td>

@@ -1200,6 +1200,7 @@ impl Sms {
 pub struct FirefoxPlatformItem {
     pub id: i64,
     pub item_id: String,
+    pub item_name: Option<String>,
     pub country_id: String,
     pub phone_num: String,
     pub iccid: Option<String>,
@@ -1251,8 +1252,10 @@ impl FirefoxPlatformItem {
     pub async fn query_all() -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let items = sqlx::query_as(
-            "SELECT id, item_id, country_id, phone_num, iccid, sim_id, status, created_at, updated_at \
-             FROM firefox_platform_items ORDER BY updated_at DESC",
+            "SELECT p.id, p.item_id, n.item_name AS item_name, p.country_id, p.phone_num, p.iccid, p.sim_id, p.status, p.created_at, p.updated_at \
+             FROM firefox_platform_items p
+             LEFT JOIN firefox_item_names n ON p.item_id = n.item_id
+             ORDER BY p.updated_at DESC",
         )
         .fetch_all(pool)
         .await?;
@@ -1262,8 +1265,10 @@ impl FirefoxPlatformItem {
     pub async fn query_by_item_id(item_id: &str) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let items = sqlx::query_as(
-            "SELECT id, item_id, country_id, phone_num, iccid, sim_id, status, created_at, updated_at \
-             FROM firefox_platform_items WHERE item_id = ? ORDER BY phone_num",
+            "SELECT id, p.item_id, n.item_name AS item_name, p.country_id, p.phone_num, p.iccid, p.sim_id, p.status, p.created_at, p.updated_at \
+             FROM firefox_platform_items p \
+             LEFT JOIN firefox_item_names n ON p.item_id = n.item_id \
+             WHERE p.item_id = ? ORDER BY p.phone_num",
         )
         .bind(item_id)
         .fetch_all(pool)
@@ -1291,6 +1296,7 @@ impl FirefoxPlatformItem {
         let stats = sqlx::query_as::<_, PlatformItemStat>(
             "SELECT \
                 s.platform_item_id AS item_id, \
+                MAX(n.item_name) AS item_name, \
                COALESCE(MAX(i.country_id), MAX(sc.country_code), '') AS country_id, \
                COALESCE(MAX(i.phone_num), MAX(sc.phone_number), '') AS phone_num, \
                 s.sim_id AS iccid, \
@@ -1302,6 +1308,8 @@ impl FirefoxPlatformItem {
                  ON s.platform_item_id = i.item_id AND s.sim_id = i.iccid \
              LEFT JOIN sim_cards sc \
                  ON s.sim_id = sc.id \
+             LEFT JOIN firefox_item_names n \
+                 ON s.platform_item_id = n.item_id \
              WHERE s.platform_item_id IS NOT NULL \
              GROUP BY s.platform_item_id, s.sim_id \
              ORDER BY total_sms DESC",
@@ -1424,6 +1432,7 @@ impl Sms {
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
 pub struct PlatformItemStat {
     pub item_id: String,
+    pub item_name: Option<String>,
     pub country_id: String,
     pub phone_num: String,
     pub iccid: String,

@@ -182,12 +182,56 @@ async fn process_retry_queue() -> anyhow::Result<()> {
 
     // Process each item
     for item in items {
+        // Resolve the item_id for this retry so we can prefix the item name if needed.
+        let item_id = if item.sms_id > 0 {
+            match db::get_pool() {
+                Ok(pool) => match sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT platform_item_id FROM sms WHERE id = ?",
+                )
+                .bind(item.sms_id)
+                .fetch_one(pool)
+                .await
+                {
+                    Ok(Some(id)) => Some(id),
+                    Ok(None) => db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await.ok().flatten(),
+                    Err(e) => {
+                        error!(
+                            "[Firefox Upload Retry] Failed to read platform_item_id for SMS {}: {}",
+                            item.sms_id, e
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        "[Firefox Upload Retry] Failed to access DB pool for SMS {}: {}",
+                        item.sms_id, e
+                    );
+                    None
+                }
+            }
+        } else {
+            db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await.ok().flatten()
+        };
+
+        let upload_content = if let Some(ref id) = item_id {
+            db::build_upload_sms_content(id, &item.message).await.unwrap_or_else(|e| {
+                error!(
+                    "[Firefox Upload Retry] Failed to build upload content for SMS {}: {}, using original",
+                    item.sms_id, e
+                );
+                item.message.clone()
+            })
+        } else {
+            item.message.clone()
+        };
+
         match firefox_api::upload_sms(
             &client,
             &api_key,
             &item.country_id,
             &item.phone_number,
-            &item.message,
+            &upload_content,
         )
         .await
         {

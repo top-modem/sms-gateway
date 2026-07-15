@@ -922,12 +922,21 @@ impl Modem {
                                                 if sms.send {
                                                     continue;
                                                 }
+                                                let item_id = crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await.ok().flatten();
+                                                let upload_content = if let Some(ref id) = item_id {
+                                                    crate::db::build_upload_sms_content(id, &sms.message).await.unwrap_or_else(|e| {
+                                                        log::error!("[{}] Failed to build upload content for incoming SMS, using original: {}", sim_id, e);
+                                                        sms.message.clone()
+                                                    })
+                                                } else {
+                                                    sms.message.clone()
+                                                };
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,
                                                     country_id,
                                                     phone_num,
-                                                    &sms.message,
+                                                    &upload_content,
                                                 )
                                                 .await
                                                 {

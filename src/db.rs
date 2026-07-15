@@ -1320,6 +1320,36 @@ impl FirefoxPlatformItem {
     }
 }
 
+/// Build the SMS content to upload to the platform.
+/// If the raw message does not already contain the item name keyword,
+/// prefix it with `[Item_Name] ` so the platform accepts it.
+pub async fn build_upload_sms_content(item_id: &str, raw_content: &str) -> Result<String> {
+    let pool = get_pool()?;
+    let item_name: Option<String> = sqlx::query_scalar(
+        "SELECT item_name FROM firefox_item_names WHERE item_id = ?",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(item_name) = item_name else {
+        return Ok(raw_content.to_string());
+    };
+
+    let raw_lower = raw_content.to_ascii_lowercase();
+    let name_lower = item_name.to_ascii_lowercase();
+    if raw_lower.contains(&name_lower) {
+        return Ok(raw_content.to_string());
+    }
+
+    let prefixed = format!("[{}] {}", item_name, raw_content);
+    log::info!(
+        "[Upload SMS] Prefixed item name to SMS content: item_id={}, item_name={}, original={:?}, prefixed={:?}",
+        item_id, item_name, raw_content, prefixed
+    );
+    Ok(prefixed)
+}
+
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
 pub struct BarcodeScan {
     pub id: i64,

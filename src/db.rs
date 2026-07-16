@@ -681,6 +681,19 @@ impl Sms {
     ) -> Result<u64> {
         let pool = get_pool()?;
 
+        // Look up the item name for the active item. Only remap SMS whose content
+        // contains the item name, to avoid assigning a Yahoo message to Instagram, etc.
+        let item_name: Option<String> = sqlx::query_scalar(
+            "SELECT item_name FROM firefox_item_names WHERE item_id = ?",
+        )
+        .bind(active_item_id)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some(item_name) = item_name else {
+            return Ok(0);
+        };
+
         let result = sqlx::query(
             r#"
             UPDATE sms
@@ -691,11 +704,13 @@ impl Sms {
               AND platform_item_id IS NOT NULL
               AND platform_item_id != ?
               AND timestamp > datetime('now', '-2 days')
+              AND LOWER(message) LIKE '%' || LOWER(?) || '%'
             "#,
         )
         .bind(active_item_id)
         .bind(sim_id)
         .bind(active_item_id)
+        .bind(item_name)
         .execute(pool)
         .await?;
 

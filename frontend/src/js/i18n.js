@@ -503,7 +503,7 @@ const translations = {
     service_action_in_progress:'处理中...',
     btn_logout:               '退出',
     col_com_port:             'COM端口',
-    col_module:               '模块',
+    col_module:               '网络',
     col_signal:               '信号',
     col_network_status:       '网络状态',
     col_phone_number:         '电话号码',

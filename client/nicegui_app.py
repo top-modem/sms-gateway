@@ -294,7 +294,7 @@ with ui.column().classes('w-full h-screen no-wrap p-0 m-0'):
                     {'headerName': '#',    'field': 'row_num',    'width': 50,
                      'checkboxSelection': True, 'headerCheckboxSelection': True},
                     {'headerName': '端口',   'field': 'com_port',    'width': 70},
-                    {'headerName': '模块',   'field': 'module',      'width': 80},
+                    {'headerName': '网络',   'field': 'module',      'width': 80},
                     {'headerName': '信号',   'field': 'signal',      'width': 90,
                      'cellStyle': {'function': "const v=parseInt((params.value||'0').split('/')[1]);return {color:v>14?'#009900':v>0?'#cc6600':'#cc0000',fontWeight:'bold'};"}},
                     {'headerName': '状态',   'field': 'status',      'width': 72,

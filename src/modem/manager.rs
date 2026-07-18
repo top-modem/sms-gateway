@@ -805,6 +805,7 @@ impl ModemManager {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
+        let active_entries_len = active_entries.len();
 
         #[derive(Debug)]
         enum ProbeOutcome {
@@ -819,7 +820,13 @@ impl ModemManager {
                 // AT+CPIN? is the most reliable indicator of physical SIM presence.
                 // If the SIM is pulled out, the modem typically reports
                 // +CPIN: SIM REMOVED, +CME ERROR, or plain ERROR.
-                let status = modem.get_sim_status().await.ok().flatten();
+                // Use a short explicit timeout so a dead modem cannot stall the
+                // whole recheck cycle.
+                let status = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_status())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
                 let status_ready = status
                     .as_deref()
                     .map(|s| s.trim().eq_ignore_ascii_case("READY"))
@@ -835,11 +842,15 @@ impl ModemManager {
                     };
                 }
 
-                match modem.get_sim_iccid().await {
-                    Ok(Some(current_iccid)) if current_iccid == iccid => {
+                log::info!(
+                    "SIM status on {} is READY (was {}); checking ICCID for stale cached state.",
+                    modem.com_port, iccid
+                );
+                match tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid()).await {
+                    Ok(Ok(Some(current_iccid))) if current_iccid == iccid => {
                         ProbeOutcome::Healthy { iccid }
                     }
-                    Ok(Some(current_iccid)) => {
+                    Ok(Ok(Some(current_iccid))) => {
                         info!(
                             "SIM swap detected on {} (was {}, now {}). Forcing re-init.",
                             modem.com_port, iccid, current_iccid
@@ -849,14 +860,44 @@ impl ModemManager {
                             com_port: modem.com_port.clone(),
                         }
                     }
-                    _ => ProbeOutcome::MissingOrError {
-                        iccid,
-                        com_port: modem.com_port.clone(),
-                    },
+                    Ok(Ok(None)) => {
+                        log::info!(
+                            "ICCID read returned empty on {} (was {}). Treating as absent.",
+                            modem.com_port, iccid
+                        );
+                        ProbeOutcome::MissingOrError {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        log::info!(
+                            "ICCID read failed on {} (was {}): {}. Treating as absent.",
+                            modem.com_port, iccid, e
+                        );
+                        ProbeOutcome::MissingOrError {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                        }
+                    }
+                    Err(_) => {
+                        log::info!(
+                            "ICCID read timed out on {} (was {}). Treating as absent.",
+                            modem.com_port, iccid
+                        );
+                        ProbeOutcome::MissingOrError {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                        }
+                    }
                 }
             });
         }
         let mut demotions: Vec<(String, String)> = Vec::new();
+        log::info!(
+            "Rechecking {} active modem(s) for SIM presence",
+            active_entries_len
+        );
         while let Some(result) = demotion_futs.next().await {
             match result {
                 ProbeOutcome::Healthy { iccid } => {
@@ -893,7 +934,9 @@ impl ModemManager {
                 }
             }
         }
+        log::info!("Recheck demotion phase found {} modem(s) to demote", demotions.len());
         for (iccid, com_port) in demotions {
+            log::info!("[recheck] Demoting modem {} on {}", iccid, com_port);
             let mut modems = self.modems.write().await;
             if let Some(modem) = modems.remove(&iccid) {
                 if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {

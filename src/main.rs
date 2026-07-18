@@ -190,6 +190,7 @@ async fn recheck_fallback_worker(
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         modem_manager
+            .clone()
             .recheck_fallback_modems(
                 &sms_storage_map,
                 sse_manager.clone(),

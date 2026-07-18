@@ -231,7 +231,7 @@ impl Modem {
     /// responding to CPIN) is present. This avoids the ~10-20 second cost of a
     /// full modem initialization on every empty port.
     pub async fn quick_probe_port(com_port: &str, baud_rate: u32) -> bool {
-        const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+        const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
         const READ_TIMEOUT: Duration = Duration::from_millis(300);
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 

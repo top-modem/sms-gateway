@@ -50,11 +50,15 @@ impl TranscribeConfig {
 pub struct ModemManager {
     modems: Arc<RwLock<HashMap<String, Arc<Modem>>>>,
     sim_cards_cache: Arc<RwLock<HashMap<String, SimCard>>>,
-    _initialization_semaphore: Arc<Semaphore>,
+    /// Semaphore shared by unavailable-port quick probes to limit concurrent
+    /// serial port opens (especially important on large USB hubs).
+    probe_semaphore: Arc<Semaphore>,
     /// Background URC tasks keyed by SIM ID so they can be cancelled on demotion.
     urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
+    /// Background tasks that periodically quick-probe unavailable ports.
+    unavailable_port_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// Original device list so unavailable ports can be retried later.
     devices: Vec<crate::config::Device>,
     /// If true, UK MCC SIMs (234/235) will force COPS 46001 during SIM init.
@@ -74,6 +78,167 @@ const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
 impl ModemManager {
     pub async fn is_initialization_complete(&self) -> bool {
         *self.initialization_complete.read().await
+    }
+
+    /// Mark a port as unavailable and start a background worker that quick-probes
+    /// it periodically. This replaces the old sequential unavailable_ports list so
+    /// that each port is checked independently instead of waiting for a full 1..N scan.
+    async fn add_unavailable_port(
+        self: Arc<Self>,
+        com_port: String,
+        baud_rate: u32,
+        device_id: String,
+        sms_storage: Option<SmsStorage>,
+        index: usize,
+        sse_manager: Arc<SseManager>,
+        transcribe_cfg: Option<Arc<TranscribeConfig>>,
+    ) {
+        let mut ports = self.unavailable_ports.write().await;
+        if !ports.iter().any(|(p, _)| p == &com_port) {
+            ports.push((com_port.clone(), baud_rate));
+        }
+        drop(ports);
+
+        let mut tasks = self.unavailable_port_tasks.write().await;
+        if !tasks.contains_key(&com_port) {
+            let handle = tokio::spawn(Self::unavailable_port_worker(
+                self.clone(),
+                com_port.clone(),
+                baud_rate,
+                device_id,
+                sms_storage,
+                index,
+                sse_manager,
+                transcribe_cfg,
+            ));
+            tasks.insert(com_port.clone(), handle);
+            log::debug!("Started unavailable-port worker for {}", com_port);
+        }
+    }
+
+    /// Remove a port from the unavailable list and abort its background worker.
+    async fn remove_unavailable_port(&self,
+        com_port: &str,
+    ) {
+        let mut ports = self.unavailable_ports.write().await;
+        ports.retain(|(p, _)| p != com_port);
+        drop(ports);
+
+        let mut tasks = self.unavailable_port_tasks.write().await;
+        if let Some(handle) = tasks.remove(com_port) {
+            handle.abort();
+            log::debug!("Stopped unavailable-port worker for {}", com_port);
+        }
+    }
+
+    /// Background task that probes one unavailable port at a fixed interval and
+    /// performs full initialization when a SIM appears. Each port gets its own
+    /// worker, so scan time no longer scales with the total number of ports.
+    async fn unavailable_port_worker(
+        self: Arc<Self>,
+        com_port: String,
+        baud_rate: u32,
+        device_id: String,
+        sms_storage: Option<SmsStorage>,
+        index: usize,
+        sse_manager: Arc<SseManager>,
+        transcribe_cfg: Option<Arc<TranscribeConfig>>,
+    ) {
+        const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+        loop {
+            tokio::time::sleep(PROBE_INTERVAL).await;
+
+            // If the port is no longer in the unavailable list, this worker is done.
+            if !self.unavailable_ports.read().await.iter().any(|(p, _)| p == &com_port) {
+                break;
+            }
+
+            // Quick probe: empty ports fail fast. Acquire the shared probe semaphore
+            // so a large number of unavailable ports cannot overwhelm the USB hub.
+            let present = {
+                let _permit = self.probe_semaphore.acquire().await;
+                Modem::quick_probe_port(&com_port, baud_rate).await
+            };
+            if !present {
+                continue;
+            }
+
+            // Full init for ports that look like they have a modem/SIM.
+            match Self::initialize_single_modem_safe(
+                com_port.clone(),
+                baud_rate,
+                device_id.clone(),
+                sms_storage,
+                index,
+                self.force_uk_mcc_to_46001,
+            )
+            .await
+            {
+                Ok((sim_id, modem, is_new)) => {
+                    info!(
+                        "Port {} reconnected with SIM {}. Promoting to active.",
+                        com_port, sim_id
+                    );
+
+                    self.modems.write().await.insert(sim_id.clone(), Arc::new(modem));
+
+                    if is_new {
+                        self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
+                    }
+
+                    // Refresh the SIM cache entry for this SIM.
+                    match SimCard::find_by_conditions(Some(&sim_id), None, None, None).await {
+                        Ok(cards) => {
+                            if let Some(card) = cards.into_iter().next() {
+                                self.sim_cards_cache.write().await.insert(sim_id.clone(), card);
+                                log::info!(
+                                    "[recheck] Updated cache for reconnected SIM {} on port {}",
+                                    sim_id, com_port
+                                );
+                            } else {
+                                log::warn!(
+                                    "[recheck] Reconnected SIM {} not found in DB, cache not updated",
+                                    sim_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[recheck] Failed to query DB for reconnected SIM {}: {}",
+                                sim_id, e
+                            );
+                        }
+                    }
+
+                    // Start the URC handler for the reconnected modem.
+                    if let Some(modem) = self.get_modem(&sim_id).await {
+                        let handle = tokio::spawn(Self::run_urc_handler(
+                            sim_id.clone(),
+                            modem,
+                            sse_manager.clone(),
+                            transcribe_cfg.clone(),
+                        ));
+                        if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
+                            old.abort();
+                        }
+                    }
+
+                    // Remove the port from the unavailable list and stop this worker.
+                    self.remove_unavailable_port(&com_port).await;
+                    break;
+                }
+                Err(e) => {
+                    log::debug!(
+                        "Port {} quick probe passed but full init failed: {}",
+                        com_port, e
+                    );
+                }
+            }
+        }
+
+        // Clean up our own task handle so the supervisor does not respawn us.
+        self.unavailable_port_tasks.write().await.remove(&com_port);
     }
 
     async fn initialize_single_modem_safe(
@@ -122,9 +287,12 @@ impl ModemManager {
         Self {
             modems: Arc::new(RwLock::new(HashMap::new())),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
-            _initialization_semaphore: Arc::new(Semaphore::new(3)),
+            probe_semaphore: Arc::new(Semaphore::new(
+                config.settings.max_concurrent_modem_init.unwrap_or(3).max(1),
+            )),
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
+            unavailable_port_tasks: RwLock::new(HashMap::new()),
             devices: config.devices.clone(),
             force_uk_mcc_to_46001: config.settings.force_uk_mcc_to_46001.unwrap_or(true),
             max_concurrent_modem_init: config.settings.max_concurrent_modem_init.unwrap_or(3),
@@ -137,6 +305,11 @@ impl ModemManager {
     /// Initialize all configured modems and start their URC handlers.
     /// This is intentionally run in the background so the HTTP API can start
     /// immediately without waiting for slow/disconnected serial ports to time out.
+    ///
+    /// Startup now happens in two phases so it scales with many ports:
+    ///   1) Quick-probe every configured port in parallel (a few seconds per port).
+    ///   2) Run full modem initialization only on ports that passed the probe.
+    ///   3) Spawn dedicated background workers for the remaining unavailable ports.
     pub async fn initialize_modems(
         self: Arc<Self>,
         sse_manager: Arc<SseManager>,
@@ -144,29 +317,65 @@ impl ModemManager {
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) -> anyhow::Result<()> {
         let force_uk_mcc_to_46001 = self.force_uk_mcc_to_46001;
-        let max_concurrent = self.max_concurrent_modem_init;
+        let max_concurrent = self.max_concurrent_modem_init.max(1);
+        let device_count = self.devices.len();
 
-        // 0 or 1 = serial initialization (safest for USB hubs with shared resources)
-        // 2+ = parallel initialization with semaphore to limit concurrent AT commands
-        let is_serial = max_concurrent <= 1;
+        info!(
+            "Starting modem discovery for {} configured port(s) (max_concurrent_modem_init={})",
+            device_count, max_concurrent
+        );
 
-        let mut modems = HashMap::new();
+        // ── Phase 1: quick-probe all configured ports in parallel ──────────────
+        let mut probe_futs = FuturesUnordered::new();
+        for (index, device) in self.devices.iter().enumerate() {
+            let sem = self.probe_semaphore.clone();
+            let port = device.com_port.clone();
+            let baud_rate = device.baud_rate;
+            probe_futs.push(async move {
+                let _permit = sem.acquire().await;
+                let present = Modem::quick_probe_port(&port, baud_rate).await;
+                (index, port, baud_rate, present)
+            });
+        }
+
+        let mut probe_results = Vec::new();
+        while let Some((index, port, baud_rate, present)) = probe_futs.next().await {
+            probe_results.push((index, port, baud_rate, present));
+        }
+
+        let probed_present: Vec<usize> = probe_results
+            .iter()
+            .filter(|(_, _, _, present)| *present)
+            .map(|(index, _, _, _)| *index)
+            .collect();
+        let probed_absent: Vec<usize> = probe_results
+            .iter()
+            .filter(|(_, _, _, present)| !present)
+            .map(|(index, _, _, _)| *index)
+            .collect();
+
+        info!(
+            "Quick probe complete: {} port(s) look active, {} port(s) empty/unresponsive",
+            probed_present.len(),
+            probed_absent.len()
+        );
+
+        // ── Phase 2: full initialization only on ports that passed the probe ───
         let mut new_sim_ids = Vec::new();
-        let mut unavailable_ports: Vec<(String, u32)> = Vec::new();
+        let init_semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let mut init_futs = FuturesUnordered::new();
 
-        if is_serial {
-            info!("Initializing modems serially (max_concurrent_modem_init={})", max_concurrent);
-            // Initialize ports sequentially (not concurrently).  In this deployment
-            // many COM ports share the same USB hub / serial concentrator; issuing
-            // AT commands to several ports at the same time causes command timeouts
-            // and makes the service hang during startup.
-            for (index, device) in self.devices.iter().enumerate() {
-                let port = device.com_port.clone();
-                let baud_rate = device.baud_rate;
-                let sms_storage = device.sms_storage.or(self.default_sms_storage);
-                let temp_device_id = format!("device_{}", index);
+        for index in probed_present {
+            let device = &self.devices[index];
+            let port = device.com_port.clone();
+            let baud_rate = device.baud_rate;
+            let sms_storage = device.sms_storage.or(self.default_sms_storage);
+            let temp_device_id = format!("device_{}", index);
+            let sem = init_semaphore.clone();
 
-                match Self::initialize_single_modem_safe(
+            init_futs.push(async move {
+                let _permit = sem.acquire().await;
+                let result = Self::initialize_single_modem_safe(
                     port.clone(),
                     baud_rate,
                     temp_device_id,
@@ -174,94 +383,72 @@ impl ModemManager {
                     index,
                     force_uk_mcc_to_46001,
                 )
-                .await
-                {
-                    Ok((sim_id, modem, is_new)) => {
-                        if is_new {
-                            new_sim_ids.push(sim_id.clone());
-                        }
-                        let modem_arc = Arc::new(modem);
-                        modems.insert(sim_id.clone(), modem_arc.clone());
-                        // Make the active modem visible to the API immediately,
-                        // rather than waiting for the whole initialization pass.
-                        self.modems.write().await.insert(sim_id, modem_arc);
+                .await;
+                (port, index, result)
+            });
+        }
+
+        let mut unavailable_after_init: Vec<(String, u32, usize)> = Vec::new();
+        while let Some((port, index, result)) = init_futs.next().await {
+            match result {
+                Ok((sim_id, modem, is_new)) => {
+                    if is_new {
+                        new_sim_ids.push(sim_id.clone());
                     }
-                    Err(e) => {
-                        error!("Failed to initialize modem on {}: {}", port, e);
-                        unavailable_ports.push((port, baud_rate));
-                    }
+                    let modem_arc = Arc::new(modem);
+                    // Make the active modem visible to the API immediately,
+                    // rather than waiting for the whole initialization pass.
+                    self.modems.write().await.insert(sim_id, modem_arc);
                 }
-            }
-        } else {
-            info!("Initializing modems in parallel (max_concurrent_modem_init={})", max_concurrent);
-            // Parallel initialization with semaphore to limit concurrent AT commands
-            let semaphore = Arc::new(Semaphore::new(max_concurrent));
-            let mut init_futures = FuturesUnordered::new();
-
-            for (index, device) in self.devices.iter().enumerate() {
-                let port = device.com_port.clone();
-                let baud_rate = device.baud_rate;
-                let sms_storage = device.sms_storage.or(self.default_sms_storage);
-                let temp_device_id = format!("device_{}", index);
-                let sem = semaphore.clone();
-
-                init_futures.push(async move {
-                    let _permit = sem.acquire().await;
-                    let result = Self::initialize_single_modem_safe(
-                        port.clone(),
-                        baud_rate,
-                        temp_device_id,
-                        sms_storage,
-                        index,
-                        force_uk_mcc_to_46001,
-                    )
-                    .await;
-                    (port, result)
-                });
-            }
-
-            while let Some((port, result)) = init_futures.next().await {
-                match result {
-                    Ok((sim_id, modem, is_new)) => {
-                        if is_new {
-                            new_sim_ids.push(sim_id.clone());
-                        }
-                        let modem_arc = Arc::new(modem);
-                        modems.insert(sim_id.clone(), modem_arc.clone());
-                        // Make the active modem visible to the API immediately,
-                        // rather than waiting for the whole initialization pass.
-                        self.modems.write().await.insert(sim_id, modem_arc);
-                    }
-                    Err(e) => {
-                        error!("Failed to initialize modem on {}: {}", port, e);
-                        if let Some(device) = self.devices.iter().find(|d| d.com_port == port) {
-                            unavailable_ports.push((port, device.baud_rate));
-                        }
-                    }
+                Err(e) => {
+                    error!("Failed to initialize modem on {}: {}", port, e);
+                    unavailable_after_init.push((port, self.devices[index].baud_rate, index));
                 }
             }
         }
 
-        // Even if no modems have a real SIM, we still start the manager so the
-        // API can report all ports as unavailable instead of crashing.
-        if modems.is_empty() {
+        // ── Phase 3: spawn dedicated workers for all unavailable ports ──────────
+        for index in probed_absent {
+            let device = &self.devices[index];
+            self.clone().add_unavailable_port(
+                device.com_port.clone(),
+                device.baud_rate,
+                format!("device_{}", index),
+                device.sms_storage.or(self.default_sms_storage),
+                index,
+                sse_manager.clone(),
+                transcribe_cfg.clone(),
+            )
+            .await;
+        }
+        for (port, baud_rate, index) in unavailable_after_init {
+            let device = &self.devices[index];
+            self.clone().add_unavailable_port(
+                port,
+                baud_rate,
+                format!("device_{}", index),
+                device.sms_storage.or(self.default_sms_storage),
+                index,
+                sse_manager.clone(),
+                transcribe_cfg.clone(),
+            )
+            .await;
+        }
+
+        let active_count = self.modems.read().await.len();
+        let unavailable_count = self.unavailable_ports.read().await.len();
+        if active_count == 0 {
             log::warn!(
                 "No modems with valid SIM cards were initialized ({} ports unavailable). \
                  Starting with empty modem set.",
-                unavailable_ports.len()
+                unavailable_count
             );
         }
 
         info!(
             "Modem initialization pass finished: {} active, {} unavailable",
-            self.modems.read().await.len(),
-            unavailable_ports.len()
+            active_count, unavailable_count
         );
-
-        {
-            let mut self_unavailable = self.unavailable_ports.write().await;
-            *self_unavailable = unavailable_ports;
-        }
 
         self.init_sim_cache().await?;
         self.cleanup_stale_sim_cards().await?;
@@ -600,11 +787,12 @@ impl ModemManager {
 
     /// Re-check all currently active modems for SIM insertion/removal.
     /// Demotes modems where AT+CPIN? reports the SIM is not ready, or where
-    /// +CCID returns a different or missing ICCID. Periodically attempts to
-    /// reopen ports listed in `unavailable_ports`.
+    /// +CCID returns a different or missing ICCID. Reconnection is handled by
+    /// per-port background workers, so this function only manages demotion and
+    /// makes sure every unavailable port has a live worker.
     pub async fn recheck_fallback_modems(
-        &self,
-        sms_storage_map: &std::collections::HashMap<String, Option<crate::config::SmsStorage>>,
+        self: Arc<Self>,
+        _sms_storage_map: &std::collections::HashMap<String, Option<crate::config::SmsStorage>>,
         sse_manager: Arc<SseManager>,
         _webhook_manager: Option<webhook::WebhookManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
@@ -713,10 +901,7 @@ impl ModemManager {
                 }
                 let baud_rate = modem.baud_rate;
                 drop(modems);
-                let mut unavailable = self.unavailable_ports.write().await;
-                if !unavailable.iter().any(|(p, _)| p == &com_port) {
-                    unavailable.push((com_port.clone(), baud_rate));
-                }
+
                 // Remove demoted SIM from cache so dashboard doesn't show stale data
                 let mut cache = self.sim_cards_cache.write().await;
                 if cache.remove(&iccid).is_some() {
@@ -738,51 +923,47 @@ impl ModemManager {
                         iccid, com_port, e
                     ),
                 }
+                drop(cache);
+
+                // Spawn a dedicated worker to watch this port for reconnection.
+                let device_cfg = self.devices.iter().find(|d| d.com_port == com_port);
+                let sms_storage = device_cfg
+                    .and_then(|d| d.sms_storage)
+                    .or(self.default_sms_storage);
+                let index = device_cfg
+                    .map(|d| self.devices.iter().position(|x| x.com_port == d.com_port).unwrap_or(0))
+                    .unwrap_or_else(|| {
+                        com_port
+                            .trim_start_matches(|c: char| !c.is_ascii_digit())
+                            .parse::<usize>()
+                            .unwrap_or(0)
+                            .saturating_sub(1)
+                    });
+                self.clone().add_unavailable_port(
+                    com_port.clone(),
+                    baud_rate,
+                    format!("device_{}", index),
+                    sms_storage,
+                    index,
+                    sse_manager.clone(),
+                    transcribe_cfg.clone(),
+                )
+                .await;
             }
         }
 
-        // ── Reconnection: try to reopen ports that were unavailable at startup ──
+        // ── Supervisor: keep unavailable-port workers alive and consistent ──────
+        // Each unavailable port should have its own worker. If a worker has been
+        // aborted or crashed, respawn it. If a worker exists for a port that is no
+        // longer unavailable, stop it.
         let unavailable_snapshot: Vec<(String, u32)> = self.unavailable_ports.read().await.clone();
-        if unavailable_snapshot.is_empty() {
-            return;
-        }
-
-        // 1) Quick probe in parallel: empty ports fail fast (a few seconds) instead
-        // of paying the full ~10-20 second initialization cost.
-        let max_concurrent = self.max_concurrent_modem_init.max(1);
-        let probe_semaphore = Arc::new(Semaphore::new(max_concurrent));
-        let mut probe_futs = FuturesUnordered::new();
-        for (com_port, baud_rate) in unavailable_snapshot.clone() {
-            let sem = probe_semaphore.clone();
-            probe_futs.push(async move {
-                let _permit = sem.acquire().await;
-                let present = Modem::quick_probe_port(&com_port, baud_rate).await;
-                (com_port, baud_rate, present)
-            });
-        }
-
-        let mut candidates: Vec<(String, u32)> = Vec::new();
-        while let Some((com_port, baud_rate, present)) = probe_futs.next().await {
-            if present {
-                log::debug!("Quick probe found modem/SIM on {}, scheduling full init", com_port);
-                candidates.push((com_port, baud_rate));
-            } else {
-                log::debug!("Quick probe: no modem/SIM on {}", com_port);
-            }
-        }
-
-        if candidates.is_empty() {
-            return;
-        }
-
-        // 2) Full initialization only for ports that passed the quick probe.
-        let init_semaphore = Arc::new(Semaphore::new(max_concurrent));
-        let mut init_futs = FuturesUnordered::new();
-        for (com_port, baud_rate) in candidates {
-            let device_cfg = self.devices.iter().find(|d| d.com_port == com_port);
+        let mut expected_workers: HashMap<String, (u32, usize, Option<SmsStorage>)> =
+            HashMap::new();
+        for (com_port, baud_rate) in &unavailable_snapshot {
+            let device_cfg = self.devices.iter().find(|d| d.com_port == *com_port);
             let sms_storage = device_cfg
                 .and_then(|d| d.sms_storage)
-                .or(*sms_storage_map.get(&com_port).unwrap_or(&None));
+                .or(self.default_sms_storage);
             let index = device_cfg
                 .map(|d| self.devices.iter().position(|x| x.com_port == d.com_port).unwrap_or(0))
                 .unwrap_or_else(|| {
@@ -792,76 +973,47 @@ impl ModemManager {
                         .unwrap_or(0)
                         .saturating_sub(1)
                 });
-            let sem = init_semaphore.clone();
-            let sse = sse_manager.clone();
-            let tc = transcribe_cfg.clone();
-
-            init_futs.push(async move {
-                let _permit = sem.acquire().await;
-                let result = Self::initialize_single_modem_safe(
-                    com_port.clone(),
-                    baud_rate,
-                    format!("device_{}", index),
-                    sms_storage,
-                    index,
-                    self.force_uk_mcc_to_46001,
-                )
-                .await;
-                (com_port, result, sse, tc)
-            });
+            expected_workers.insert(com_port.clone(), (*baud_rate, index, sms_storage));
         }
 
-        let mut reconnected = Vec::new();
-        while let Some((com_port, result, sse, tc)) = init_futs.next().await {
-            match result {
-                Ok((sim_id, modem, is_new)) => {
-                    info!(
-                        "Port {} reconnected with SIM {}. Promoting to active.",
-                        com_port, sim_id
-                    );
-                    let mut modems = self.modems.write().await;
-                    modems.insert(sim_id.clone(), Arc::new(modem));
-                    drop(modems);
-                    if is_new {
-                        self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
-                    }
-                    // Query DB for the latest SIM info and update cache
-                    match SimCard::find_by_conditions(Some(&sim_id), None, None, None).await {
-                        Ok(cards) => {
-                            if let Some(card) = cards.into_iter().next() {
-                                let mut cache = self.sim_cards_cache.write().await;
-                                cache.insert(sim_id.clone(), card);
-                                log::info!("[recheck] Updated cache for reconnected SIM {} on port {}", sim_id, com_port);
-                            } else {
-                                log::warn!("[recheck] Reconnected SIM {} not found in DB, cache not updated", sim_id);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("[recheck] Failed to query DB for reconnected SIM {}: {}", sim_id, e);
-                        }
-                    }
-                    if let Some(modem) = self.get_modem(&sim_id).await {
-                        let handle = tokio::spawn(Self::run_urc_handler(
-                            sim_id.clone(),
-                            modem,
-                            sse,
-                            tc,
-                        ));
-                        if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
-                            old.abort();
-                        }
-                    }
-                    reconnected.push(com_port);
-                }
-                Err(e) => {
-                    log::debug!("Port {} still unavailable after quick probe: {}", com_port, e);
+        // Stop workers for ports that are no longer unavailable.
+        let stale_ports: Vec<String> = {
+            let tasks = self.unavailable_port_tasks.read().await;
+            tasks
+                .keys()
+                .filter(|p| !expected_workers.contains_key(p.as_str()))
+                .cloned()
+                .collect()
+        };
+        if !stale_ports.is_empty() {
+            let mut tasks = self.unavailable_port_tasks.write().await;
+            for port in stale_ports {
+                if let Some(handle) = tasks.remove(&port) {
+                    handle.abort();
                 }
             }
         }
 
-        if !reconnected.is_empty() {
-            let mut unavailable = self.unavailable_ports.write().await;
-            unavailable.retain(|(p, _)| !reconnected.contains(p));
+        // Respawn workers for unavailable ports that don't have one.
+        let missing_ports: Vec<(String, u32, usize, Option<SmsStorage>)> = {
+            let tasks = self.unavailable_port_tasks.read().await;
+            expected_workers
+                .iter()
+                .filter(|(p, _)| !tasks.contains_key(p.as_str()))
+                .map(|(p, (baud, index, storage))| (p.clone(), *baud, *index, *storage))
+                .collect()
+        };
+        for (com_port, baud_rate, index, sms_storage) in missing_ports {
+            self.clone().add_unavailable_port(
+                com_port,
+                baud_rate,
+                format!("device_{}", index),
+                sms_storage,
+                index,
+                sse_manager.clone(),
+                transcribe_cfg.clone(),
+            )
+            .await;
         }
     }
 

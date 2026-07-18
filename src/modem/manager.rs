@@ -228,6 +228,7 @@ impl ModemManager {
         };
 
         manager.init_sim_cache().await?;
+        manager.cleanup_stale_sim_cards().await?;
 
         if !new_sim_ids.is_empty() {
             manager.init_new_sim_sms_data(new_sim_ids).await;
@@ -325,6 +326,47 @@ impl ModemManager {
         *cache = sim_cards;
 
         info!("Initialized SIM cache with {} cards", cache.len());
+        Ok(())
+    }
+
+    /// Remove sim_cards rows for SIMs that are no longer physically present.
+    /// This prevents the dashboard/API from showing stale IMSI/ICCID/phone info
+    /// after a SIM has been pulled out (especially when the server was stopped
+    /// at the time the SIM was removed).
+    async fn cleanup_stale_sim_cards(&self) -> anyhow::Result<()> {
+        let modems = self.modems.read().await;
+        let active_ids: std::collections::HashSet<&str> =
+            modems.keys().map(|k| k.as_str()).collect();
+        if active_ids.is_empty() {
+            log::info!("No active modems; skipping stale sim_cards cleanup");
+            return Ok(());
+        }
+
+        let all_cards = SimCard::query_all().await?;
+        let mut deleted = 0;
+        for card in all_cards {
+            if !active_ids.contains(card.id.as_str()) {
+                match SimCard::delete_by_id(&card.id).await {
+                    Ok(true) => {
+                        deleted += 1;
+                        log::info!(
+                            "[cleanup] Deleted stale sim_cards row for absent SIM {}",
+                            card.id
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => log::warn!(
+                        "[cleanup] Failed to delete stale sim_cards row {}: {}",
+                        card.id,
+                        e
+                    ),
+                }
+            }
+        }
+
+        if deleted > 0 {
+            info!("Cleaned up {} stale sim_cards row(s) for removed SIMs", deleted);
+        }
         Ok(())
     }
 
@@ -609,6 +651,22 @@ impl ModemManager {
                 let mut cache = self.sim_cards_cache.write().await;
                 if cache.remove(&iccid).is_some() {
                     log::info!("[recheck] Removed demoted SIM {} from cache (port {})", iccid, com_port);
+                }
+                // Also delete the DB record so the SIM card list does not retain
+                // stale IMSI/ICCID/phone info after the physical SIM is removed.
+                match SimCard::delete_by_id(&iccid).await {
+                    Ok(true) => log::info!(
+                        "[recheck] Deleted sim_cards DB row for removed SIM {} (port {})",
+                        iccid, com_port
+                    ),
+                    Ok(false) => log::debug!(
+                        "[recheck] No sim_cards DB row to delete for SIM {} (port {})",
+                        iccid, com_port
+                    ),
+                    Err(e) => log::warn!(
+                        "[recheck] Failed to delete sim_cards DB row for SIM {} (port {}): {}",
+                        iccid, com_port, e
+                    ),
                 }
             }
         }

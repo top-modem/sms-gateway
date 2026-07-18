@@ -84,7 +84,7 @@ impl ModemManager {
         index: usize,
         force_uk_mcc_to_46001: bool,
     ) -> anyhow::Result<(String, Modem, bool)> {
-        const INIT_TIMEOUT_SECS: u64 = 45;
+        const INIT_TIMEOUT_SECS: u64 = 10;
 
         // Some serial stack failures on Windows can panic internally while opening a COM port.
         // Catch unwind here so one bad port cannot terminate the whole process.
@@ -180,7 +180,11 @@ impl ModemManager {
                         if is_new {
                             new_sim_ids.push(sim_id.clone());
                         }
-                        modems.insert(sim_id, Arc::new(modem));
+                        let modem_arc = Arc::new(modem);
+                        modems.insert(sim_id.clone(), modem_arc.clone());
+                        // Make the active modem visible to the API immediately,
+                        // rather than waiting for the whole initialization pass.
+                        self.modems.write().await.insert(sim_id, modem_arc);
                     }
                     Err(e) => {
                         error!("Failed to initialize modem on {}: {}", port, e);
@@ -222,7 +226,11 @@ impl ModemManager {
                         if is_new {
                             new_sim_ids.push(sim_id.clone());
                         }
-                        modems.insert(sim_id, Arc::new(modem));
+                        let modem_arc = Arc::new(modem);
+                        modems.insert(sim_id.clone(), modem_arc.clone());
+                        // Make the active modem visible to the API immediately,
+                        // rather than waiting for the whole initialization pass.
+                        self.modems.write().await.insert(sim_id, modem_arc);
                     }
                     Err(e) => {
                         error!("Failed to initialize modem on {}: {}", port, e);
@@ -245,15 +253,11 @@ impl ModemManager {
         }
 
         info!(
-            "Successfully initialized {} modem(s), {} unavailable",
-            modems.len(),
+            "Modem initialization pass finished: {} active, {} unavailable",
+            self.modems.read().await.len(),
             unavailable_ports.len()
         );
 
-        {
-            let mut self_modems = self.modems.write().await;
-            *self_modems = modems;
-        }
         {
             let mut self_unavailable = self.unavailable_ports.write().await;
             *self_unavailable = unavailable_ports;

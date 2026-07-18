@@ -1,7 +1,7 @@
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use log::{error, info};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -181,7 +181,34 @@ impl ModemManager {
                         com_port, sim_id
                     );
 
-                    self.modems.write().await.insert(sim_id.clone(), Arc::new(modem));
+                    // Insert the new modem. If this SIM was previously active on a
+                    // different port, that old port is now abandoned (no active
+                    // modem, no watcher) and would vanish from the dashboard, so
+                    // mark it unavailable. The recheck supervisor will spawn its
+                    // reconnect worker (calling add_unavailable_port directly here
+                    // would create a worker -> add_unavailable_port -> worker
+                    // future cycle that is not Send).
+                    let previous = self
+                        .modems
+                        .write()
+                        .await
+                        .insert(sim_id.clone(), Arc::new(modem));
+                    let moved_from: Option<(String, u32)> = previous.and_then(|old_modem| {
+                        let old_port = old_modem.com_port.clone();
+                        let old_baud = old_modem.baud_rate;
+                        drop(old_modem);
+                        (old_port != com_port).then_some((old_port, old_baud))
+                    });
+                    if let Some((old_port, old_baud)) = moved_from {
+                        info!(
+                            "SIM {} moved from {} to {}; marking {} as unavailable.",
+                            sim_id, old_port, com_port, old_port
+                        );
+                        let mut ports = self.unavailable_ports.write().await;
+                        if !ports.iter().any(|(p, _)| p == &old_port) {
+                            ports.push((old_port, old_baud));
+                        }
+                    }
 
                     if is_new {
                         self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
@@ -552,11 +579,48 @@ impl ModemManager {
         }
 
         let sim_cards = SimCard::get_by_ids(&sim_ids).await?;
+        let cached_ids: HashSet<String> = sim_cards.keys().cloned().collect();
+
+        // Active modems without a sim_cards row can appear after a transient
+        // demotion deleted the DB record while the modem stayed active. Recreate
+        // the row from live SIM info so the dashboard always shows IMSI.
+        let missing: Vec<(String, Arc<Modem>)> = modems
+            .iter()
+            .filter(|(id, _)| !cached_ids.contains(id.as_str()))
+            .map(|(id, modem)| (id.clone(), modem.clone()))
+            .collect();
 
         let mut cache = self.sim_cards_cache.write().await;
         *cache = sim_cards;
+        drop(cache);
+        drop(modems);
 
-        info!("Initialized SIM cache with {} cards", cache.len());
+        for (iccid, modem) in missing {
+            log::info!(
+                "[init_sim_cache] Active modem {} on {} has no sim_cards row; recreating from live SIM info",
+                iccid, modem.com_port
+            );
+            let (imsi_res, phone_res) = tokio::join!(modem.get_sim_imsi(), modem.get_phone_number());
+            let imsi = imsi_res.ok().flatten();
+            let phone_number = phone_res.ok().flatten();
+            match SimCard::find_or_create_with_phone(&iccid, imsi, phone_number).await {
+                Ok(card) => {
+                    let mut cache = self.sim_cards_cache.write().await;
+                    cache.insert(card.id.clone(), card);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[init_sim_cache] Failed to recreate sim_cards row for {}: {}",
+                        iccid, e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Initialized SIM cache with {} cards",
+            self.sim_cards_cache.read().await.len()
+        );
         Ok(())
     }
 
@@ -807,11 +871,10 @@ impl ModemManager {
         };
         let active_entries_len = active_entries.len();
 
-        #[derive(Debug)]
         enum ProbeOutcome {
-            Healthy { iccid: String },
-            Swap { iccid: String, com_port: String },
-            MissingOrError { iccid: String, com_port: String },
+            Healthy { iccid: String, modem: Arc<Modem> },
+            Swap { iccid: String, com_port: String, modem: Arc<Modem> },
+            MissingOrError { iccid: String, com_port: String, modem: Arc<Modem> },
         }
 
         let mut demotion_futs = FuturesUnordered::new();
@@ -839,6 +902,7 @@ impl ModemManager {
                     return ProbeOutcome::MissingOrError {
                         iccid,
                         com_port: modem.com_port.clone(),
+                        modem,
                     };
                 }
 
@@ -848,7 +912,7 @@ impl ModemManager {
                 );
                 match tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid()).await {
                     Ok(Ok(Some(current_iccid))) if current_iccid == iccid => {
-                        ProbeOutcome::Healthy { iccid }
+                        ProbeOutcome::Healthy { iccid, modem }
                     }
                     Ok(Ok(Some(current_iccid))) => {
                         info!(
@@ -858,6 +922,7 @@ impl ModemManager {
                         ProbeOutcome::Swap {
                             iccid,
                             com_port: modem.com_port.clone(),
+                            modem,
                         }
                     }
                     Ok(Ok(None)) => {
@@ -868,6 +933,7 @@ impl ModemManager {
                         ProbeOutcome::MissingOrError {
                             iccid,
                             com_port: modem.com_port.clone(),
+                            modem,
                         }
                     }
                     Ok(Err(e)) => {
@@ -878,6 +944,7 @@ impl ModemManager {
                         ProbeOutcome::MissingOrError {
                             iccid,
                             com_port: modem.com_port.clone(),
+                            modem,
                         }
                     }
                     Err(_) => {
@@ -888,26 +955,59 @@ impl ModemManager {
                         ProbeOutcome::MissingOrError {
                             iccid,
                             com_port: modem.com_port.clone(),
+                            modem,
                         }
                     }
                 }
             });
         }
-        let mut demotions: Vec<(String, String)> = Vec::new();
+        let mut demotions: Vec<(String, String, Arc<Modem>)> = Vec::new();
         log::info!(
             "Rechecking {} active modem(s) for SIM presence",
             active_entries_len
         );
         while let Some(result) = demotion_futs.next().await {
             match result {
-                ProbeOutcome::Healthy { iccid } => {
+                ProbeOutcome::Healthy { iccid, modem } => {
                     self.sim_probe_fail_counts.write().await.remove(&iccid);
+
+                    // Ensure the sim_cards DB row exists and has the current IMSI.
+                    // A transient demotion may have deleted the row while the modem
+                    // stayed active, which leaves the dashboard IMSI column blank.
+                    if let Some(imsi) = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        modem.get_sim_imsi(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+                    {
+                        match SimCard::find_or_create_with_phone(
+                            &iccid, Some(imsi), None,
+                        )
+                        .await
+                        {
+                            Ok(card) => {
+                                self.sim_cards_cache
+                                    .write()
+                                    .await
+                                    .insert(card.id.clone(), card);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[recheck] Failed to ensure sim_cards row for {}: {}",
+                                    iccid, e
+                                );
+                            }
+                        }
+                    }
                 }
-                ProbeOutcome::Swap { iccid, com_port } => {
+                ProbeOutcome::Swap { iccid, com_port, modem } => {
                     self.sim_probe_fail_counts.write().await.remove(&iccid);
-                    demotions.push((iccid, com_port));
+                    demotions.push((iccid, com_port, modem));
                 }
-                ProbeOutcome::MissingOrError { iccid, com_port } => {
+                ProbeOutcome::MissingOrError { iccid, com_port, modem } => {
                     let failures = {
                         let mut fail_counts = self.sim_probe_fail_counts.write().await;
                         let count = fail_counts.entry(iccid.clone()).or_insert(0);
@@ -921,7 +1021,7 @@ impl ModemManager {
                             failures, com_port, iccid
                         );
                         self.sim_probe_fail_counts.write().await.remove(&iccid);
-                        demotions.push((iccid, com_port));
+                        demotions.push((iccid, com_port, modem));
                     } else {
                         log::debug!(
                             "Transient SIM probe failure {}/{} on {} (SIM {}). Keeping modem active.",
@@ -935,15 +1035,32 @@ impl ModemManager {
             }
         }
         log::info!("Recheck demotion phase found {} modem(s) to demote", demotions.len());
-        for (iccid, com_port) in demotions {
+        for (iccid, com_port, probed_modem) in demotions {
             log::info!("[recheck] Demoting modem {} on {}", iccid, com_port);
-            let mut modems = self.modems.write().await;
-            if let Some(modem) = modems.remove(&iccid) {
+            let baud_rate = probed_modem.baud_rate;
+
+            // Remove the map entry only if it is still the exact modem we probed.
+            // A concurrent reconnect worker may already have replaced it with the
+            // same SIM on a different port; removing that fresh entry would make
+            // the SIM vanish from the dashboard until the next restart.
+            let removed = {
+                let mut modems = self.modems.write().await;
+                if modems
+                    .get(&iccid)
+                    .map(|current| Arc::ptr_eq(current, &probed_modem))
+                    .unwrap_or(false)
+                {
+                    modems.remove(&iccid);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if removed {
                 if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {
                     task.abort();
                 }
-                let baud_rate = modem.baud_rate;
-                drop(modems);
 
                 // Remove demoted SIM from cache so dashboard doesn't show stale data
                 let mut cache = self.sim_cards_cache.write().await;
@@ -967,31 +1084,83 @@ impl ModemManager {
                     ),
                 }
                 drop(cache);
+            } else {
+                log::info!(
+                    "[recheck] Skipped demotion of {} on {}: active entry was already replaced (SIM re-detected on another port).",
+                    iccid, com_port
+                );
+            }
 
-                // Spawn a dedicated worker to watch this port for reconnection.
-                let device_cfg = self.devices.iter().find(|d| d.com_port == com_port);
-                let sms_storage = device_cfg
-                    .and_then(|d| d.sms_storage)
-                    .or(self.default_sms_storage);
-                let index = device_cfg
-                    .map(|d| self.devices.iter().position(|x| x.com_port == d.com_port).unwrap_or(0))
-                    .unwrap_or_else(|| {
-                        com_port
-                            .trim_start_matches(|c: char| !c.is_ascii_digit())
-                            .parse::<usize>()
-                            .unwrap_or(0)
-                            .saturating_sub(1)
-                    });
-                self.clone().add_unavailable_port(
-                    com_port.clone(),
-                    baud_rate,
-                    format!("device_{}", index),
-                    sms_storage,
-                    index,
-                    sse_manager.clone(),
-                    transcribe_cfg.clone(),
-                )
-                .await;
+            // Whether the entry was removed or replaced, the probed modem on this
+            // port is gone, so make sure the port is watched for reconnection.
+            let device_cfg = self.devices.iter().find(|d| d.com_port == com_port);
+            let sms_storage = device_cfg
+                .and_then(|d| d.sms_storage)
+                .or(self.default_sms_storage);
+            let index = device_cfg
+                .map(|d| self.devices.iter().position(|x| x.com_port == d.com_port).unwrap_or(0))
+                .unwrap_or_else(|| {
+                    com_port
+                        .trim_start_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .unwrap_or(0)
+                        .saturating_sub(1)
+                });
+            self.clone().add_unavailable_port(
+                com_port.clone(),
+                baud_rate,
+                format!("device_{}", index),
+                sms_storage,
+                index,
+                sse_manager.clone(),
+                transcribe_cfg.clone(),
+            )
+            .await;
+        }
+
+        // ── Invariant sweep: every configured port is active or watched ───────
+        // A port can fall out of both sets — e.g. its SIM was promoted away on a
+        // different port before this recheck's snapshot was taken, so no demotion
+        // was ever queued for it. Such a port would vanish from the dashboard
+        // entirely, so start watching it again here.
+        // Only run after startup init: during discovery, ports legitimately sit
+        // in neither set while they are being probed/initialized.
+        if *self.initialization_complete.read().await {
+            let active_ports: std::collections::HashSet<String> = self
+                .modems
+                .read()
+                .await
+                .values()
+                .map(|m| m.com_port.clone())
+                .collect();
+            for (index, device) in self.devices.iter().enumerate() {
+                if active_ports.contains(&device.com_port) {
+                    continue;
+                }
+                if self
+                    .unavailable_ports
+                    .read()
+                    .await
+                    .iter()
+                    .any(|(p, _)| p == &device.com_port)
+                {
+                    continue;
+                }
+                log::info!(
+                    "[recheck] Port {} is neither active nor watched; marking it unavailable.",
+                    device.com_port
+                );
+                self.clone()
+                    .add_unavailable_port(
+                        device.com_port.clone(),
+                        device.baud_rate,
+                        format!("device_{}", index),
+                        device.sms_storage.or(self.default_sms_storage),
+                        index,
+                        sse_manager.clone(),
+                        transcribe_cfg.clone(),
+                    )
+                    .await;
             }
         }
 

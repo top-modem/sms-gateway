@@ -226,6 +226,76 @@ impl Modem {
         }
     }
 
+    /// Quick probe used by the reconnection worker: open a port with a short
+    /// timeout, send AT+CPIN?, and report whether a SIM (or at least a modem
+    /// responding to CPIN) is present. This avoids the ~10-20 second cost of a
+    /// full modem initialization on every empty port.
+    pub async fn quick_probe_port(com_port: &str, baud_rate: u32) -> bool {
+        const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+        const READ_TIMEOUT: Duration = Duration::from_millis(300);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let open_result = tokio::time::timeout(
+            OPEN_TIMEOUT,
+            tokio::task::spawn_blocking({
+                let port = com_port.to_string();
+                move || {
+                    tokio_serial::new(&port, baud_rate)
+                        .timeout(READ_TIMEOUT)
+                        .flow_control(tokio_serial::FlowControl::None)
+                        .open_native_async()
+                        .map_err(|e| io::Error::other(format!("Failed to open {}: {}", port, e)))
+                }
+            }),
+        )
+        .await;
+
+        let mut stream = match open_result {
+            Ok(Ok(Ok(stream))) => stream,
+            _ => return false,
+        };
+
+        // Drain any stale bytes that may be sitting in the port buffer.
+        let mut drain = [0u8; 256];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut drain)).await
+        {
+            if n == 0 {
+                break;
+            }
+        }
+
+        if stream.write_all(b"AT+CPIN?\r\n").await.is_err() {
+            return false;
+        }
+        if stream.flush().await.is_err() {
+            return false;
+        }
+
+        let mut buf = [0u8; 512];
+        let mut response = String::new();
+        let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if response.contains("\r\nOK\r\n") || response.contains("\r\nERROR") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let upper = response.to_uppercase();
+        if upper.contains("+CPIN:") && !upper.contains("REMOVED") && !upper.contains("NOT INSERTED") {
+            return true;
+        }
+        // A plain OK with no CPIN info is unusual for a modem; still treat it as
+        // present so the full init can decide.
+        upper.contains("OK")
+    }
+
     // ─── Background reader task ────────────────────────────────────────────────
 
     /// Long-lived task that owns the read half of the serial stream.

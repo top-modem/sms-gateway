@@ -743,9 +743,42 @@ impl ModemManager {
 
         // ── Reconnection: try to reopen ports that were unavailable at startup ──
         let unavailable_snapshot: Vec<(String, u32)> = self.unavailable_ports.read().await.clone();
-        let mut reconnected = Vec::new();
-        for (com_port, baud_rate) in unavailable_snapshot {
-            // Look up the original device configuration for sms_storage and index.
+        if unavailable_snapshot.is_empty() {
+            return;
+        }
+
+        // 1) Quick probe in parallel: empty ports fail fast (a few seconds) instead
+        // of paying the full ~10-20 second initialization cost.
+        let max_concurrent = self.max_concurrent_modem_init.max(1);
+        let probe_semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let mut probe_futs = FuturesUnordered::new();
+        for (com_port, baud_rate) in unavailable_snapshot.clone() {
+            let sem = probe_semaphore.clone();
+            probe_futs.push(async move {
+                let _permit = sem.acquire().await;
+                let present = Modem::quick_probe_port(&com_port, baud_rate).await;
+                (com_port, baud_rate, present)
+            });
+        }
+
+        let mut candidates: Vec<(String, u32)> = Vec::new();
+        while let Some((com_port, baud_rate, present)) = probe_futs.next().await {
+            if present {
+                log::debug!("Quick probe found modem/SIM on {}, scheduling full init", com_port);
+                candidates.push((com_port, baud_rate));
+            } else {
+                log::debug!("Quick probe: no modem/SIM on {}", com_port);
+            }
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // 2) Full initialization only for ports that passed the quick probe.
+        let init_semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let mut init_futs = FuturesUnordered::new();
+        for (com_port, baud_rate) in candidates {
             let device_cfg = self.devices.iter().find(|d| d.com_port == com_port);
             let sms_storage = device_cfg
                 .and_then(|d| d.sms_storage)
@@ -759,16 +792,28 @@ impl ModemManager {
                         .unwrap_or(0)
                         .saturating_sub(1)
                 });
-            match Self::initialize_single_modem_safe(
-                com_port.clone(),
-                baud_rate,
-                format!("device_{}", index),
-                sms_storage,
-                index,
-                self.force_uk_mcc_to_46001,
-            )
-            .await
-            {
+            let sem = init_semaphore.clone();
+            let sse = sse_manager.clone();
+            let tc = transcribe_cfg.clone();
+
+            init_futs.push(async move {
+                let _permit = sem.acquire().await;
+                let result = Self::initialize_single_modem_safe(
+                    com_port.clone(),
+                    baud_rate,
+                    format!("device_{}", index),
+                    sms_storage,
+                    index,
+                    self.force_uk_mcc_to_46001,
+                )
+                .await;
+                (com_port, result, sse, tc)
+            });
+        }
+
+        let mut reconnected = Vec::new();
+        while let Some((com_port, result, sse, tc)) = init_futs.next().await {
+            match result {
                 Ok((sim_id, modem, is_new)) => {
                     info!(
                         "Port {} reconnected with SIM {}. Promoting to active.",
@@ -799,8 +844,8 @@ impl ModemManager {
                         let handle = tokio::spawn(Self::run_urc_handler(
                             sim_id.clone(),
                             modem,
-                            sse_manager.clone(),
-                            transcribe_cfg.clone(),
+                            sse,
+                            tc,
                         ));
                         if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
                             old.abort();
@@ -809,10 +854,11 @@ impl ModemManager {
                     reconnected.push(com_port);
                 }
                 Err(e) => {
-                    log::debug!("Port {} still unavailable: {}", com_port, e);
+                    log::debug!("Port {} still unavailable after quick probe: {}", com_port, e);
                 }
             }
         }
+
         if !reconnected.is_empty() {
             let mut unavailable = self.unavailable_ports.write().await;
             unavailable.retain(|(p, _)| !reconnected.contains(p));

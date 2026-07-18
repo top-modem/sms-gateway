@@ -65,11 +65,17 @@ pub struct ModemManager {
     default_sms_storage: Option<SmsStorage>,
     /// Transient AT+CCID probe failures before a modem is considered truly unavailable.
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
+    /// True once the initial background modem initialization has completed.
+    initialization_complete: RwLock<bool>,
 }
 
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
 
 impl ModemManager {
+    pub async fn is_initialization_complete(&self) -> bool {
+        *self.initialization_complete.read().await
+    }
+
     async fn initialize_single_modem_safe(
         port: String,
         baud_rate: u32,
@@ -124,6 +130,7 @@ impl ModemManager {
             max_concurrent_modem_init: config.settings.max_concurrent_modem_init.unwrap_or(3),
             default_sms_storage: config.settings.sms_storage,
             sim_probe_fail_counts: RwLock::new(HashMap::new()),
+            initialization_complete: RwLock::new(false),
         }
     }
 
@@ -260,6 +267,12 @@ impl ModemManager {
         }
 
         self.start_urc_handlers(sse_manager, transcribe_cfg).await;
+
+        {
+            let mut complete = self.initialization_complete.write().await;
+            *complete = true;
+        }
+        log::info!("Modem initialization complete");
 
         Ok(())
     }

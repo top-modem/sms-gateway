@@ -283,6 +283,7 @@ const translations = {
     no_sim:                   'No SIM',
     unavailable:              'Unavailable',
     no_sim_cards:             'No SIM cards found',
+    initializing_modems:      'Initializing modems, please wait...',
     err_load_sim:             'Failed to load SIM data',
     err_service_toggle_failed:'Failed to change service status',
 
@@ -669,6 +670,7 @@ const translations = {
     no_sim:                   '无SIM卡',
     unavailable:              '不可用',
     no_sim_cards:             '未找到SIM卡',
+    initializing_modems:      '正在初始化调制解调器，请稍候...',
     err_load_sim:             '加载SIM数据失败',
     err_service_toggle_failed:'切换服务状态失败',
 

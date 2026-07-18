@@ -114,7 +114,7 @@ pub async fn run_api(
     let api = Router::new()
         .route("/check", get(check))
         .route("/diagnostics", get(diagnostics).with_state(modem_manager.clone()))
-        .route("/service/status", get(get_service_status))
+        .route("/service/status", get(get_service_status).with_state(modem_manager.clone()))
         .route("/service/start", post(start_service))
         .route("/service/stop", post(stop_service))
         .route("/sms", get(get_sms_paginated))
@@ -315,13 +315,16 @@ pub struct SmsQuery {
 #[derive(Serialize)]
 struct ServiceStatusResponse {
     running: bool,
+    initializing: bool,
 }
 
-async fn get_service_status() -> impl IntoResponse {
+async fn get_service_status(State(mm): State<ModemManagerRef>) -> impl IntoResponse {
+    let initializing = !mm.is_initialization_complete().await;
     (
         StatusCode::OK,
         Json(ServiceStatusResponse {
             running: service_control::is_running(),
+            initializing,
         }),
     )
 }
@@ -332,6 +335,7 @@ async fn start_service() -> impl IntoResponse {
         StatusCode::OK,
         Json(ServiceStatusResponse {
             running: true,
+            initializing: false,
         }),
     )
 }
@@ -342,6 +346,7 @@ async fn stop_service() -> impl IntoResponse {
         StatusCode::OK,
         Json(ServiceStatusResponse {
             running: false,
+            initializing: false,
         }),
     )
 }

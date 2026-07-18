@@ -128,6 +128,7 @@
   let hoveredRow = $state(null);
   let serviceRunning = $state(true);
   let serviceBusy = $state(false);
+  let initializing = $state(true);
 
   // ── Network status map ────────────────────────────────────────────────────
   const netStatusKeys = {
@@ -207,6 +208,7 @@
     try {
       const response = await apiClient.getServiceStatus();
       serviceRunning = !!(response?.data?.running ?? response?.running);
+      initializing = !!(response?.data?.initializing ?? response?.initializing);
     } catch {
       // keep last known state when status polling fails
     }
@@ -432,7 +434,11 @@
             <tr>
               <td colspan="13" class="px-6 py-12 text-center text-gray-400">
                 <Icon icon="carbon:sim-card" class="w-8 h-8 mx-auto mb-2 opacity-40" />
-                <p>{$t('no_sim_cards')}</p>
+                {#if initializing}
+                  <p>{$t('initializing_modems')}</p>
+                {:else}
+                  <p>{$t('no_sim_cards')}</p>
+                {/if}
               </td>
             </tr>
           {:else}

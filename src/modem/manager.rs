@@ -59,6 +59,10 @@ pub struct ModemManager {
     devices: Vec<crate::config::Device>,
     /// If true, UK MCC SIMs (234/235) will force COPS 46001 during SIM init.
     force_uk_mcc_to_46001: bool,
+    /// Number of modems to initialize in parallel (from config).
+    max_concurrent_modem_init: usize,
+    /// Default SMS storage location if not overridden per-device.
+    default_sms_storage: Option<SmsStorage>,
     /// Transient AT+CCID probe failures before a modem is considered truly unavailable.
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
 }
@@ -108,10 +112,33 @@ impl ModemManager {
         }
     }
 
-    pub async fn initialize(config: &crate::config::AppConfig) -> anyhow::Result<Self> {
-        let force_uk_mcc_to_46001 = config.settings.force_uk_mcc_to_46001.unwrap_or(true);
-        let max_concurrent = config.settings.max_concurrent_modem_init.unwrap_or(3);
-        
+    pub fn new(config: &crate::config::AppConfig) -> Self {
+        Self {
+            modems: Arc::new(RwLock::new(HashMap::new())),
+            sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
+            _initialization_semaphore: Arc::new(Semaphore::new(3)),
+            urc_tasks: RwLock::new(HashMap::new()),
+            unavailable_ports: RwLock::new(Vec::new()),
+            devices: config.devices.clone(),
+            force_uk_mcc_to_46001: config.settings.force_uk_mcc_to_46001.unwrap_or(true),
+            max_concurrent_modem_init: config.settings.max_concurrent_modem_init.unwrap_or(3),
+            default_sms_storage: config.settings.sms_storage,
+            sim_probe_fail_counts: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Initialize all configured modems and start their URC handlers.
+    /// This is intentionally run in the background so the HTTP API can start
+    /// immediately without waiting for slow/disconnected serial ports to time out.
+    pub async fn initialize_modems(
+        self: Arc<Self>,
+        sse_manager: Arc<SseManager>,
+        _webhook_manager: Option<webhook::WebhookManager>,
+        transcribe_cfg: Option<Arc<TranscribeConfig>>,
+    ) -> anyhow::Result<()> {
+        let force_uk_mcc_to_46001 = self.force_uk_mcc_to_46001;
+        let max_concurrent = self.max_concurrent_modem_init;
+
         // 0 or 1 = serial initialization (safest for USB hubs with shared resources)
         // 2+ = parallel initialization with semaphore to limit concurrent AT commands
         let is_serial = max_concurrent <= 1;
@@ -126,10 +153,10 @@ impl ModemManager {
             // many COM ports share the same USB hub / serial concentrator; issuing
             // AT commands to several ports at the same time causes command timeouts
             // and makes the service hang during startup.
-            for (index, device) in config.devices.iter().enumerate() {
+            for (index, device) in self.devices.iter().enumerate() {
                 let port = device.com_port.clone();
                 let baud_rate = device.baud_rate;
-                let sms_storage = device.sms_storage.or(config.settings.sms_storage);
+                let sms_storage = device.sms_storage.or(self.default_sms_storage);
                 let temp_device_id = format!("device_{}", index);
 
                 match Self::initialize_single_modem_safe(
@@ -160,10 +187,10 @@ impl ModemManager {
             let semaphore = Arc::new(Semaphore::new(max_concurrent));
             let mut init_futures = FuturesUnordered::new();
 
-            for (index, device) in config.devices.iter().enumerate() {
+            for (index, device) in self.devices.iter().enumerate() {
                 let port = device.com_port.clone();
                 let baud_rate = device.baud_rate;
-                let sms_storage = device.sms_storage.or(config.settings.sms_storage);
+                let sms_storage = device.sms_storage.or(self.default_sms_storage);
                 let temp_device_id = format!("device_{}", index);
                 let sem = semaphore.clone();
 
@@ -192,7 +219,7 @@ impl ModemManager {
                     }
                     Err(e) => {
                         error!("Failed to initialize modem on {}: {}", port, e);
-                        if let Some(device) = config.devices.iter().find(|d| d.com_port == port) {
+                        if let Some(device) = self.devices.iter().find(|d| d.com_port == port) {
                             unavailable_ports.push((port, device.baud_rate));
                         }
                     }
@@ -216,25 +243,25 @@ impl ModemManager {
             unavailable_ports.len()
         );
 
-        let manager = Self {
-            modems: Arc::new(RwLock::new(modems)),
-            sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
-            _initialization_semaphore: Arc::new(Semaphore::new(3)),
-            urc_tasks: RwLock::new(HashMap::new()),
-            unavailable_ports: RwLock::new(unavailable_ports),
-            devices: config.devices.clone(),
-            force_uk_mcc_to_46001,
-            sim_probe_fail_counts: RwLock::new(HashMap::new()),
-        };
-
-        manager.init_sim_cache().await?;
-        manager.cleanup_stale_sim_cards().await?;
-
-        if !new_sim_ids.is_empty() {
-            manager.init_new_sim_sms_data(new_sim_ids).await;
+        {
+            let mut self_modems = self.modems.write().await;
+            *self_modems = modems;
+        }
+        {
+            let mut self_unavailable = self.unavailable_ports.write().await;
+            *self_unavailable = unavailable_ports;
         }
 
-        Ok(manager)
+        self.init_sim_cache().await?;
+        self.cleanup_stale_sim_cards().await?;
+
+        if !new_sim_ids.is_empty() {
+            self.init_new_sim_sms_data(new_sim_ids).await;
+        }
+
+        self.start_urc_handlers(sse_manager, transcribe_cfg).await;
+
+        Ok(())
     }
 
     async fn initialize_single_modem(

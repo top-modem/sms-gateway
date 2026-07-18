@@ -80,18 +80,10 @@ async fn main() {
         }
     };
 
-    let modem_manager = match ModemManager::initialize(&config).await {
-        Ok(manager) => Arc::new(manager),
-        Err(err) => {
-            eprintln!("Failed to initialize ModemManager: {}", err);
-            std::process::exit(1);
-        }
-    };
-
+    let modem_manager = Arc::new(ModemManager::new(&config));
     let sse_manager = Arc::new(api::SseManager::new());
 
     let transcribe_cfg = TranscribeConfig::from_settings(&config.settings);
-    modem_manager.start_urc_handlers(sse_manager.clone(), transcribe_cfg.clone()).await;
 
     let webhook_manager = match config.settings.webhooks.clone() {
         Some(cfgs) => Some(webhook::start_webhook_worker_with_concurrency(
@@ -100,6 +92,20 @@ async fn main() {
         )),
         _ => None,
     };
+
+    // Start modem initialization in the background so the HTTP API can become
+    // available immediately, even when many COM ports are slow/disconnected.
+    {
+        let mm = modem_manager.clone();
+        let sse = sse_manager.clone();
+        let webhook = webhook_manager.clone();
+        let tc = transcribe_cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mm.initialize_modems(sse, webhook, tc).await {
+                log::error!("Failed to initialize modems: {}", e);
+            }
+        });
+    }
 
     tokio::spawn(read_sms_worker(
         modem_manager.clone(),

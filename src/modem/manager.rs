@@ -599,8 +599,9 @@ impl ModemManager {
     }
 
     /// Re-check all currently active modems for SIM insertion/removal.
-    /// Demotes real-ICCID modems where +CCID returns a different or missing ICCID.
-    /// Periodically attempts to reopen ports listed in `unavailable_ports`.
+    /// Demotes modems where AT+CPIN? reports the SIM is not ready, or where
+    /// +CCID returns a different or missing ICCID. Periodically attempts to
+    /// reopen ports listed in `unavailable_ports`.
     pub async fn recheck_fallback_modems(
         &self,
         sms_storage_map: &std::collections::HashMap<String, Option<crate::config::SmsStorage>>,
@@ -608,7 +609,7 @@ impl ModemManager {
         _webhook_manager: Option<webhook::WebhookManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
-        // ── Demotion: parallel AT+CCID on all real-ICCID modems ──────────────
+        // ── Demotion: parallel AT+CPIN? / AT+CCID on all active modems ────────
         let active_entries: Vec<(String, Arc<Modem>)> = {
             let modems = self.modems.read().await;
             modems
@@ -627,18 +628,43 @@ impl ModemManager {
         let mut demotion_futs = FuturesUnordered::new();
         for (iccid, modem) in active_entries {
             demotion_futs.push(async move {
+                // AT+CPIN? is the most reliable indicator of physical SIM presence.
+                // If the SIM is pulled out, the modem typically reports
+                // +CPIN: SIM REMOVED, +CME ERROR, or plain ERROR.
+                let status = modem.get_sim_status().await.ok().flatten();
+                let status_ready = status
+                    .as_deref()
+                    .map(|s| s.trim().eq_ignore_ascii_case("READY"))
+                    .unwrap_or(false);
+                if !status_ready {
+                    log::info!(
+                        "SIM status on {} is not READY (was {}, status={:?}). Treating as absent.",
+                        modem.com_port, iccid, status
+                    );
+                    return ProbeOutcome::MissingOrError {
+                        iccid,
+                        com_port: modem.com_port.clone(),
+                    };
+                }
+
                 match modem.get_sim_iccid().await {
-                    Ok(Some(current_iccid)) if current_iccid == iccid => ProbeOutcome::Healthy { iccid },
+                    Ok(Some(current_iccid)) if current_iccid == iccid => {
+                        ProbeOutcome::Healthy { iccid }
+                    }
                     Ok(Some(current_iccid)) => {
                         info!(
                             "SIM swap detected on {} (was {}, now {}). Forcing re-init.",
                             modem.com_port, iccid, current_iccid
                         );
-                        ProbeOutcome::Swap { iccid, com_port: modem.com_port.clone() }
+                        ProbeOutcome::Swap {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                        }
                     }
-                    _ => {
-                        ProbeOutcome::MissingOrError { iccid, com_port: modem.com_port.clone() }
-                    }
+                    _ => ProbeOutcome::MissingOrError {
+                        iccid,
+                        com_port: modem.com_port.clone(),
+                    },
                 }
             });
         }

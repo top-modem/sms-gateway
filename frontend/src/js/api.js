@@ -151,6 +151,14 @@ class ApiClient {
         return FetchApi.post(`/api/sims/${simId}/phone`, payload, {}, 'application/json');
     }
 
+    /**
+     * Force network registration (Quectel scancontrol/cops sequence) on selected SIMs.
+     * @param {string[]} simIds - SIM card IDs (ICCID)
+     */
+    async forceRegister(simIds) {
+        return FetchApi.post('/api/sims/force-register', { sim_ids: simIds }, {}, 'application/json');
+    }
+
     // ── 火狐狸 platform integration ─────────────────────────────────────────
 
     /**

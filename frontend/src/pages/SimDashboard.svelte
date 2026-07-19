@@ -235,6 +235,31 @@
     await Promise.all([fetchData(), fetchServiceStatus()]);
   }
 
+  // ── Force registration (强制注册) ─────────────────────────────────────────
+  let forceRegBusy    = $state(false);
+  let forceRegResults = $state(null);
+
+  async function forceRegister() {
+    if (selected.size === 0 || forceRegBusy) return;
+    forceRegBusy = true;
+    forceRegResults = null;
+    try {
+      const res = await apiClient.forceRegister([...selected]);
+      forceRegResults = res?.data?.results ?? res?.results ?? [];
+      // Refresh live data so network status reflects the new registration
+      fetchData();
+    } catch (e) {
+      forceRegResults = [{
+        sim_id: '',
+        com_port: '',
+        success: false,
+        message: e?.data?.error ?? e?.message ?? 'request failed',
+      }];
+    } finally {
+      forceRegBusy = false;
+    }
+  }
+
   let pollTimer;
   onMount(async () => {
     await refreshAll();
@@ -341,6 +366,18 @@
         {$t('btn_messages')}
       </button>
       <button
+        onclick={forceRegister}
+        disabled={selected.size === 0 || forceRegBusy}
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+               border border-gray-200 dark:border-zinc-700
+               text-gray-600 dark:text-gray-300
+               hover:bg-gray-50 dark:hover:bg-zinc-800 transition
+               disabled:opacity-60 disabled:cursor-not-allowed"
+      >
+        <Icon icon="carbon:network-3" class="w-4 h-4" />
+        {forceRegBusy ? $t('force_register_running') : $t('btn_force_register')}
+      </button>
+      <button
         onclick={() => { loading = true; error = ''; fetchData(); fetchServiceStatus(); }}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
@@ -377,6 +414,26 @@
       </button>
     </div>
   </header>
+
+  <!-- ── Force-register results ────────────────────────────────────────────── -->
+  {#if forceRegResults}
+    <div class="px-6 py-2 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800">
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        {#each forceRegResults as r}
+          <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded
+                       {r.success
+                         ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                         : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'}">
+            {r.com_port || r.sim_id || '?'}: {r.message}
+          </span>
+        {/each}
+        <button
+          onclick={() => forceRegResults = null}
+          class="ml-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+        >✕</button>
+      </div>
+    </div>
+  {/if}
 
   <!-- ── Table area ──────────────────────────────────────────────────────── -->
   <div class="flex-1 overflow-auto pb-10">

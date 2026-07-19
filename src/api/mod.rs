@@ -158,6 +158,10 @@ pub async fn run_api(
         .route("/sim-cards", get(get_all_sim_cards)) // 保留用于管理
         .route("/sims/stats", get(get_sim_sms_stats))
         .route(
+            "/sims/force-register",
+            post(force_register_sims).with_state(modem_manager.clone()),
+        )
+        .route(
             "/sims/{sim_id}/info",
             get(get_enhanced_sim_info).with_state(modem_manager.clone()),
         )
@@ -742,6 +746,54 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
 #[derive(Deserialize)]
 struct AtCommandRequest {
     command: String,
+}
+
+#[derive(Deserialize)]
+struct ForceRegisterRequest {
+    sim_ids: Vec<String>,
+}
+
+/// Force network registration (Quectel scancontrol/cops sequence) on the
+/// selected SIMs. Runs all selected modems concurrently; each modem's own
+/// command queue keeps its three commands strictly ordered.
+async fn force_register_sims(
+    State(modem_manager): State<ModemManagerRef>,
+    Json(request): Json<ForceRegisterRequest>,
+) -> Response {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    if request.sim_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "sim_ids is required"})),
+        )
+            .into_response();
+    }
+
+    let mut futs = FuturesUnordered::new();
+    for sim_id in request.sim_ids.clone() {
+        let mm = modem_manager.clone();
+        futs.push(async move {
+            let com_port = mm.get_modem(&sim_id).await.map(|m| m.com_port.clone());
+            let result = mm.force_register(&sim_id).await;
+            (sim_id, com_port, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some((sim_id, com_port, result)) = futs.next().await {
+        results.push(json!({
+            "sim_id": sim_id,
+            "com_port": com_port,
+            "success": result.is_ok(),
+            "message": match &result {
+                Ok(()) => "OK".to_string(),
+                Err(e) => e.clone(),
+            },
+        }));
+    }
+
+    (StatusCode::OK, Json(json!({ "results": results }))).into_response()
 }
 
 async fn send_at_command_handler(

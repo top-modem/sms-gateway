@@ -1372,6 +1372,15 @@ impl ModemManager {
         modem.send_command(command).await.map_err(Into::into)
     }
 
+    /// Force network registration (Quectel scancontrol/cops sequence) on a SIM.
+    pub async fn force_register(&self, sim_id: &str) -> Result<(), String> {
+        let modem = self
+            .get_modem(sim_id)
+            .await
+            .ok_or_else(|| format!("Modem not found for SIM ID: {}", sim_id))?;
+        modem.force_register().await
+    }
+
     pub async fn set_sms_storage(
         &self,
         sim_id: &str,

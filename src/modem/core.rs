@@ -794,6 +794,71 @@ impl Modem {
         }
     }
 
+    /// Send an AT command with a custom outer timeout. The command processor
+    /// still caps each attempt at 8s with retries; this only bounds the total wait.
+    async fn send_command_outer_timeout(&self, command: &str, timeout_secs: u64) -> io::Result<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
+
+        let at_command = ATCommand {
+            command: command.to_string(),
+            response_tx: tx,
+            _priority: 5,
+            retries: 0,
+        };
+
+        self.command_tx
+            .send(at_command)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Command queue closed"))?;
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Response channel closed",
+            )),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("AT command timed out after {}s", timeout_secs),
+            )),
+        }
+    }
+
+    /// Force network registration to China Unicom (46001) using the Quectel
+    /// scan-control + COPS sequence:
+    ///   1. AT+QOPSCFG="scancontrol",2,0,80,0
+    ///   2. AT+QCFG="cops_control",1
+    ///   3. AT+COPS=1,2,"46001",7
+    /// Steps are strictly ordered; the sequence aborts on the first failure.
+    pub async fn force_register(&self) -> Result<(), String> {
+        for (command, name) in [
+            ("AT+QOPSCFG=\"scancontrol\",2,0,80,0\r\n", "AT+QOPSCFG"),
+            ("AT+QCFG=\"cops_control\",1\r\n", "AT+QCFG"),
+        ] {
+            // Brief gap so the modem can apply the previous setting.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            self.send_command_with_ok(command)
+                .await
+                .map_err(|e| format!("{} failed: {}", name, e))?;
+            info!("[force_register] {} succeeded on {}", name, self.com_port);
+        }
+
+        // Manual operator selection may take a long time while the modem scans
+        // and registers; give it a longer outer timeout like send_cops_command.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let response = self
+            .send_command_outer_timeout("AT+COPS=1,2,\"46001\",7\r\n", 30)
+            .await
+            .map_err(|e| format!("AT+COPS failed: {}", e))?;
+        if !response.contains("OK") {
+            return Err(format!(
+                "AT+COPS failed: {}",
+                Self::format_log(&response)
+            ));
+        }
+        info!("[force_register] AT+COPS succeeded on {}", self.com_port);
+        Ok(())
+    }
+
     async fn send_command_priority(&self, command: &str, priority: u8) -> io::Result<String> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 

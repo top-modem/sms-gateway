@@ -39,10 +39,13 @@ pub async fn transcribe(
     // ── Step 2: ffmpeg AMR → 16 kHz mono WAV ─────────────────────────────────
     let ffmpeg_child = Command::new(ffmpeg_exe)
         .args([
-            "-y",               // overwrite output without asking
-            "-i", amr_path.to_str().unwrap(),
-            "-ar", "16000",     // 16 kHz sample rate (required by Whisper)
-            "-ac", "1",         // mono
+            "-y", // overwrite output without asking
+            "-i",
+            amr_path.to_str().unwrap(),
+            "-ar",
+            "16000", // 16 kHz sample rate (required by Whisper)
+            "-ac",
+            "1", // mono
             wav_path.to_str().unwrap(),
         ])
         .kill_on_drop(true)
@@ -52,7 +55,9 @@ pub async fn transcribe(
     let ffmpeg_out = match tokio::time::timeout(
         Duration::from_secs(60),
         ffmpeg_child.wait_with_output(),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             cleanup(&[&amr_path, &wav_path, &txt_path]).await;
@@ -79,11 +84,14 @@ pub async fn transcribe(
     let output_prefix_str = output_prefix.to_str().unwrap();
     let wav_str = wav_path.to_str().unwrap();
     let mut whisper_args: Vec<&str> = vec![
-        "-m", whisper_model,
-        "-f", wav_str,
-        "--output-txt",     // write transcript to <-of>.txt
-        "-nt",              // no timestamps in output
-        "-of", output_prefix_str,
+        "-m",
+        whisper_model,
+        "-f",
+        wav_str,
+        "--output-txt", // write transcript to <-of>.txt
+        "-nt",          // no timestamps in output
+        "-of",
+        output_prefix_str,
     ];
     if language != "auto" {
         whisper_args.push("-l");
@@ -98,7 +106,9 @@ pub async fn transcribe(
     let whisper_out = match tokio::time::timeout(
         Duration::from_secs(120),
         whisper_child.wait_with_output(),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             cleanup(&[&amr_path, &wav_path, &txt_path]).await;
@@ -133,7 +143,11 @@ async fn cleanup(paths: &[&PathBuf]) {
     for p in paths {
         if let Err(e) = tokio::fs::remove_file(p).await {
             // Non-fatal — just log at debug level
-            error!("transcribe: failed to delete temp file {}: {}", p.display(), e);
+            error!(
+                "transcribe: failed to delete temp file {}: {}",
+                p.display(),
+                e
+            );
         }
     }
 }

@@ -53,8 +53,15 @@ pub struct MmsRetrieveConf {
 /// Entry point: decode a raw M-Retrieve.conf byte buffer (the HTTP GET response
 /// body fetched from a WAP-push `content_location` URL).
 pub fn decode_retrieve_conf(data: &[u8]) -> Result<MmsRetrieveConf> {
-    anyhow::ensure!(data.len() >= 2, "M-Retrieve.conf too short ({} bytes)", data.len());
-    anyhow::ensure!(data[0] == HDR_MESSAGE_TYPE, "missing X-Mms-Message-Type header");
+    anyhow::ensure!(
+        data.len() >= 2,
+        "M-Retrieve.conf too short ({} bytes)",
+        data.len()
+    );
+    anyhow::ensure!(
+        data[0] == HDR_MESSAGE_TYPE,
+        "missing X-Mms-Message-Type header"
+    );
     anyhow::ensure!(
         data[1] == MMS_MSG_TYPE_RETRIEVE_CONF,
         "not a m-retrieve-conf PDU (type=0x{:02X})",
@@ -108,7 +115,10 @@ pub fn decode_retrieve_conf(data: &[u8]) -> Result<MmsRetrieveConf> {
         match step {
             Some(n) if pos + n <= data.len() => pos += n,
             _ => {
-                log::debug!("M-Retrieve.conf header 0x{:02X} failed to parse, stopping header scan", field);
+                log::debug!(
+                    "M-Retrieve.conf header 0x{:02X} failed to parse, stopping header scan",
+                    field
+                );
                 break;
             }
         }
@@ -122,7 +132,11 @@ pub fn decode_retrieve_conf(data: &[u8]) -> Result<MmsRetrieveConf> {
     let parts = decode_message_body(&data[pos..]).context("failed to decode MMS message body")?;
     anyhow::ensure!(!parts.is_empty(), "MMS message body contained no parts");
 
-    Ok(MmsRetrieveConf { subject, from, parts })
+    Ok(MmsRetrieveConf {
+        subject,
+        from,
+        parts,
+    })
 }
 
 /// Generic WSP field `Value` decode (WAP-230-WSP §8.4.2.1): distinguishes the
@@ -185,7 +199,10 @@ fn decode_encoded_string(bytes: &[u8]) -> Option<String> {
             if let Some(span) = bytes.get(n..n + len as usize) {
                 if let Some((_charset, cn)) = read_short_or_long_integer(span) {
                     if let Some(text_bytes) = span.get(cn..) {
-                        let nul = text_bytes.iter().position(|&b| b == 0).unwrap_or(text_bytes.len());
+                        let nul = text_bytes
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(text_bytes.len());
                         return Some(String::from_utf8_lossy(&text_bytes[..nul]).into_owned());
                     }
                 }
@@ -204,7 +221,10 @@ fn decode_encoded_text_header(data: &[u8]) -> Option<(Option<String>, usize)> {
         WspFieldValue::Long(bytes) => {
             let (_charset, n) = read_short_or_long_integer(bytes)?;
             let text_bytes = bytes.get(n..)?;
-            let nul = text_bytes.iter().position(|&b| b == 0).unwrap_or(text_bytes.len());
+            let nul = text_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(text_bytes.len());
             Some(String::from_utf8_lossy(&text_bytes[..nul]).into_owned())
         }
         WspFieldValue::Short(_) => None,
@@ -258,11 +278,15 @@ fn decode_content_type_value(data: &[u8]) -> Option<(String, usize)> {
 /// WSP multipart entries (WAP-230-WSP §8.5.2); otherwise the whole remainder
 /// is treated as a single part (a valid, if rare, single-part MMS).
 fn decode_message_body(data: &[u8]) -> Result<Vec<MmsRetrievePart>> {
-    anyhow::ensure!(!data.is_empty() && data[0] == HDR_CONTENT_TYPE, "expected Content-Type header");
+    anyhow::ensure!(
+        !data.is_empty() && data[0] == HDR_CONTENT_TYPE,
+        "expected Content-Type header"
+    );
     let mut pos = 1usize;
 
-    let (top_level_mime, ct_consumed) = decode_content_type_value(data.get(pos..).context("truncated Content-Type value")?)
-        .context("failed to decode top-level Content-Type value")?;
+    let (top_level_mime, ct_consumed) =
+        decode_content_type_value(data.get(pos..).context("truncated Content-Type value")?)
+            .context("failed to decode top-level Content-Type value")?;
     pos += ct_consumed;
 
     if !top_level_mime.contains("multipart") {
@@ -276,7 +300,8 @@ fn decode_message_body(data: &[u8]) -> Result<Vec<MmsRetrievePart>> {
     // Number of parts (Uintvar). Later specs set this to 0 and expect the
     // reader to just iterate entries until the data runs out, so the value
     // itself is not relied upon -- only its encoded length matters here.
-    let (_n_entries, n) = read_uintvar(data.get(pos..).context("truncated multipart entry count")?)?;
+    let (_n_entries, n) =
+        read_uintvar(data.get(pos..).context("truncated multipart entry count")?)?;
     pos += n;
 
     let mut parts = Vec::new();
@@ -294,15 +319,26 @@ fn decode_message_body(data: &[u8]) -> Result<Vec<MmsRetrievePart>> {
             "multipart entry length out of bounds"
         );
 
-        let (content_type, ct_consumed) = decode_content_type_value(&data[entry_start..entry_start + headers_len])
-            .with_context(|| format!("failed to decode multipart entry #{} content-type", parts.len()))?;
+        let (content_type, ct_consumed) = decode_content_type_value(
+            &data[entry_start..entry_start + headers_len],
+        )
+        .with_context(|| {
+            format!(
+                "failed to decode multipart entry #{} content-type",
+                parts.len()
+            )
+        })?;
         let part_headers = &data[entry_start + ct_consumed..entry_start + headers_len];
         let filename = extract_part_filename(part_headers);
 
         let body_start = entry_start + headers_len;
         let body = data[body_start..body_start + body_len].to_vec();
 
-        parts.push(MmsRetrievePart { content_type, filename, data: body });
+        parts.push(MmsRetrievePart {
+            content_type,
+            filename,
+            data: body,
+        });
         pos = body_start + body_len;
     }
 

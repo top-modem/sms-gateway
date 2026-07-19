@@ -1,11 +1,11 @@
-﻿use chrono::{Timelike, Utc};
+use chrono::{Timelike, Utc};
 use log::{debug, error, info, warn};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 use crate::api::SseManager;
@@ -48,7 +48,12 @@ const ERROR_TERMINATORS: &[&[u8]] = &[b"\r\n+CME ERROR", b"\r\n+CMS ERROR"];
 /// were accepted as a terminator here, the raw response would be dispatched
 /// with just `"CONNECT\r\n"` and no payload, well before the download actually
 /// completes.
-const RAW_TERMINATORS: &[&[u8]] = &[b"\r\nOK\r\n", b"\r\nERROR\r\n", b"\r\n+CME ERROR", b"\r\n+CMS ERROR"];
+const RAW_TERMINATORS: &[&[u8]] = &[
+    b"\r\nOK\r\n",
+    b"\r\nERROR\r\n",
+    b"\r\n+CME ERROR",
+    b"\r\n+CMS ERROR",
+];
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -98,7 +103,8 @@ pub struct Modem {
     /// Oneshot sender for the in-flight MMS content fetch, resolved by the URC handler
     /// when the modem emits the async `+QHTTPGET: <err>,<httprsp>,<content_length>`
     /// completion notification.
-    pending_http_get: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32, i64)>>>>,
+    pending_http_get:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32, i64)>>>>,
     /// Oneshot sender for the in-flight `AT+QHTTPREADFILE`, resolved by the URC handler
     /// when the modem emits the async `+QHTTPREADFILE: <err>` completion notification.
     /// `AT+QHTTPREADFILE` returns `OK` as soon as the command is accepted, not once the
@@ -123,7 +129,10 @@ impl Modem {
 
         let write_half = Arc::new(Mutex::new(Some(write_half_stream)));
         let connection_state = Arc::new(RwLock::new(ConnectionState::Connected));
-        let reader_state = Arc::new(Mutex::new(ReaderState { response_tx: None, raw_response_tx: None }));
+        let reader_state = Arc::new(Mutex::new(ReaderState {
+            response_tx: None,
+            raw_response_tx: None,
+        }));
 
         // Spawn background reader task — owns ReadHalf, routes bytes to commands or URC channel
         let reader_task = tokio::spawn({
@@ -135,8 +144,14 @@ impl Modem {
             let com_port_c = com_port.to_string();
             async move {
                 Self::reader_task_main(
-                    read_half, reader_state, urc_tx, write_half,
-                    name_c, com_port_c, baud_rate, connection_state,
+                    read_half,
+                    reader_state,
+                    urc_tx,
+                    write_half,
+                    name_c,
+                    com_port_c,
+                    baud_rate,
+                    connection_state,
                 )
                 .await;
             }
@@ -177,7 +192,6 @@ impl Modem {
             pending_http_readfile: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
-
 }
 
 impl Drop for Modem {
@@ -187,14 +201,10 @@ impl Drop for Modem {
     }
 }
 
-
 impl Modem {
     const SERIAL_OPEN_TIMEOUT_SECS: u64 = 20;
 
-    async fn create_serial_connection(
-        com_port: &str,
-        baud_rate: u32,
-    ) -> io::Result<SerialStream> {
+    async fn create_serial_connection(com_port: &str, baud_rate: u32) -> io::Result<SerialStream> {
         let port_name = com_port.to_string();
         let port_name_for_err = port_name.clone();
         let open_task = tokio::task::spawn_blocking(move || {
@@ -205,8 +215,11 @@ impl Modem {
                 .map_err(|e| io::Error::other(format!("Failed to open {}: {}", port_name, e)))
         });
 
-        match tokio::time::timeout(Duration::from_secs(Self::SERIAL_OPEN_TIMEOUT_SECS), open_task)
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(Self::SERIAL_OPEN_TIMEOUT_SECS),
+            open_task,
+        )
+        .await
         {
             Ok(joined) => match joined {
                 Ok(result) => result,
@@ -288,7 +301,8 @@ impl Modem {
         }
 
         let upper = response.to_uppercase();
-        if upper.contains("+CPIN:") && !upper.contains("REMOVED") && !upper.contains("NOT INSERTED") {
+        if upper.contains("+CPIN:") && !upper.contains("REMOVED") && !upper.contains("NOT INSERTED")
+        {
             return true;
         }
         // A plain OK with no CPIN info is unusual for a modem; still treat it as
@@ -318,12 +332,19 @@ impl Modem {
                 Ok(0) => {
                     error!("Reader [{}]: EOF on serial port", name);
                     let ok = Self::reader_do_reconnect(
-                        &mut read_half, &write_half, &reader_state,
-                        &com_port, baud_rate, &connection_state, &name,
+                        &mut read_half,
+                        &write_half,
+                        &reader_state,
+                        &com_port,
+                        baud_rate,
+                        &connection_state,
+                        &name,
                     )
                     .await;
                     line_buf.clear();
-                    if !ok { break; }
+                    if !ok {
+                        break;
+                    }
                 }
                 Ok(n) => {
                     line_buf.extend_from_slice(&raw_buf[..n]);
@@ -348,12 +369,19 @@ impl Modem {
                 Err(e) => {
                     error!("Reader [{}]: read error: {}", name, e);
                     let ok = Self::reader_do_reconnect(
-                        &mut read_half, &write_half, &reader_state,
-                        &com_port, baud_rate, &connection_state, &name,
+                        &mut read_half,
+                        &write_half,
+                        &reader_state,
+                        &com_port,
+                        baud_rate,
+                        &connection_state,
+                        &name,
                     )
                     .await;
                     line_buf.clear();
-                    if !ok { break; }
+                    if !ok {
+                        break;
+                    }
                 }
             }
         }
@@ -432,7 +460,10 @@ impl Modem {
                     let end = if ERROR_TERMINATORS.contains(&term) {
                         let after_prefix = pos + term.len();
                         // Look for the trailing \r\n to capture the complete error line
-                        if let Some(rn_pos) = line_buf[after_prefix..].windows(2).position(|w| w == b"\r\n") {
+                        if let Some(rn_pos) = line_buf[after_prefix..]
+                            .windows(2)
+                            .position(|w| w == b"\r\n")
+                        {
                             after_prefix + rn_pos + 2
                         } else {
                             // Trailing \r\n not yet received — wait for more data
@@ -547,7 +578,10 @@ impl Modem {
         } // write_guard drops here, releasing the write lock before waiting for response
         match tokio::time::timeout(timeout_dur, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "Reader channel closed")),
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Reader channel closed",
+            )),
             Err(_) => {
                 reader_state.lock().await.response_tx = None;
                 Err(io::Error::new(
@@ -560,7 +594,11 @@ impl Modem {
 
     /// Forward any call-state URC lines embedded inside a command response buffer.
     /// EC20F modems can include e.g. `NO CARRIER` before `OK` in the ATH response.
-    fn forward_embedded_call_urcs(response: &str, urc_tx: &mpsc::UnboundedSender<String>, name: &str) {
+    fn forward_embedded_call_urcs(
+        response: &str,
+        urc_tx: &mpsc::UnboundedSender<String>,
+        name: &str,
+    ) {
         for line in response.split("\r\n") {
             let trimmed = line.trim();
             if matches!(trimmed, "NO CARRIER" | "BUSY" | "RING" | "CONNECT")
@@ -669,11 +707,17 @@ impl Modem {
 
         let iccid = iccid_result.ok().flatten();
         let imsi = imsi_result.ok().flatten();
-        let phone_number = phone_result.ok().flatten();
+        // Normalize the modem-reported MSISDN before storing: digits only,
+        // no `+` prefix, no leading zeros.
+        let phone_number = phone_result
+            .ok()
+            .flatten()
+            .map(|p| crate::phone_number::normalize_msisdn(&p))
+            .filter(|p| !p.is_empty());
         let should_force_china_unicom = self.force_uk_mcc_to_46001
             && imsi
-            .as_deref()
-            .is_some_and(|v| v.starts_with("234") || v.starts_with("235"));
+                .as_deref()
+                .is_some_and(|v| v.starts_with("234") || v.starts_with("235"));
 
         if let Some(iccid) = iccid {
             match SimCard::find_or_create_with_phone(&iccid, imsi.clone(), phone_number).await {
@@ -696,7 +740,8 @@ impl Modem {
                         if let Err(e) = self.send_cops_command().await {
                             log::warn!(
                                 "Failed to force operator 46001 for UK MCC SIM on device {}: {}",
-                                self.name, e
+                                self.name,
+                                e
                             );
                         } else {
                             info!(
@@ -738,7 +783,10 @@ impl Modem {
         // Use 20-second timeout instead of default 8 seconds.
         match tokio::time::timeout(Duration::from_secs(20), rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "Response channel closed")),
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Response channel closed",
+            )),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "AT+COPS command timed out after 20s",
@@ -809,14 +857,21 @@ impl Modem {
             Err(_) => return Err(anyhow::anyhow!("Timeout waiting for SMS prompt")),
         };
         if !prompt.contains("> ") {
-            return Err(anyhow::anyhow!("SMS prompt not received: {}", Self::format_log(&prompt)));
+            return Err(anyhow::anyhow!(
+                "SMS prompt not received: {}",
+                Self::format_log(&prompt)
+            ));
         }
 
         // Step 2: Send PDU + Ctrl-Z and wait for +CMGS:/OK.
         // Use a 30-second timeout — network transmission can be slow.
         let (tx2, rx2) = tokio::sync::oneshot::channel::<io::Result<String>>();
         self.reader_state.lock().await.response_tx = Some(tx2);
-        debug!("TX [{}]: <PDU {} bytes + Ctrl-Z>", self.name, pdu_hex.len() / 2);
+        debug!(
+            "TX [{}]: <PDU {} bytes + Ctrl-Z>",
+            self.name,
+            pdu_hex.len() / 2
+        );
         write.write_all(full_pdu.as_bytes()).await?;
         write.flush().await?;
         let final_response = match tokio::time::timeout(Duration::from_secs(30), rx2).await {
@@ -876,7 +931,8 @@ impl Modem {
         // Use contact.id if it looks like a phone number (starts with + or is all digits),
         // otherwise fall back to contact.name (contacts auto-created from received SMS
         // store the phone number in the name field with a UUID as the id).
-        let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit()) {
+        let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit())
+        {
             contact.id.clone()
         } else {
             contact.name.clone()
@@ -975,12 +1031,17 @@ impl Modem {
         // ── Upload received SMS to 火狐狸 platform ────────────────
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
         if sim_id.is_empty() {
-            log::warn!("Skipping 火狐狸 SMS upload: SIM ID is empty on device {}", self.name);
+            log::warn!(
+                "Skipping 火狐狸 SMS upload: SIM ID is empty on device {}",
+                self.name
+            );
         } else {
             match SimCard::query_all().await {
                 Ok(cards) => {
                     if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
-                        if let (Some(country_id), Some(phone_num)) = (&card.country_code, &card.phone_number) {
+                        if let (Some(country_id), Some(phone_num)) =
+                            (&card.country_code, &card.phone_number)
+                        {
                             match crate::db::AppSetting::get("firefox_api_key").await {
                                 Ok(Some(api_key)) => {
                                     match reqwest::Client::builder()
@@ -1019,7 +1080,8 @@ impl Modem {
                                                             resp.data
                                                         );
 
-                                                        let response_json = serde_json::to_string(&resp).ok();
+                                                        let response_json =
+                                                            serde_json::to_string(&resp).ok();
                                                         if let Err(e) = crate::db::Sms::mark_uploaded_by_phone_message(
                                                             phone_num,
                                                             &sim_id,
@@ -1035,7 +1097,7 @@ impl Modem {
                                                             );
                                                         }
                                                     }
-                                                     Ok(resp) => {
+                                                    Ok(resp) => {
                                                         // Enqueue for retry instead of just logging
                                                         log::warn!(
                                                             "[{}] Failed to upload incoming SMS to 火狐狸 (platform rejected): phone={}, code={}, data={:?}",
@@ -1045,7 +1107,8 @@ impl Modem {
                                                             resp.data
                                                         );
 
-                                                        let response_json = serde_json::to_string(&resp).ok();
+                                                        let response_json =
+                                                            serde_json::to_string(&resp).ok();
                                                         if let Err(e) = crate::db::Sms::mark_platform_attempt_by_phone_message(
                                                             phone_num,
                                                             &sim_id,
@@ -1126,7 +1189,8 @@ impl Modem {
                                                             e
                                                         );
 
-                                                        let error_message = format!("Auto-upload failed: {}", e);
+                                                        let error_message =
+                                                            format!("Auto-upload failed: {}", e);
                                                         if let Err(mark_err) = crate::db::Sms::mark_platform_attempt_by_phone_message(
                                                             phone_num,
                                                             &sim_id,
@@ -1198,7 +1262,7 @@ impl Modem {
                                                 sim_id,
                                                 e
                                             );
-                                            
+
                                             // Enqueue all SMS for retry when HTTP client fails
                                             for sms in &sms_list {
                                                 if sms.send {
@@ -1239,7 +1303,7 @@ impl Modem {
                                                     format!("HTTP client build failed: {}", e),
                                                     None,
                                                 );
-                                                
+
                                                 if let Ok(pool) = crate::db::get_pool() {
                                                     if let Err(enqueue_err) = crate::firefox_upload_retry::FirefoxUploadRetryItem::insert(pool, &retry_item).await {
                                                         log::error!(
@@ -1316,8 +1380,13 @@ impl Modem {
         // the modem (this is our only chance -- there is no "leave undeleted for
         // retry" option like a ModemManager-based stack would have).
         for candidate in mms_candidates {
-            if let Err(e) = crate::mms_wap::handle_notification_candidate(&sim_id, candidate).await {
-                log::warn!("[{}] Failed to process MMS WAP-push notification: {}", sim_id, e);
+            if let Err(e) = crate::mms_wap::handle_notification_candidate(&sim_id, candidate).await
+            {
+                log::warn!(
+                    "[{}] Failed to process MMS WAP-push notification: {}",
+                    sim_id,
+                    e
+                );
             }
         }
         Ok((sms_list, mms_found))
@@ -1387,7 +1456,10 @@ impl Modem {
     ) -> io::Result<Option<NetworkRegistrationStatus>> {
         // Try AT+CEREG? (EPS/LTE registration) first; fall back to AT+CREG? (CS)
         if let Ok(Some(status)) = self
-            .get_modem_info("AT+CEREG?\r\n", NetworkRegistrationStatus::from_cereg_response)
+            .get_modem_info(
+                "AT+CEREG?\r\n",
+                NetworkRegistrationStatus::from_cereg_response,
+            )
             .await
         {
             return Ok(Some(status));
@@ -1478,7 +1550,11 @@ impl Modem {
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 2 {
                     let number = parts[1].trim().trim_matches('"').to_string();
-                    if number.is_empty() { None } else { Some(number) }
+                    if number.is_empty() {
+                        None
+                    } else {
+                        Some(number)
+                    }
                 } else {
                     None
                 }
@@ -1497,7 +1573,8 @@ impl Modem {
         contact: &Contact,
         message: &str,
     ) -> anyhow::Result<(i64, String)> {
-        let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit()) {
+        let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit())
+        {
             contact.id.clone()
         } else {
             contact.name.clone()
@@ -1651,7 +1728,8 @@ impl Modem {
 
     /// Initiate an outbound voice call. The trailing `;` keeps AT command mode active.
     pub async fn make_call(&self, phone: &str) -> io::Result<()> {
-        self.send_command_with_ok(&format!("ATD{};\r\n", phone)).await?;
+        self.send_command_with_ok(&format!("ATD{};\r\n", phone))
+            .await?;
         Ok(())
     }
 
@@ -1686,7 +1764,10 @@ impl Modem {
                 let parts: Vec<&str> = after_prefix.split(',').collect();
                 if parts.len() >= 2 {
                     let raw = parts[1].trim().trim_matches('"');
-                    if raw.chars().all(|c| c.is_ascii_hexdigit()) && raw.len() % 4 == 0 && raw.len() >= 4 {
+                    if raw.chars().all(|c| c.is_ascii_hexdigit())
+                        && raw.len() % 4 == 0
+                        && raw.len() >= 4
+                    {
                         ucs2_hex_to_string(raw)
                     } else {
                         raw.to_string()
@@ -1757,7 +1838,10 @@ impl Modem {
         let raw = match tokio::time::timeout(Duration::from_secs(60), raw_rx).await {
             Ok(Ok(result)) => result?,
             Ok(Err(_)) => {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Reader channel closed"))
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Reader channel closed",
+                ))
             }
             Err(_) => {
                 self.reader_state.lock().await.raw_response_tx = None;
@@ -1874,7 +1958,8 @@ impl Modem {
     ) -> anyhow::Result<()> {
         self.send_command_with_ok(&format!("AT+QICSGP=1,1,\"{}\",\"\",\"\",0\r\n", apn))
             .await?;
-        self.send_command_with_ok("AT+QMMSCFG=\"contextid\",1\r\n").await?;
+        self.send_command_with_ok("AT+QMMSCFG=\"contextid\",1\r\n")
+            .await?;
         self.send_command_with_ok(&format!("AT+QMMSCFG=\"mmsc\",\"{}\"\r\n", mmsc))
             .await?;
         self.send_command_with_ok(&format!(
@@ -2001,7 +2086,12 @@ impl Modem {
 
     /// Called by the URC handler when a `+QHTTPGET: <err>,<httprsp>,<content_length>`
     /// notification arrives.
-    pub async fn resolve_http_get_completion(&self, err_code: i32, http_code: i32, content_length: i64) {
+    pub async fn resolve_http_get_completion(
+        &self,
+        err_code: i32,
+        http_code: i32,
+        content_length: i64,
+    ) {
         if let Some(tx) = self.pending_http_get.lock().await.take() {
             let _ = tx.send((err_code, http_code, content_length));
         }
@@ -2036,10 +2126,17 @@ impl Modem {
     /// if the actual write hasn't finished yet -- observed on real hardware for MMS
     /// content in the 100KB+ range (small content_location bodies complete fast enough
     /// that the race is rarely hit).
-    async fn readfile_then_download(&self, ram_file: &str, timeout_secs: u64) -> anyhow::Result<Vec<u8>> {
+    async fn readfile_then_download(
+        &self,
+        ram_file: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<Vec<u8>> {
         let waiter = self.take_http_readfile_waiter().await;
         if let Err(e) = self
-            .send_command_with_ok(&format!("AT+QHTTPREADFILE=\"{}\",{}\r\n", ram_file, timeout_secs))
+            .send_command_with_ok(&format!(
+                "AT+QHTTPREADFILE=\"{}\",{}\r\n",
+                ram_file, timeout_secs
+            ))
             .await
         {
             *self.pending_http_readfile.lock().await = None;
@@ -2049,16 +2146,23 @@ impl Modem {
         match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), waiter).await {
             Ok(Ok(0)) => {}
             Ok(Ok(err_code)) => {
-                return Err(anyhow::anyhow!("AT+QHTTPREADFILE completed with err={}", err_code));
+                return Err(anyhow::anyhow!(
+                    "AT+QHTTPREADFILE completed with err={}",
+                    err_code
+                ));
             }
             Ok(Err(_)) => return Err(anyhow::anyhow!("QHTTPREADFILE completion channel closed")),
             Err(_) => {
                 *self.pending_http_readfile.lock().await = None;
-                return Err(anyhow::anyhow!("Timed out waiting for +QHTTPREADFILE completion"));
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for +QHTTPREADFILE completion"
+                ));
             }
         }
 
-        self.download_file(ram_file).await.map_err(anyhow::Error::from)
+        self.download_file(ram_file)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     /// Parse a `+QHTTPGET: <err>[,<httprsp>,<content_length>]` URC line. On
@@ -2104,7 +2208,9 @@ impl Modem {
             Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
             Err(_) => {
                 self.reader_state.lock().await.response_tx = None;
-                return Err(anyhow::anyhow!("Timeout waiting for QHTTPURL CONNECT prompt"));
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for QHTTPURL CONNECT prompt"
+                ));
             }
         };
         if !prompt.contains("CONNECT") {
@@ -2119,15 +2225,16 @@ impl Modem {
         debug!("TX [{}]: <QHTTPURL {} bytes>", self.name, url.len());
         write.write_all(url.as_bytes()).await?;
         write.flush().await?;
-        let final_response = match tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), rx2).await {
-            Ok(Ok(Ok(r))) => r,
-            Ok(Ok(Err(e))) => return Err(e.into()),
-            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
-            Err(_) => {
-                self.reader_state.lock().await.response_tx = None;
-                return Err(anyhow::anyhow!("Timeout waiting for QHTTPURL completion"));
-            }
-        };
+        let final_response =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), rx2).await {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(e))) => return Err(e.into()),
+                Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+                Err(_) => {
+                    self.reader_state.lock().await.response_tx = None;
+                    return Err(anyhow::anyhow!("Timeout waiting for QHTTPURL completion"));
+                }
+            };
 
         if final_response.contains("OK\r\n") {
             Ok(())
@@ -2144,13 +2251,21 @@ impl Modem {
         let (scheme, rest) = url
             .split_once("://")
             .ok_or_else(|| anyhow::anyhow!("MMS content URL is missing a scheme: {}", url))?;
-        anyhow::ensure!(scheme.eq_ignore_ascii_case("http"), "unsupported MMS URL scheme: {}", scheme);
+        anyhow::ensure!(
+            scheme.eq_ignore_ascii_case("http"),
+            "unsupported MMS URL scheme: {}",
+            scheme
+        );
 
         let (authority, path) = match rest.find('/') {
             Some(pos) => (&rest[..pos], &rest[pos..]),
             None => (rest, "/"),
         };
-        anyhow::ensure!(!authority.is_empty(), "MMS content URL has an empty host: {}", url);
+        anyhow::ensure!(
+            !authority.is_empty(),
+            "MMS content URL has an empty host: {}",
+            url
+        );
 
         let (host, port) = match authority.rsplit_once(':') {
             Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
@@ -2173,7 +2288,11 @@ impl Modem {
     /// `AT+QHTTPURL`, see `fetch_mms_content_via_requestheader`) targets the proxy.
     fn build_requestheader_get(url: &str) -> anyhow::Result<String> {
         let (host, port, _path) = Self::parse_http_url(url)?;
-        let authority = if port == 80 { host.clone() } else { format!("{}:{}", host, port) };
+        let authority = if port == 80 {
+            host.clone()
+        } else {
+            format!("{}:{}", host, port)
+        };
 
         Ok(format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nX-Online-Host: {}\r\nProxy-Connection: Keep-Alive\r\nConnection: Keep-Alive\r\n\r\n",
@@ -2243,7 +2362,9 @@ impl Modem {
             Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
             Err(_) => {
                 self.reader_state.lock().await.response_tx = None;
-                return Err(anyhow::anyhow!("Timeout waiting for QHTTPGET requestheader prompt"));
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for QHTTPGET requestheader prompt"
+                ));
             }
         };
         if !prompt.contains("CONNECT") && !prompt.contains("> ") {
@@ -2268,15 +2389,18 @@ impl Modem {
         // it here would deadlock that task against ourselves.
         drop(write_guard);
 
-        let final_response = match tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), rx2).await {
-            Ok(Ok(Ok(r))) => r,
-            Ok(Ok(Err(e))) => return Err(e.into()),
-            Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
-            Err(_) => {
-                self.reader_state.lock().await.response_tx = None;
-                return Err(anyhow::anyhow!("Timeout waiting for QHTTPGET requestheader completion"));
-            }
-        };
+        let final_response =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs.max(10)), rx2).await {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(e))) => return Err(e.into()),
+                Ok(Err(_)) => return Err(anyhow::anyhow!("Reader channel closed")),
+                Err(_) => {
+                    self.reader_state.lock().await.response_tx = None;
+                    return Err(anyhow::anyhow!(
+                        "Timeout waiting for QHTTPGET requestheader completion"
+                    ));
+                }
+            };
 
         if !final_response.contains("OK\r\n") {
             return Err(anyhow::anyhow!(
@@ -2291,7 +2415,9 @@ impl Modem {
                 Ok(Err(_)) => return Err(anyhow::anyhow!("HTTP GET completion channel closed")),
                 Err(_) => {
                     *self.pending_http_get.lock().await = None;
-                    return Err(anyhow::anyhow!("Timed out waiting for +QHTTPGET completion"));
+                    return Err(anyhow::anyhow!(
+                        "Timed out waiting for +QHTTPGET completion"
+                    ));
                 }
             };
 
@@ -2303,7 +2429,10 @@ impl Modem {
             ));
         }
         if !(200..300).contains(&http_code) {
-            return Err(anyhow::anyhow!("MMS content fetch HTTP error: {}", http_code));
+            return Err(anyhow::anyhow!(
+                "MMS content fetch HTTP error: {}",
+                http_code
+            ));
         }
 
         let port_tag: String = self
@@ -2312,11 +2441,11 @@ impl Modem {
             .filter(|c| c.is_ascii_alphanumeric())
             .collect();
         let ram_file = format!("RAM:mmsdl_hdr_{}.bin", port_tag);
-        let result = self
-            .readfile_then_download(&ram_file, timeout_secs)
-            .await;
+        let result = self.readfile_then_download(&ram_file, timeout_secs).await;
 
-        let _ = self.send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_file)).await;
+        let _ = self
+            .send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_file))
+            .await;
         result
     }
 
@@ -2422,10 +2551,14 @@ impl Modem {
             let (err_code, http_code, _content_length) =
                 match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), waiter).await {
                     Ok(Ok(result)) => result,
-                    Ok(Err(_)) => return Err(anyhow::anyhow!("HTTP GET completion channel closed")),
+                    Ok(Err(_)) => {
+                        return Err(anyhow::anyhow!("HTTP GET completion channel closed"))
+                    }
                     Err(_) => {
                         *self.pending_http_get.lock().await = None;
-                        return Err(anyhow::anyhow!("Timed out waiting for +QHTTPGET completion"));
+                        return Err(anyhow::anyhow!(
+                            "Timed out waiting for +QHTTPGET completion"
+                        ));
                     }
                 };
 
@@ -2437,13 +2570,18 @@ impl Modem {
                 ));
             }
             if !(200..300).contains(&http_code) {
-                return Err(anyhow::anyhow!("MMS content fetch HTTP error: {}", http_code));
+                return Err(anyhow::anyhow!(
+                    "MMS content fetch HTTP error: {}",
+                    http_code
+                ));
             }
 
             let result = self.readfile_then_download(&ram_file, timeout_secs).await;
 
             // Best-effort cleanup regardless of outcome — free RAM storage.
-            let _ = self.send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_file)).await;
+            let _ = self
+                .send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_file))
+                .await;
 
             result
         }
@@ -2498,7 +2636,11 @@ impl Modem {
         let start = rest.find('"')? + 1;
         let end = rest[start..].find('"')?;
         let number = &rest[start..start + end];
-        if number.is_empty() { None } else { Some(number.to_string()) }
+        if number.is_empty() {
+            None
+        } else {
+            Some(number.to_string())
+        }
     }
 }
 

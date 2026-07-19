@@ -1,13 +1,12 @@
+use crate::db;
 /// Background worker that retries failed 火狐狸 SMS uploads
 /// This worker:
 /// 1. Polls the retry queue every 10 seconds
 /// 2. Retries uploads that are ready (next_retry_at <= now)
 /// 3. Uses exponential backoff (5s, 10s, 20s, 40s, 80s, 160s max)
 /// 4. Logs dead-letter items (exceeded max retries)
-
 use crate::firefox_api;
 use crate::firefox_upload_retry::FirefoxUploadRetryItem;
-use crate::db;
 use log::{error, info, warn};
 use std::time::Duration;
 
@@ -26,23 +25,27 @@ async fn mark_retry_sms_attempt(
             .await
             {
                 Ok(Some(item_id)) => item_id,
-                Ok(None) => match db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await {
-                    Ok(Some(item_id)) => item_id,
-                    Ok(None) => {
-                        warn!(
+                Ok(None) => {
+                    match db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number)
+                        .await
+                    {
+                        Ok(Some(item_id)) => item_id,
+                        Ok(None) => {
+                            warn!(
                             "[Firefox Upload Retry] No platform item found for phone {} while updating SMS status",
                             item.phone_number
                         );
-                        return;
-                    }
-                    Err(e) => {
-                        error!(
+                            return;
+                        }
+                        Err(e) => {
+                            error!(
                             "[Firefox Upload Retry] Failed to resolve platform item for phone {}: {}",
                             item.phone_number, e
                         );
-                        return;
+                            return;
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     error!(
                         "[Firefox Upload Retry] Failed to read existing platform item for SMS {}: {}",
@@ -61,21 +64,21 @@ async fn mark_retry_sms_attempt(
         }
     } else {
         match db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await {
-        Ok(Some(item_id)) => item_id,
-        Ok(None) => {
-            warn!(
+            Ok(Some(item_id)) => item_id,
+            Ok(None) => {
+                warn!(
                 "[Firefox Upload Retry] No platform item found for phone {} while updating SMS status",
                 item.phone_number
             );
-            return;
-        }
-        Err(e) => {
-            error!(
-                "[Firefox Upload Retry] Failed to resolve platform item for phone {}: {}",
-                item.phone_number, e
-            );
-            return;
-        }
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "[Firefox Upload Retry] Failed to resolve platform item for phone {}: {}",
+                    item.phone_number, e
+                );
+                return;
+            }
         }
     };
 
@@ -157,7 +160,10 @@ async fn process_retry_queue() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!("[Firefox Upload Retry] Processing {} items from retry queue", items.len());
+    info!(
+        "[Firefox Upload Retry] Processing {} items from retry queue",
+        items.len()
+    );
 
     // Get API key
     let api_key = match crate::db::AppSetting::get("firefox_api_key").await {
@@ -193,7 +199,12 @@ async fn process_retry_queue() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(Some(id)) => Some(id),
-                    Ok(None) => db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await.ok().flatten(),
+                    Ok(None) => {
+                        db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
                     Err(e) => {
                         error!(
                             "[Firefox Upload Retry] Failed to read platform_item_id for SMS {}: {}",
@@ -211,7 +222,10 @@ async fn process_retry_queue() -> anyhow::Result<()> {
                 }
             }
         } else {
-            db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number).await.ok().flatten()
+            db::FirefoxPlatformItem::find_latest_item_for_phone(&item.phone_number)
+                .await
+                .ok()
+                .flatten()
         };
 
         let upload_content = if let Some(ref id) = item_id {
@@ -239,7 +253,8 @@ async fn process_retry_queue() -> anyhow::Result<()> {
                 // Success! Remove from queue
                 info!(
                     "[Firefox Upload Retry] Upload succeeded (SMS ID: {}, retry attempt: {})",
-                    item.sms_id, item.retry_count + 1
+                    item.sms_id,
+                    item.retry_count + 1
                 );
 
                 if let Err(e) = FirefoxUploadRetryItem::mark_success(pool, &item.id).await {

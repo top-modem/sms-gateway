@@ -34,7 +34,7 @@ impl FirefoxUploadRetryItem {
         let now = Utc::now().naive_utc();
         // Initial retry after 5 seconds
         let next_retry_at = now + Duration::seconds(5);
-        
+
         Self {
             id: Uuid::new_v4().to_string(),
             sms_id,
@@ -199,7 +199,7 @@ impl FirefoxUploadRetryItem {
     /// Get queue statistics
     pub async fn get_stats(pool: &SqlitePool) -> Result<QueueStats> {
         let now = Utc::now().naive_utc();
-        
+
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firefox_upload_retry_queue")
             .fetch_one(pool)
             .await?;
@@ -215,7 +215,7 @@ impl FirefoxUploadRetryItem {
         .await?;
 
         let dead_letter: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM firefox_upload_retry_queue WHERE retry_count >= max_retries"
+            "SELECT COUNT(*) FROM firefox_upload_retry_queue WHERE retry_count >= max_retries",
         )
         .fetch_one(pool)
         .await?;

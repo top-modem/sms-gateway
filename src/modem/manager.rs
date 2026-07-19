@@ -990,19 +990,37 @@ impl ModemManager {
                     // Ensure the sim_cards DB row exists and has the current IMSI.
                     // A transient demotion may have deleted the row while the modem
                     // stayed active, which leaves the dashboard IMSI column blank.
-                    if let Some(imsi) = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        modem.get_sim_imsi(),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .flatten()
-                    {
-                        match SimCard::find_or_create_with_phone(
-                            &iccid, Some(imsi), None,
-                        )
+                    // Only query AT+CNUM when the stored phone number is missing,
+                    // so healthy modems are not hit with an extra AT command each cycle.
+                    let needs_phone = self
+                        .sim_cards_cache
+                        .read()
                         .await
+                        .get(&iccid)
+                        .and_then(|c| c.phone_number.as_deref())
+                        .map(|p| p.is_empty())
+                        .unwrap_or(true);
+
+                    let imsi = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_imsi())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten();
+                    let phone_number = if needs_phone {
+                        tokio::time::timeout(Duration::from_secs(5), modem.get_phone_number())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten()
+                            .map(|p| crate::phone_number::normalize_msisdn(&p))
+                            .filter(|p| !p.is_empty())
+                    } else {
+                        None
+                    };
+
+                    if let Some(imsi) = imsi {
+                        match SimCard::find_or_create_with_phone(&iccid, Some(imsi), phone_number)
+                            .await
                         {
                             Ok(card) => {
                                 self.sim_cards_cache

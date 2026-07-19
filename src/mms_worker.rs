@@ -15,10 +15,7 @@ use std::time::Duration;
 /// inbox content-fetch timeout (AT+QHTTPGET/AT+QHTTPREADFILE) -- both talk to
 /// the same MMSC/APN over similar-latency HTTP round-trips, so a single
 /// configured value is sufficient for now.
-pub fn start_mms_worker(
-    modem_manager: ModemManagerRef,
-    send_timeout_secs: u64,
-) {
+pub fn start_mms_worker(modem_manager: ModemManagerRef, send_timeout_secs: u64) {
     tokio::spawn(async move {
         mms_worker_loop(modem_manager, send_timeout_secs).await;
     });
@@ -44,7 +41,10 @@ async fn mms_worker_loop(modem_manager: ModemManagerRef, send_timeout_secs: u64)
     }
 }
 
-async fn process_queue(modem_manager: &ModemManagerRef, send_timeout_secs: u64) -> anyhow::Result<()> {
+async fn process_queue(
+    modem_manager: &ModemManagerRef,
+    send_timeout_secs: u64,
+) -> anyhow::Result<()> {
     // Process a small batch per tick so one slow send doesn't starve the poll loop for long.
     let jobs = MmsMessage::get_queued(5).await?;
     if jobs.is_empty() {
@@ -58,14 +58,20 @@ async fn process_queue(modem_manager: &ModemManagerRef, send_timeout_secs: u64) 
         );
 
         if let Err(e) = MmsMessage::mark_sending(&job.id).await {
-            error!("[MMS Worker] Failed to mark job {} as sending: {}", job.id, e);
+            error!(
+                "[MMS Worker] Failed to mark job {} as sending: {}",
+                job.id, e
+            );
             continue;
         }
 
         let modem = match modem_manager.get_modem(&job.sim_id).await {
             Some(m) => m,
             None => {
-                warn!("[MMS Worker] Job {}: modem for SIM {} not available", job.id, job.sim_id);
+                warn!(
+                    "[MMS Worker] Job {}: modem for SIM {} not available",
+                    job.id, job.sim_id
+                );
                 let _ = MmsMessage::mark_result(
                     &job.id,
                     "failed",
@@ -95,7 +101,10 @@ async fn process_queue(modem_manager: &ModemManagerRef, send_timeout_secs: u64) 
                     .configure_mms_profile(&apn, &mmsc, &proxy_host, proxy_port)
                     .await
                 {
-                    error!("[MMS Worker] Job {}: failed to apply MMS profile: {}", job.id, e);
+                    error!(
+                        "[MMS Worker] Job {}: failed to apply MMS profile: {}",
+                        job.id, e
+                    );
                     let _ = MmsMessage::mark_result(
                         &job.id,
                         "failed",
@@ -114,14 +123,20 @@ async fn process_queue(modem_manager: &ModemManagerRef, send_timeout_secs: u64) 
                 );
             }
             Err(e) => {
-                error!("[MMS Worker] Job {}: failed to load MMS profile: {}", job.id, e);
+                error!(
+                    "[MMS Worker] Job {}: failed to load MMS profile: {}",
+                    job.id, e
+                );
             }
         }
 
         let attachments = match MmsAttachment::fetch_all_with_data(&job.id).await {
             Ok(a) => a,
             Err(e) => {
-                error!("[MMS Worker] Job {}: failed to load attachments: {}", job.id, e);
+                error!(
+                    "[MMS Worker] Job {}: failed to load attachments: {}",
+                    job.id, e
+                );
                 let _ = MmsMessage::mark_result(
                     &job.id,
                     "failed",
@@ -135,13 +150,28 @@ async fn process_queue(modem_manager: &ModemManagerRef, send_timeout_secs: u64) 
         };
 
         match modem
-            .send_mms(&job.to_number, job.subject.as_deref(), &attachments, send_timeout_secs)
+            .send_mms(
+                &job.to_number,
+                job.subject.as_deref(),
+                &attachments,
+                send_timeout_secs,
+            )
             .await
         {
             Ok((err_code, http_code)) => {
                 if err_code == 0 {
-                    info!("[MMS Worker] Job {} sent successfully (http={})", job.id, http_code);
-                    let _ = MmsMessage::mark_result(&job.id, "sent", Some(err_code), Some(http_code), None).await;
+                    info!(
+                        "[MMS Worker] Job {} sent successfully (http={})",
+                        job.id, http_code
+                    );
+                    let _ = MmsMessage::mark_result(
+                        &job.id,
+                        "sent",
+                        Some(err_code),
+                        Some(http_code),
+                        None,
+                    )
+                    .await;
                 } else {
                     warn!(
                         "[MMS Worker] Job {} rejected by modem/MMSC: err={}, http={}",
@@ -185,7 +215,10 @@ const RETRY_BACKOFF_SECS: [i64; 3] = [30, 120, 600];
 /// notified, or failed and past their retry backoff). Reuses the AT-port-only
 /// `AT+QHTTPxxx` fetch mechanism (`Modem::fetch_mms_content`) -- see
 /// `mms_retrieve.rs` for the M-Retrieve.conf decoder.
-async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs: u64) -> anyhow::Result<()> {
+async fn process_inbox_queue(
+    modem_manager: &ModemManagerRef,
+    fetch_timeout_secs: u64,
+) -> anyhow::Result<()> {
     if let Ok(n) = MmsInboxNotification::expire_overdue().await {
         if n > 0 {
             info!("[MMS Worker] Expired {} overdue MMS notification(s)", n);
@@ -205,7 +238,10 @@ async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs
 
         info!(
             "[MMS Worker] Fetching MMS content {} (sim={}, txn={}, attempt={})",
-            item.id, item.sim_id, item.transaction_id, item.retry_count + 1
+            item.id,
+            item.sim_id,
+            item.transaction_id,
+            item.retry_count + 1
         );
 
         if let Err(e) = MmsInboxNotification::mark_fetching(&item.id).await {
@@ -216,7 +252,10 @@ async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs
         let modem = match modem_manager.get_modem(&item.sim_id).await {
             Some(m) => m,
             None => {
-                warn!("[MMS Worker] {}: modem for SIM {} not available", item.id, item.sim_id);
+                warn!(
+                    "[MMS Worker] {}: modem for SIM {} not available",
+                    item.id, item.sim_id
+                );
                 fail_and_schedule_retry(&item, "Modem not available").await;
                 continue;
             }
@@ -232,7 +271,10 @@ async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs
             ),
             Ok(None) => (None, None),
             Err(e) => {
-                warn!("[MMS Worker] {}: failed to load MMS profile: {}", item.id, e);
+                warn!(
+                    "[MMS Worker] {}: failed to load MMS profile: {}",
+                    item.id, e
+                );
                 (None, None)
             }
         };
@@ -252,14 +294,20 @@ async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs
         let conf = match crate::mms_retrieve::decode_retrieve_conf(&bytes) {
             Ok(c) => c,
             Err(e) => {
-                error!("[MMS Worker] {}: failed to decode M-Retrieve.conf: {}", item.id, e);
+                error!(
+                    "[MMS Worker] {}: failed to decode M-Retrieve.conf: {}",
+                    item.id, e
+                );
                 fail_and_schedule_retry(&item, &format!("Decode failed: {}", e)).await;
                 continue;
             }
         };
 
         if let Err(e) = MmsInboxPart::delete_all_for_inbox(&item.id).await {
-            warn!("[MMS Worker] {}: failed to clear stale parts before insert: {}", item.id, e);
+            warn!(
+                "[MMS Worker] {}: failed to clear stale parts before insert: {}",
+                item.id, e
+            );
         }
 
         let mut store_err = None;
@@ -271,14 +319,23 @@ async fn process_inbox_queue(modem_manager: &ModemManagerRef, fetch_timeout_secs
                     .unwrap_or("bin");
                 format!("part{}.{}", idx, ext)
             });
-            if let Err(e) = MmsInboxPart::insert(&item.id, &part.content_type, Some(&filename), &part.data).await {
+            if let Err(e) =
+                MmsInboxPart::insert(&item.id, &part.content_type, Some(&filename), &part.data)
+                    .await
+            {
                 store_err = Some(e);
                 break;
             }
         }
 
         match store_err {
-            None => match MmsInboxNotification::mark_fetched(&item.id, conf.subject.as_deref(), conf.from.as_deref()).await {
+            None => match MmsInboxNotification::mark_fetched(
+                &item.id,
+                conf.subject.as_deref(),
+                conf.from.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => info!(
                     "[MMS Worker] {} fetched successfully: {} part(s), subject={:?}",
                     item.id,
@@ -311,7 +368,12 @@ async fn fail_and_schedule_retry(item: &MmsInboxNotification, error_message: &st
             item.retry_count + 1
         );
     }
-    if let Err(e) = MmsInboxNotification::mark_fetch_failed(&item.id, error_message, next_retry_at).await {
-        error!("[MMS Worker] {}: failed to record fetch failure: {}", item.id, e);
+    if let Err(e) =
+        MmsInboxNotification::mark_fetch_failed(&item.id, error_message, next_retry_at).await
+    {
+        error!(
+            "[MMS Worker] {}: failed to record fetch failure: {}",
+            item.id, e
+        );
     }
 }

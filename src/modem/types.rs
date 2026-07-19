@@ -77,9 +77,7 @@ impl NetworkRegistrationStatus {
         if parts.len() >= 2 {
             Some(NetworkRegistrationStatus {
                 status: parts[1].trim().trim_matches('"').to_string(),
-                location_area_code: parts
-                    .get(2)
-                    .map(|s| s.trim().trim_matches('"').to_string()),
+                location_area_code: parts.get(2).map(|s| s.trim().trim_matches('"').to_string()),
                 cell_id: parts.get(3).map(|s| s.trim().trim_matches('"').to_string()),
             })
         } else if parts.len() == 1 {

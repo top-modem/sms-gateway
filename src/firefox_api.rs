@@ -363,11 +363,10 @@ struct PhoneDeleteAllRequest {
 }
 
 /// Delete all uploaded phone numbers from the platform.
-pub async fn delete_phone_all(
-    client: &reqwest::Client,
-    api_key: &str,
-) -> Result<ApiResponse> {
-    let payload = PhoneDeleteAllRequest { act: "PhoneDeleteAll" };
+pub async fn delete_phone_all(client: &reqwest::Client, api_key: &str) -> Result<ApiResponse> {
+    let payload = PhoneDeleteAllRequest {
+        act: "PhoneDeleteAll",
+    };
     do_post(client, api_key, &payload).await
 }
 
@@ -515,12 +514,23 @@ pub async fn upload_sms(
     };
     log::info!(
         "[火狐狸平台] UploadSms request: phone={}, country_id={}, content={:?}",
-        phone_num, country_id, payload.Phone_SmsContent
+        phone_num,
+        country_id,
+        payload.Phone_SmsContent
     );
     let resp: anyhow::Result<ApiResponse> = do_post(client, api_key, &payload).await;
     match &resp {
-        Ok(r) => log::info!("[火狐狸平台] UploadSms response: phone={}, code={}, data={:?}", phone_num, r.code, r.data),
-        Err(e) => log::warn!("[火狐狸平台] UploadSms failed: phone={}, error={}", phone_num, e),
+        Ok(r) => log::info!(
+            "[火狐狸平台] UploadSms response: phone={}, code={}, data={:?}",
+            phone_num,
+            r.code,
+            r.data
+        ),
+        Err(e) => log::warn!(
+            "[火狐狸平台] UploadSms failed: phone={}, error={}",
+            phone_num,
+            e
+        ),
     }
     resp
 }

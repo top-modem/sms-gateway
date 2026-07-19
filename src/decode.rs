@@ -105,7 +105,10 @@ impl MultipartHandler {
 
 // ---------- Main Parser Function ----------
 /// Returns (regular text SMS, MMS WAP-push notification candidates).
-pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> (Vec<ModemSMS>, Vec<MmsNotificationCandidate>) {
+pub fn parse_pdu_sms(
+    cmgl_entries: &str,
+    sim_id: &str,
+) -> (Vec<ModemSMS>, Vec<MmsNotificationCandidate>) {
     let mut handler = MultipartHandler::new();
     let mut messages = Vec::new();
     let mut mms_candidates = Vec::new();
@@ -121,11 +124,17 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> (Vec<ModemSMS>, Vec<Mm
     for cap in entry_re.captures_iter(cmgl_entries).flatten() {
         let index: u32 = match cap[2].parse() {
             Ok(v) => v,
-            Err(e) => { log::warn!("跳过短信，无法解析索引: {}", e); continue; }
+            Err(e) => {
+                log::warn!("跳过短信，无法解析索引: {}", e);
+                continue;
+            }
         };
         let pdu = match hex::decode(cap[3].to_uppercase().as_str()) {
             Ok(v) => v,
-            Err(e) => { log::warn!("跳过短信 #{}, PDU hex解码失败: {}", index, e); continue; }
+            Err(e) => {
+                log::warn!("跳过短信 #{}, PDU hex解码失败: {}", index, e);
+                continue;
+            }
         };
 
         // Skip SMSC information

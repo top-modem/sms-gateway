@@ -22,10 +22,14 @@ use crate::{
     config::SmsStorage,
     db::{AppSetting, BarcodeScan, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
-    modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
-    phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
-    service_control,
-    ModemManagerRef,
+    modem::{
+        ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType,
+    },
+    phone_number::{
+        call_exchange, import_phone_numbers, new_task_handle, sms_exchange, ussd_batch,
+        PhoneNumberTask, TaskHandle,
+    },
+    service_control, ModemManagerRef,
 };
 
 static PHONE_NUMBER_TASK: OnceLock<TaskHandle> = OnceLock::new();
@@ -113,12 +117,21 @@ pub async fn run_api(
 ) -> anyhow::Result<()> {
     let api = Router::new()
         .route("/check", get(check))
-        .route("/diagnostics", get(diagnostics).with_state(modem_manager.clone()))
-        .route("/service/status", get(get_service_status).with_state(modem_manager.clone()))
+        .route(
+            "/diagnostics",
+            get(diagnostics).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/service/status",
+            get(get_service_status).with_state(modem_manager.clone()),
+        )
         .route("/service/start", post(start_service))
         .route("/service/stop", post(stop_service))
         .route("/sms", get(get_sms_paginated))
-        .route("/sms", post(send_sms).with_state((modem_manager.clone(), sse_manager.clone())))
+        .route(
+            "/sms",
+            post(send_sms).with_state((modem_manager.clone(), sse_manager.clone())),
+        )
         .route("/sms/sse", get(sse_events).with_state(sse_manager.clone()))
         // 破坏性改造: 删除所有/api/device路径，改为/api/sims
         .route(
@@ -213,34 +226,61 @@ pub async fn run_api(
         .route("/firefox/batch-status", post(firefox_batch_status))
         .route("/firefox/batch-uploads", get(firefox_batch_uploads))
         .route("/firefox/delete-batch", post(firefox_delete_batch))
-        .route("/firefox/delete-batch-by-id", post(firefox_delete_batch_by_id))
+        .route(
+            "/firefox/delete-batch-by-id",
+            post(firefox_delete_batch_by_id),
+        )
         .route("/firefox/delete-country", post(firefox_delete_country))
         .route("/firefox/delete-all", post(firefox_delete_all))
         .route("/firefox/wait-list", get(firefox_wait_list))
         .route("/firefox/result-list", get(firefox_result_list))
         .route("/firefox/upload-sms", post(firefox_upload_sms))
         .route("/firefox/platform-items", get(firefox_platform_items))
-        .route("/firefox/platform-items/{item_id}", get(firefox_platform_item_detail))
-        .route("/firefox/platform-statistics", get(firefox_platform_statistics))
-        .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
-        // ── Firefox upload retry queue routes ────────────────────────────
-        .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
-        .route("/firefox/upload-retry/queue", get(firefox_upload_retry_queue))
-        .route("/firefox/upload-retry/dead-letter", get(firefox_upload_retry_dead_letter))
-        .route("/firefox/upload-retry/{id}/retry", post(firefox_upload_retry_manual))
-        .route("/firefox/upload-retry/{id}", delete(firefox_upload_retry_delete))
-        // ── Voice call routes ─────────────────────────────────────────────
         .route(
-            "/calls",
-            get(get_calls),
+            "/firefox/platform-items/{item_id}",
+            get(firefox_platform_item_detail),
         )
+        .route(
+            "/firefox/platform-statistics",
+            get(firefox_platform_statistics),
+        )
+        .route(
+            "/firefox/platform-rejection-reasons",
+            get(firefox_platform_rejection_reasons),
+        )
+        // ── Firefox upload retry queue routes ────────────────────────────
+        .route(
+            "/firefox/upload-retry/stats",
+            get(firefox_upload_retry_stats),
+        )
+        .route(
+            "/firefox/upload-retry/queue",
+            get(firefox_upload_retry_queue),
+        )
+        .route(
+            "/firefox/upload-retry/dead-letter",
+            get(firefox_upload_retry_dead_letter),
+        )
+        .route(
+            "/firefox/upload-retry/{id}/retry",
+            post(firefox_upload_retry_manual),
+        )
+        .route(
+            "/firefox/upload-retry/{id}",
+            delete(firefox_upload_retry_delete),
+        )
+        // ── Voice call routes ─────────────────────────────────────────────
+        .route("/calls", get(get_calls))
         .route(
             "/calls/sse",
             get(calls_sse_events).with_state(sse_manager.clone()),
         )
         .route(
             "/calls/make",
-            post(make_call).with_state(CallState { mm: modem_manager.clone(), sse: sse_manager.clone() }),
+            post(make_call).with_state(CallState {
+                mm: modem_manager.clone(),
+                sse: sse_manager.clone(),
+            }),
         )
         .route(
             "/calls/answer",
@@ -248,31 +288,19 @@ pub async fn run_api(
         )
         .route(
             "/calls/hangup",
-            post(hangup_call).with_state(CallState { mm: modem_manager.clone(), sse: sse_manager.clone() }),
+            post(hangup_call).with_state(CallState {
+                mm: modem_manager.clone(),
+                sse: sse_manager.clone(),
+            }),
         )
-        .route(
-            "/calls/{id}/recording",
-            get(get_call_recording),
-        )
-        .route(
-            "/calls/{id}/transcript",
-            get(get_call_transcript),
-        )
+        .route("/calls/{id}/recording", get(get_call_recording))
+        .route("/calls/{id}/transcript", get(get_call_transcript))
         // ── MMS routes (EC20/EC25 via AT+QMMSEDIT/AT+QMMSEND) ────────────
-        .route(
-            "/mms",
-            post(create_mms).with_state(modem_manager.clone()),
-        )
+        .route("/mms", post(create_mms).with_state(modem_manager.clone()))
         .route("/mms", get(get_mms_paginated))
         .route("/mms/{id}", get(get_mms_detail))
-        .route(
-            "/sim-cards/{sim_id}/mms-profile",
-            get(get_mms_profile),
-        )
-        .route(
-            "/sim-cards/{sim_id}/mms-profile",
-            put(set_mms_profile),
-        )
+        .route("/sim-cards/{sim_id}/mms-profile", get(get_mms_profile))
+        .route("/sim-cards/{sim_id}/mms-profile", put(set_mms_profile))
         .route("/mms/inbox", get(get_mms_inbox_paginated))
         .route("/mms/inbox/{id}", get(get_mms_inbox_detail))
         .route("/mms/inbox/{id}/parts/{part_id}", get(get_mms_inbox_part))
@@ -361,10 +389,15 @@ async fn get_sms_paginated(Query(query): Query<SmsQuery>) -> Response {
                 "total": total,
                 "page": query.page,
                 "per_page": query.per_page,
-            })).into_response(),
+            }))
+            .into_response(),
             Err(e) => {
                 error!("{}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get SMS: {}", e)).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to get SMS: {}", e),
+                )
+                    .into_response()
             }
         };
     }
@@ -407,15 +440,21 @@ async fn send_sms(
         None => match payload.phone_number.as_deref() {
             Some(phone) => match modem_manager.find_sim_id_by_phone_number(phone).await {
                 Some(id) => id,
-                None => return (
-                    StatusCode::NOT_FOUND,
-                    format!("No SIM card found with phone number: {}", phone),
-                ).into_response(),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        format!("No SIM card found with phone number: {}", phone),
+                    )
+                        .into_response()
+                }
             },
-            None => return (
-                StatusCode::BAD_REQUEST,
-                "Either sim_id or phone_number must be provided".to_string(),
-            ).into_response(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Either sim_id or phone_number must be provided".to_string(),
+                )
+                    .into_response()
+            }
         },
     };
 
@@ -428,9 +467,7 @@ async fn send_sms(
         .await
     {
         Ok((sms_id, contact_id)) => {
-            if let Ok(convs) =
-                Conversation::query_by_contact_ids(&[contact_id.clone()]).await
-            {
+            if let Ok(convs) = Conversation::query_by_contact_ids(&[contact_id.clone()]).await {
                 sse_manager.send(convs);
             }
             (
@@ -501,10 +538,7 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
                     Duration::from_secs(5),
                     modem_manager.get_memory_status(&sim_id),
                 );
-                let imei_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_imei(&sim_id),
-                );
+                let imei_future = timeout(Duration::from_secs(5), modem_manager.get_imei(&sim_id));
 
                 let (
                     signal_result,
@@ -621,10 +655,13 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
             format!("SIM {}", sim_id)
         };
 
-        // Get modem info for com_port and baud_rate
+        // Get modem info for com_port and baud_rate. If the modem vanished
+        // from the manager between listing sim IDs and this lookup (e.g. it was
+        // demoted mid-request after the SIM was pulled), skip the entry entirely
+        // instead of rendering a zombie "N/A" row on the dashboard.
         let (com_port, baud_rate) = match modem_manager.get_modem(&sim_id).await {
             Some(modem) => (modem.com_port.clone(), modem.baud_rate),
-            _ => ("N/A".to_string(), 0),
+            None => continue,
         };
 
         let phone_number = sim_data.as_ref().and_then(|s| s.phone_number.clone());
@@ -712,9 +749,16 @@ async fn send_at_command_handler(
     State(modem_manager): State<ModemManagerRef>,
     Json(body): Json<AtCommandRequest>,
 ) -> Response {
-    match modem_manager.send_at_command(&com_port, &body.command).await {
+    match modem_manager
+        .send_at_command(&com_port, &body.command)
+        .await
+    {
         Ok(response) => (StatusCode::OK, Json(json!({"response": response}))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -734,7 +778,10 @@ async fn refresh_sim_sms(
 async fn refresh_all_sim_cache(State(modem_manager): State<ModemManagerRef>) -> Response {
     let sim_ids = modem_manager.get_sim_ids().await;
     modem_manager.refresh_sim_cache(&sim_ids).await;
-    log::info!("[refresh-all-sim-cache] Refreshed cache for {} active SIM(s)", sim_ids.len());
+    log::info!(
+        "[refresh-all-sim-cache] Refreshed cache for {} active SIM(s)",
+        sim_ids.len()
+    );
     Json(json!({"refreshed": sim_ids.len(), "sim_ids": sim_ids})).into_response()
 }
 
@@ -758,7 +805,10 @@ async fn diagnostics(State(mm): State<ModemManagerRef>) -> impl IntoResponse {
     let mut modems = Vec::new();
     for sim_id in &sim_ids {
         let (com_port, model) = match mm.get_modem(sim_id).await {
-            Some(modem) => (modem.com_port.clone(), modem.get_modem_model().await.ok().flatten()),
+            Some(modem) => (
+                modem.com_port.clone(),
+                modem.get_modem_model().await.ok().flatten(),
+            ),
             None => ("N/A".to_string(), None),
         };
         modems.push(json!({
@@ -768,7 +818,9 @@ async fn diagnostics(State(mm): State<ModemManagerRef>) -> impl IntoResponse {
         }));
     }
 
-    let platform_upload_count = crate::db::FirefoxBatchUpload::exists().await.unwrap_or(false) as i64;
+    let platform_upload_count = crate::db::FirefoxBatchUpload::exists()
+        .await
+        .unwrap_or(false) as i64;
     let platform_upload_count = if platform_upload_count > 0 {
         match crate::db::FirefoxBatchUpload::query_recent(1000).await {
             Ok(v) => v.len() as i64,
@@ -778,19 +830,20 @@ async fn diagnostics(State(mm): State<ModemManagerRef>) -> impl IntoResponse {
         0
     };
 
-    let platform_item_count = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firefox_platform_items")
-        .fetch_one(&*crate::db::get_pool().expect("No DB pool"))
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[diagnostics] Failed to count platform items: {}", e);
-            0
-        }
-    };
+    let platform_item_count =
+        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firefox_platform_items")
+            .fetch_one(&*crate::db::get_pool().expect("No DB pool"))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[diagnostics] Failed to count platform items: {}", e);
+                0
+            }
+        };
 
     let pending_sms_count = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sms WHERE send = 0 AND uploaded_to_platform = 0"
+        "SELECT COUNT(*) FROM sms WHERE send = 0 AND uploaded_to_platform = 0",
     )
     .fetch_one(&*crate::db::get_pool().expect("No DB pool"))
     .await
@@ -875,7 +928,10 @@ fn validate_barcode_msisdn(msisdn: &str) -> bool {
 fn normalize_msisdn(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('+') {
-        let digits: String = trimmed[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: String = trimmed[1..]
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
         let normalized = digits.trim_start_matches('0');
         if normalized.is_empty() {
             "+".to_string()
@@ -892,8 +948,16 @@ async fn phone_numbers_barcode_scan(
     State(mm): State<ModemManagerRef>,
     Json(request): Json<BarcodeScanRequest>,
 ) -> Response {
-    let iccid: String = request.iccid.chars().filter(|c| c.is_ascii_digit()).collect();
-    let msisdn: String = request.msisdn.chars().filter(|c| c.is_ascii_digit()).collect();
+    let iccid: String = request
+        .iccid
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let msisdn: String = request
+        .msisdn
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
 
     if !validate_barcode_iccid(&iccid) {
         return (
@@ -920,7 +984,11 @@ async fn phone_numbers_barcode_scan(
     }
 
     match BarcodeScan::upsert(&iccid, &msisdn).await {
-        Ok(_) => (StatusCode::OK, Json(json!({"iccid": iccid, "msisdn": msisdn}))).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"iccid": iccid, "msisdn": msisdn})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to save scan: {}", e)})),
@@ -963,9 +1031,7 @@ async fn phone_numbers_barcode_scans_clear() -> Response {
     }
 }
 
-async fn phone_numbers_barcode_scans_import(
-    State(mm): State<ModemManagerRef>,
-) -> Response {
+async fn phone_numbers_barcode_scans_import(State(mm): State<ModemManagerRef>) -> Response {
     let scans = match BarcodeScan::list_unimported().await {
         Ok(s) => s,
         Err(e) => {
@@ -978,16 +1044,28 @@ async fn phone_numbers_barcode_scans_import(
         }
     };
 
-    log::info!("[barcode-import] Starting import of {} scanned rows", scans.len());
+    log::info!(
+        "[barcode-import] Starting import of {} scanned rows",
+        scans.len()
+    );
 
     let mut imported_ids = Vec::new();
     let mut failed = None;
 
     for scan in &scans {
         let normalized = normalize_msisdn(&scan.msisdn);
-        log::info!("[barcode-import] Importing ICCID={} MSISDN={} (normalized={})", scan.iccid, scan.msisdn, normalized);
+        log::info!(
+            "[barcode-import] Importing ICCID={} MSISDN={} (normalized={})",
+            scan.iccid,
+            scan.msisdn,
+            normalized
+        );
         if let Err(e) = mm.set_sim_phone_number(&scan.iccid, &normalized).await {
-            log::error!("[barcode-import] Failed to write MSISDN for ICCID={}: {}", scan.iccid, e);
+            log::error!(
+                "[barcode-import] Failed to write MSISDN for ICCID={}: {}",
+                scan.iccid,
+                e
+            );
             failed = Some(json!({
                 "iccid": scan.iccid,
                 "error": format!("Failed to write phone number to SIM: {}", e),
@@ -995,11 +1073,17 @@ async fn phone_numbers_barcode_scans_import(
             break;
         }
         imported_ids.push(scan.id);
-        log::info!("[barcode-import] Successfully imported ICCID={}", scan.iccid);
+        log::info!(
+            "[barcode-import] Successfully imported ICCID={}",
+            scan.iccid
+        );
     }
 
     if let Some(err) = failed {
-        log::warn!("[barcode-import] Aborted after {} successful imports due to failure", imported_ids.len());
+        log::warn!(
+            "[barcode-import] Aborted after {} successful imports due to failure",
+            imported_ids.len()
+        );
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({
@@ -1011,7 +1095,11 @@ async fn phone_numbers_barcode_scans_import(
     }
 
     if let Err(e) = BarcodeScan::mark_imported(&imported_ids).await {
-        log::error!("[barcode-import] Failed to mark {} scans as imported: {}", imported_ids.len(), e);
+        log::error!(
+            "[barcode-import] Failed to mark {} scans as imported: {}",
+            imported_ids.len(),
+            e
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to mark scans imported: {}", e)})),
@@ -1019,8 +1107,15 @@ async fn phone_numbers_barcode_scans_import(
             .into_response();
     }
 
-    log::info!("[barcode-import] Completed: {} scans imported and marked", imported_ids.len());
-    (StatusCode::OK, Json(json!({"imported_count": imported_ids.len()}))).into_response()
+    log::info!(
+        "[barcode-import] Completed: {} scans imported and marked",
+        imported_ids.len()
+    );
+    (
+        StatusCode::OK,
+        Json(json!({"imported_count": imported_ids.len()})),
+    )
+        .into_response()
 }
 
 async fn phone_numbers_import(
@@ -1122,7 +1217,9 @@ struct CallsQuery {
     offset: i64,
 }
 
-fn default_limit() -> i64 { 50 }
+fn default_limit() -> i64 {
+    50
+}
 
 async fn get_calls(Query(q): Query<CallsQuery>) -> Response {
     let result = match q.sim_id {
@@ -1130,9 +1227,9 @@ async fn get_calls(Query(q): Query<CallsQuery>) -> Response {
             let total = v.len() as i64;
             json!({ "data": v, "total": total })
         }),
-        None => Call::query_all(q.limit, q.offset).await.map(|(v, total)| {
-            json!({ "data": v, "total": total })
-        }),
+        None => Call::query_all(q.limit, q.offset)
+            .await
+            .map(|(v, total)| json!({ "data": v, "total": total })),
     };
     match result {
         Ok(data) => Json(data).into_response(),
@@ -1146,7 +1243,10 @@ async fn get_call_recording(Path(id): Path<String>) -> Response {
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, "audio/amr"),
-                (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}.amr\"", id).leak()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}.amr\"", id).leak(),
+                ),
             ],
             data,
         )
@@ -1170,7 +1270,11 @@ async fn get_call_transcript(Path(id): Path<String>) -> Response {
 }
 
 async fn make_call(State(cs): State<CallState>, Json(body): Json<MakeCallRequest>) -> Response {
-    match cs.mm.make_call(&body.sim_id, &body.phone, cs.sse.clone()).await {
+    match cs
+        .mm
+        .make_call(&body.sim_id, &body.phone, cs.sse.clone())
+        .await
+    {
         Ok(call_id) => {
             cs.sse.send_call_event(CallEvent {
                 event_type: "outbound_call_started".into(),
@@ -1185,7 +1289,10 @@ async fn make_call(State(cs): State<CallState>, Json(body): Json<MakeCallRequest
     }
 }
 
-async fn answer_call(State(mm): State<ModemManagerRef>, Json(body): Json<SimIdRequest>) -> Response {
+async fn answer_call(
+    State(mm): State<ModemManagerRef>,
+    Json(body): Json<SimIdRequest>,
+) -> Response {
     match mm.answer_call(&body.sim_id).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1209,7 +1316,9 @@ async fn hangup_call(State(cs): State<CallState>, Json(body): Json<SimIdRequest>
     }
 }
 
-async fn calls_sse_events(State(sse_manager): State<Arc<SseManager>>) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+async fn calls_sse_events(
+    State(sse_manager): State<Arc<SseManager>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = sse_manager.subscribe_calls();
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
@@ -1355,7 +1464,11 @@ async fn create_mms(
             .into_response();
     }
     if payload.to.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "`to` must not be empty".to_string()).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "`to` must not be empty".to_string(),
+        )
+            .into_response();
     }
 
     let mms_id = match crate::db::MmsMessage::insert_queued(
@@ -1368,7 +1481,10 @@ async fn create_mms(
         Ok(id) => id,
         Err(e) => {
             error!("Failed to enqueue MMS job: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to enqueue MMS: {}", e))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to enqueue MMS: {}", e),
+            )
                 .into_response();
         }
     };
@@ -1380,7 +1496,10 @@ async fn create_mms(
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("Invalid base64 for attachment {}: {}", attachment.filename, e),
+                    format!(
+                        "Invalid base64 for attachment {}: {}",
+                        attachment.filename, e
+                    ),
                 )
                     .into_response();
             }
@@ -1402,12 +1521,19 @@ async fn create_mms(
         }
     }
 
-    (StatusCode::ACCEPTED, Json(json!({ "id": mms_id, "status": "queued" }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "id": mms_id, "status": "queued" })),
+    )
+        .into_response()
 }
 
 async fn get_mms_paginated(Query(query): Query<MmsQuery>) -> Response {
-    match crate::db::MmsMessage::query_paginated(query.per_page as i64, ((query.page - 1) * query.per_page) as i64)
-        .await
+    match crate::db::MmsMessage::query_paginated(
+        query.per_page as i64,
+        ((query.page - 1) * query.per_page) as i64,
+    )
+    .await
     {
         Ok((data, total)) => Json(PaginatedMmsResponse {
             data,
@@ -1416,19 +1542,31 @@ async fn get_mms_paginated(Query(query): Query<MmsQuery>) -> Response {
             per_page: query.per_page,
         })
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list MMS: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list MMS: {}", e),
+        )
+            .into_response(),
     }
 }
 
 async fn get_mms_detail(Path(id): Path<String>) -> Response {
     let job = match crate::db::MmsMessage::find_by_id(&id).await {
         Ok(Some(job)) => job,
-        Ok(None) => return (StatusCode::NOT_FOUND, "MMS job not found".to_string()).into_response(),
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "MMS job not found".to_string()).into_response()
+        }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS: {}", e)).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load MMS: {}", e),
+            )
+                .into_response()
         }
     };
-    let attachments = crate::db::MmsAttachment::list_meta(&id).await.unwrap_or_default();
+    let attachments = crate::db::MmsAttachment::list_meta(&id)
+        .await
+        .unwrap_or_default();
     Json(json!({ "job": job, "attachments": attachments })).into_response()
 }
 
@@ -1436,7 +1574,10 @@ async fn get_mms_profile(Path(sim_id): Path<String>) -> Response {
     match crate::db::MmsProfile::get(&sim_id).await {
         Ok(Some(profile)) => Json(profile).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "SIM card not found".to_string()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS profile: {}", e))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load MMS profile: {}", e),
+        )
             .into_response(),
     }
 }
@@ -1463,7 +1604,10 @@ async fn set_mms_profile(
     .await
     {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update MMS profile: {}", e))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to update MMS profile: {}", e),
+        )
             .into_response(),
     }
 }
@@ -1492,7 +1636,10 @@ async fn get_mms_inbox_paginated(Query(query): Query<MmsQuery>) -> Response {
             per_page: query.per_page,
         })
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list MMS inbox: {}", e))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list MMS inbox: {}", e),
+        )
             .into_response(),
     }
 }
@@ -1500,14 +1647,21 @@ async fn get_mms_inbox_paginated(Query(query): Query<MmsQuery>) -> Response {
 async fn get_mms_inbox_detail(Path(id): Path<String>) -> Response {
     match crate::db::MmsInboxNotification::find_by_id(&id).await {
         Ok(Some(item)) => {
-            let parts = crate::db::MmsInboxPart::list_meta(&id).await.unwrap_or_default();
+            let parts = crate::db::MmsInboxPart::list_meta(&id)
+                .await
+                .unwrap_or_default();
             Json(json!({ "notification": item, "parts": parts })).into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "MMS notification not found".to_string()).into_response(),
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS notification: {}", e))
-                .into_response()
-        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "MMS notification not found".to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load MMS notification: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -1515,7 +1669,8 @@ async fn get_mms_inbox_detail(Path(id): Path<String>) -> Response {
 async fn get_mms_inbox_part(Path((_id, part_id)): Path<(String, String)>) -> Response {
     match crate::db::MmsInboxPart::fetch_data(&part_id).await {
         Ok(Some((content_type, filename, data))) => {
-            let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            let content_type =
+                content_type.unwrap_or_else(|| "application/octet-stream".to_string());
             let filename = filename.unwrap_or_else(|| part_id.clone());
             // `.leak()` returns `&'static mut str`; explicitly type as `&'static str`
             // (a valid mut->immut reborrow) so the array elements match the `&str`
@@ -1536,7 +1691,11 @@ async fn get_mms_inbox_part(Path((_id, part_id)): Path<(String, String)>) -> Res
                 .into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "MMS part not found".to_string()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS part: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load MMS part: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -1770,7 +1929,10 @@ async fn set_sim_phone_number(
     }
 
     // 1. Write the number into the SIM card via AT commands.
-    if let Err(e) = modem_manager.set_sim_phone_number(&sim_id, &normalized).await {
+    if let Err(e) = modem_manager
+        .set_sim_phone_number(&sim_id, &normalized)
+        .await
+    {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("Failed to write phone number to SIM: {}", e)})),
@@ -1782,7 +1944,10 @@ async fn set_sim_phone_number(
     match SimCard::query_all().await {
         Ok(sim_cards) => {
             if let Some(mut sim_card) = sim_cards.into_iter().find(|s| s.id == sim_id) {
-                match sim_card.update_phone_number(Some(normalized.to_string())).await {
+                match sim_card
+                    .update_phone_number(Some(normalized.to_string()))
+                    .await
+                {
                     Ok(_) => {
                         modem_manager.update_sim_cache(sim_card.clone()).await;
                         (StatusCode::OK, Json(sim_card)).into_response()
@@ -1901,7 +2066,10 @@ async fn firefox_upload(
         if let Some(card) = sim_cards.iter().find(|c| &c.id == sim_id) {
             if let Some(phone) = card.phone_number.as_deref().filter(|p| !p.is_empty()) {
                 // Normalize: keep only digits and plus sign.
-                let normalized: String = phone.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+                let normalized: String = phone
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '+')
+                    .collect();
                 if !normalized.is_empty() {
                     phone_numbers.push(normalized);
                     sim_ids_to_update.push(sim_id.clone());
@@ -1931,14 +2099,9 @@ async fn firefox_upload(
 
     match firefox_api::upload_phone_batch(&client, &api_key, country_id, &phone_numbers).await {
         Ok(results) => {
-            let batch_ids: Vec<String> = results
-                .iter()
-                .map(|r| r.batch_id.clone())
-                .collect();
-            let api_responses: Vec<firefox_api::ApiResponse> = results
-                .iter()
-                .map(|r| r.response.clone())
-                .collect();
+            let batch_ids: Vec<String> = results.iter().map(|r| r.batch_id.clone()).collect();
+            let api_responses: Vec<firefox_api::ApiResponse> =
+                results.iter().map(|r| r.response.clone()).collect();
 
             // Persist each batch upload record with its own phone numbers
             for result in &results {
@@ -1982,17 +2145,29 @@ async fn get_firefox_client() -> Result<(String, reqwest::Client), Response> {
     let api_key = AppSetting::get("firefox_api_key")
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to read API key: {}", e)}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to read API key: {}", e)})),
+            )
+                .into_response()
         })?
         .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "Firefox API key not configured"}))).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Firefox API key not configured"})),
+            )
+                .into_response()
         })?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to build HTTP client: {}", e)}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to build HTTP client: {}", e)})),
+            )
+                .into_response()
         })?;
 
     Ok((api_key, client))
@@ -2008,7 +2183,11 @@ struct FirefoxBatchStatusRequest {
 async fn firefox_batch_status(Json(request): Json<FirefoxBatchStatusRequest>) -> Response {
     let batch_id = request.batch_id.trim().to_string();
     if batch_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Batch ID is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Batch ID is required"})),
+        )
+            .into_response();
     }
 
     let (api_key, client) = match get_firefox_client().await {
@@ -2018,7 +2197,11 @@ async fn firefox_batch_status(Json(request): Json<FirefoxBatchStatusRequest>) ->
 
     match firefox_api::query_batch_status(&client, &api_key, &batch_id).await {
         Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Query failed: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Query failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2050,7 +2233,11 @@ struct DeleteBatchEntry {
 
 async fn firefox_delete_batch(Json(request): Json<FirefoxDeleteBatchRequest>) -> Response {
     if request.entries.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "No entries provided"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "No entries provided"})),
+        )
+            .into_response();
     }
 
     let (api_key, client) = match get_firefox_client().await {
@@ -2058,7 +2245,11 @@ async fn firefox_delete_batch(Json(request): Json<FirefoxDeleteBatchRequest>) ->
         Err(e) => return e,
     };
 
-    let entries: Vec<(&str, &str)> = request.entries.iter().map(|e| (e.country_id.as_str(), e.phone_num.as_str())).collect();
+    let entries: Vec<(&str, &str)> = request
+        .entries
+        .iter()
+        .map(|e| (e.country_id.as_str(), e.phone_num.as_str()))
+        .collect();
 
     // Clear local country_code for deleted phone numbers
     if let Ok(cards) = SimCard::query_all().await {
@@ -2073,8 +2264,16 @@ async fn firefox_delete_batch(Json(request): Json<FirefoxDeleteBatchRequest>) ->
     }
 
     match firefox_api::delete_phone_batch(&client, &api_key, &entries).await {
-        Ok(results) => (StatusCode::OK, Json(json!({"message": "Delete completed", "results": results}))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+        Ok(results) => (
+            StatusCode::OK,
+            Json(json!({"message": "Delete completed", "results": results})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Delete failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2085,19 +2284,33 @@ struct FirefoxDeleteBatchByIdRequest {
     batch_id: String,
 }
 
-async fn firefox_delete_batch_by_id(Json(request): Json<FirefoxDeleteBatchByIdRequest>) -> Response {
+async fn firefox_delete_batch_by_id(
+    Json(request): Json<FirefoxDeleteBatchByIdRequest>,
+) -> Response {
     let batch_id = request.batch_id.trim().to_string();
     if batch_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Batch ID is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Batch ID is required"})),
+        )
+            .into_response();
     }
 
     let upload = match crate::db::FirefoxBatchUpload::query_by_batch_id(&batch_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "Batch not found"}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Batch not found"})),
+            )
+                .into_response();
         }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query batch: {}", e)}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to query batch: {}", e)})),
+            )
+                .into_response();
         }
     };
 
@@ -2109,7 +2322,11 @@ async fn firefox_delete_batch_by_id(Json(request): Json<FirefoxDeleteBatchByIdRe
         .collect();
 
     if phone_numbers.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "No phone numbers in batch"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "No phone numbers in batch"})),
+        )
+            .into_response();
     }
 
     let (api_key, client) = match get_firefox_client().await {
@@ -2140,7 +2357,11 @@ async fn firefox_delete_batch_by_id(Json(request): Json<FirefoxDeleteBatchByIdRe
             let _ = crate::db::FirefoxBatchUpload::delete_by_id(upload.id).await;
             (StatusCode::OK, Json(json!({"message": "Delete by batch completed", "phone_numbers": phone_numbers, "results": results}))).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Delete failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2154,7 +2375,11 @@ struct FirefoxDeleteCountryRequest {
 async fn firefox_delete_country(Json(request): Json<FirefoxDeleteCountryRequest>) -> Response {
     let country_id = request.country_id.trim().to_string();
     if country_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Country ID is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Country ID is required"})),
+        )
+            .into_response();
     }
 
     // Clear local country_code for all SIMs in this country
@@ -2174,7 +2399,11 @@ async fn firefox_delete_country(Json(request): Json<FirefoxDeleteCountryRequest>
 
     match firefox_api::delete_phone_country(&client, &api_key, &country_id).await {
         Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Delete failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2190,37 +2419,57 @@ async fn firefox_delete_all() -> Response {
             if card.country_code.is_some() {
                 let mut c = card.clone();
                 if let Err(e) = c.update_country_code(None).await {
-                    log::warn!("[platform-delete-all] Failed to clear country_code for SIM {}: {}", card.id, e);
+                    log::warn!(
+                        "[platform-delete-all] Failed to clear country_code for SIM {}: {}",
+                        card.id,
+                        e
+                    );
                 } else {
                     cleared_sims += 1;
                 }
             }
         }
     }
-    log::info!("[platform-delete-all] Cleared country_code for {} SIM(s)", cleared_sims);
+    log::info!(
+        "[platform-delete-all] Cleared country_code for {} SIM(s)",
+        cleared_sims
+    );
 
     // Clear local upload history so the poll worker stops querying
     match crate::db::FirefoxBatchUpload::delete_all().await {
         Ok(_) => log::info!("[platform-delete-all] Cleared local firefox_batch_uploads history"),
-        Err(e) => log::warn!("[platform-delete-all] Failed to clear local firefox_batch_uploads history: {}", e),
+        Err(e) => log::warn!(
+            "[platform-delete-all] Failed to clear local firefox_batch_uploads history: {}",
+            e
+        ),
     }
 
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
         Err(e) => {
-            log::error!("[platform-delete-all] Cannot get Firefox API client: {:?}", e);
+            log::error!(
+                "[platform-delete-all] Cannot get Firefox API client: {:?}",
+                e
+            );
             return e;
         }
     };
 
     match firefox_api::delete_phone_all(&client, &api_key).await {
         Ok(result) => {
-            log::info!("[platform-delete-all] Platform delete-all completed: {:?}", result);
+            log::info!(
+                "[platform-delete-all] Platform delete-all completed: {:?}",
+                result
+            );
             (StatusCode::OK, Json(json!(result))).into_response()
         }
         Err(e) => {
             log::error!("[platform-delete-all] Platform delete-all failed: {}", e);
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Delete failed: {}", e)}))).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Delete failed: {}", e)})),
+            )
+                .into_response()
         }
     }
 }
@@ -2235,7 +2484,11 @@ async fn firefox_wait_list() -> Response {
 
     match firefox_api::get_wait_phone_list(&client, &api_key).await {
         Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Query failed: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Query failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2254,9 +2507,21 @@ async fn firefox_result_list(Query(request): Query<FirefoxResultListRequest>) ->
         Err(e) => return e,
     };
 
-    match firefox_api::get_result_phone_list(&client, &api_key, &request.country_id, &request.phone_num, &request.item_id).await {
+    match firefox_api::get_result_phone_list(
+        &client,
+        &api_key,
+        &request.country_id,
+        &request.phone_num,
+        &request.item_id,
+    )
+    .await
+    {
         Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Query failed: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Query failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2275,7 +2540,11 @@ async fn firefox_upload_sms(Json(request): Json<FirefoxUploadSmsRequest>) -> Res
     let sms_content = request.sms_content.trim().to_string();
 
     if country_id.is_empty() || phone_num.is_empty() || sms_content.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "country_id, phone_num, and sms_content are required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "country_id, phone_num, and sms_content are required"})),
+        )
+            .into_response();
     }
 
     let (api_key, client) = match get_firefox_client().await {
@@ -2285,7 +2554,11 @@ async fn firefox_upload_sms(Json(request): Json<FirefoxUploadSmsRequest>) -> Res
 
     match firefox_api::upload_sms(&client, &api_key, &country_id, &phone_num, &sms_content).await {
         Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Upload SMS failed: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Upload SMS failed: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2313,34 +2586,62 @@ async fn firefox_platform_item_detail(
 ) -> Response {
     let item_id = item_id.trim().to_string();
     if item_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Item ID is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Item ID is required"})),
+        )
+            .into_response();
     }
 
     match crate::db::FirefoxPlatformItem::query_by_item_id(&item_id).await {
-        Ok(items) => match crate::db::Sms::query_by_platform_item_and_sim(&item_id, query.sim_id.as_deref()).await {
-            Ok(sms_list) => {
-                let items = if let Some(sim_id) = query.sim_id.as_deref() {
-                    items.into_iter()
-                        .filter(|item| item.iccid.as_deref() == Some(sim_id) || item.sim_id.as_deref() == Some(sim_id))
-                        .collect::<Vec<_>>()
-                } else {
-                    items
-                };
+        Ok(items) => {
+            match crate::db::Sms::query_by_platform_item_and_sim(&item_id, query.sim_id.as_deref())
+                .await
+            {
+                Ok(sms_list) => {
+                    let items = if let Some(sim_id) = query.sim_id.as_deref() {
+                        items
+                            .into_iter()
+                            .filter(|item| {
+                                item.iccid.as_deref() == Some(sim_id)
+                                    || item.sim_id.as_deref() == Some(sim_id)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        items
+                    };
 
-                if items.is_empty() && sms_list.is_empty() {
-                    return (StatusCode::NOT_FOUND, Json(json!({"error": "Item not found"}))).into_response();
+                    if items.is_empty() && sms_list.is_empty() {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "Item not found"})),
+                        )
+                            .into_response();
+                    }
+
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "item_id": item_id,
+                            "sim_id": query.sim_id,
+                            "items": items,
+                            "sms_list": sms_list,
+                        })),
+                    )
+                        .into_response()
                 }
-
-                (StatusCode::OK, Json(json!({
-                    "item_id": item_id,
-                    "sim_id": query.sim_id,
-                    "items": items,
-                    "sms_list": sms_list,
-                }))).into_response()
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("Failed to query SMS: {}", e)})),
+                )
+                    .into_response(),
             }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query SMS: {}", e)}))).into_response(),
-        },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to query item: {}", e)}))).into_response(),
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query item: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -2391,59 +2692,119 @@ async fn set_sms_storage(
 // ─── Firefox Upload Retry Queue Handlers ─────────────────────────────────
 
 async fn firefox_upload_retry_stats() -> Response {
-    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_stats(&crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool"))).await {
+    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_stats(
+        &crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+    )
+    .await
+    {
         Ok(stats) => (StatusCode::OK, Json(json!(stats))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to get queue statistics: {}", e)}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to get queue statistics: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
 async fn firefox_upload_retry_queue() -> Response {
-    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_ready_for_retry(&crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")), 100).await {
-        Ok(items) => (StatusCode::OK, Json(json!({"items": items, "count": items.len()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to get queue items: {}", e)}))).into_response(),
+    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_ready_for_retry(
+        &crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+        100,
+    )
+    .await
+    {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(json!({"items": items, "count": items.len()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to get queue items: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
 async fn firefox_upload_retry_dead_letter() -> Response {
-    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_dead_letter_items(&crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")), 100).await {
-        Ok(items) => (StatusCode::OK, Json(json!({"items": items, "count": items.len()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to get dead-letter items: {}", e)}))).into_response(),
+    match crate::firefox_upload_retry::FirefoxUploadRetryItem::get_dead_letter_items(
+        &crate::db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+        100,
+    )
+    .await
+    {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(json!({"items": items, "count": items.len()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to get dead-letter items: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
 async fn firefox_upload_retry_manual(Path(id): Path<String>) -> Response {
     let pool = match crate::db::get_pool() {
         Ok(p) => p,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Database error: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Database error: {}", e)})),
+            )
+                .into_response()
+        }
     };
-    
+
     // Update the item to retry immediately
     let now = chrono::Utc::now().naive_utc();
-    match sqlx::query(
-        "UPDATE firefox_upload_retry_queue SET next_retry_at = ? WHERE id = ?"
-    )
-    .bind(now)
-    .bind(&id)
-    .execute(pool)
-    .await
+    match sqlx::query("UPDATE firefox_upload_retry_queue SET next_retry_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
     {
-        Ok(_) => (StatusCode::OK, Json(json!({"message": "Item scheduled for immediate retry"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to update item: {}", e)}))).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"message": "Item scheduled for immediate retry"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to update item: {}", e)})),
+        )
+            .into_response(),
     }
 }
 
 async fn firefox_upload_retry_delete(Path(id): Path<String>) -> Response {
     let pool = match crate::db::get_pool() {
         Ok(p) => p,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Database error: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Database error: {}", e)})),
+            )
+                .into_response()
+        }
     };
-    
+
     match sqlx::query("DELETE FROM firefox_upload_retry_queue WHERE id = ?")
         .bind(&id)
         .execute(pool)
         .await
     {
-        Ok(_) => (StatusCode::OK, Json(json!({"message": "Item deleted from retry queue"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete item: {}", e)}))).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"message": "Item deleted from retry queue"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to delete item: {}", e)})),
+        )
+            .into_response(),
     }
 }

@@ -1,4 +1,4 @@
-﻿use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 static MSG_REF: AtomicU8 = AtomicU8::new(1);
 

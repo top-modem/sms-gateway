@@ -58,7 +58,10 @@ struct MmsNotification {
 /// Persists (or refreshes, if the carrier re-sent the same notification) a row
 /// in `mms_inbox`. Errors are logged by the caller and never abort the SMS read
 /// cycle.
-pub async fn handle_notification_candidate(sim_id: &str, candidate: MmsNotificationCandidate) -> Result<()> {
+pub async fn handle_notification_candidate(
+    sim_id: &str,
+    candidate: MmsNotificationCandidate,
+) -> Result<()> {
     let raw = candidate.raw.as_slice();
 
     match decode_wap_push(raw) {
@@ -123,12 +126,20 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Decodes a raw WSP "Push" PDU down to the `m-notification-ind` fields we need.
 /// Layout (WAP-230-WSP §8): `[TID][PDU-Type=0x06][Headers-Len][Headers...][Body]`
 fn decode_wap_push(data: &[u8]) -> Result<MmsNotification> {
-    anyhow::ensure!(data.len() > 2, "WAP push payload too short ({} bytes)", data.len());
+    anyhow::ensure!(
+        data.len() > 2,
+        "WAP push payload too short ({} bytes)",
+        data.len()
+    );
 
     let mut pos = 1usize; // byte 0 = WSP transaction id, unused for Push
     let pdu_type = *data.get(pos).context("missing PDU type")?;
     pos += 1;
-    anyhow::ensure!(pdu_type == 0x06, "not a WSP Push PDU (type=0x{:02X})", pdu_type);
+    anyhow::ensure!(
+        pdu_type == 0x06,
+        "not a WSP Push PDU (type=0x{:02X})",
+        pdu_type
+    );
 
     // Headers-Len: Uintvar-integer. We don't need to individually parse the
     // WSP-level headers (mandatory Content-Type + optional charset) — the
@@ -136,7 +147,10 @@ fn decode_wap_push(data: &[u8]) -> Result<MmsNotification> {
     let (headers_len, len_bytes) = read_uintvar(data.get(pos..).context("missing headers-len")?)?;
     pos += len_bytes;
     let body_start = pos + headers_len as usize;
-    anyhow::ensure!(body_start <= data.len(), "WSP push header length out of bounds");
+    anyhow::ensure!(
+        body_start <= data.len(),
+        "WSP push header length out of bounds"
+    );
 
     decode_mms_notification_ind(&data[body_start..])
 }
@@ -161,7 +175,10 @@ fn decode_mms_notification_ind(data: &[u8]) -> Result<MmsNotification> {
             let name_end = match data[pos..].iter().position(|&b| b == 0) {
                 Some(idx) => pos + idx + 1,
                 None => {
-                    log::debug!("遇到非知名的MMS头字段名(0x{:02X})且未找到结尾，停止解析剩余头部", field);
+                    log::debug!(
+                        "遇到非知名的MMS头字段名(0x{:02X})且未找到结尾，停止解析剩余头部",
+                        field
+                    );
                     break;
                 }
             };
@@ -171,7 +188,10 @@ fn decode_mms_notification_ind(data: &[u8]) -> Result<MmsNotification> {
                     continue;
                 }
                 _ => {
-                    log::debug!("遇到非知名的MMS头字段(0x{:02X})，值解析失败，停止解析剩余头部", field);
+                    log::debug!(
+                        "遇到非知名的MMS头字段(0x{:02X})，值解析失败，停止解析剩余头部",
+                        field
+                    );
                     break;
                 }
             }
@@ -225,7 +245,9 @@ fn decode_mms_notification_ind(data: &[u8]) -> Result<MmsNotification> {
             HDR_FROM => {
                 // Skip -- we already have the true SMS sender from the outer PDU
                 // and don't need the (often hidden) MMS-layer From header.
-                read_value_length(&data[pos..]).ok().map(|(len, n)| n + len as usize)
+                read_value_length(&data[pos..])
+                    .ok()
+                    .map(|(len, n)| n + len as usize)
             }
             // Any other well-known header (X-Mms-MMS-Version, Priority,
             // Delivery-Report, Sender-Visibility, Reply-Charging, ...): we
@@ -238,14 +260,23 @@ fn decode_mms_notification_ind(data: &[u8]) -> Result<MmsNotification> {
         match step {
             Some(n) if pos + n <= data.len() => pos += n,
             _ => {
-                log::debug!("MMS头字段0x{:02X}解析失败或长度越界，停止解析剩余头部", field);
+                log::debug!(
+                    "MMS头字段0x{:02X}解析失败或长度越界，停止解析剩余头部",
+                    field
+                );
                 break;
             }
         }
     }
 
-    anyhow::ensure!(saw_notification_ind, "did not find X-Mms-Message-Type = m-notification-ind");
-    anyhow::ensure!(!notif.transaction_id.is_empty(), "missing X-Mms-Transaction-Id");
+    anyhow::ensure!(
+        saw_notification_ind,
+        "did not find X-Mms-Message-Type = m-notification-ind"
+    );
+    anyhow::ensure!(
+        !notif.transaction_id.is_empty(),
+        "missing X-Mms-Transaction-Id"
+    );
     Ok(notif)
 }
 
@@ -326,8 +357,15 @@ pub(crate) fn read_value_length(data: &[u8]) -> Result<(u64, usize)> {
 
 /// Text-string: optional leading Quote(0x7F), then bytes up to and including NUL.
 pub(crate) fn read_text_string(data: &[u8]) -> Result<(String, usize)> {
-    let (body, prefix) = if data.first() == Some(&0x7F) { (&data[1..], 1) } else { (data, 0) };
-    let nul_pos = body.iter().position(|&b| b == 0).context("text-string missing NUL terminator")?;
+    let (body, prefix) = if data.first() == Some(&0x7F) {
+        (&data[1..], 1)
+    } else {
+        (data, 0)
+    };
+    let nul_pos = body
+        .iter()
+        .position(|&b| b == 0)
+        .context("text-string missing NUL terminator")?;
     let s = String::from_utf8_lossy(&body[..nul_pos]).into_owned();
     Ok((s, prefix + nul_pos + 1))
 }
@@ -335,8 +373,14 @@ pub(crate) fn read_text_string(data: &[u8]) -> Result<(String, usize)> {
 /// Long-integer: `[length][value bytes, big-endian]`, length in 1..=8.
 pub(crate) fn read_long_integer(data: &[u8]) -> Result<(u64, usize)> {
     let len = *data.first().context("long-integer out of bounds")? as usize;
-    anyhow::ensure!((1..=8).contains(&len), "invalid long-integer length {}", len);
-    let value_bytes = data.get(1..1 + len).context("long-integer value out of bounds")?;
+    anyhow::ensure!(
+        (1..=8).contains(&len),
+        "invalid long-integer length {}",
+        len
+    );
+    let value_bytes = data
+        .get(1..1 + len)
+        .context("long-integer value out of bounds")?;
     let mut value: u64 = 0;
     for &b in value_bytes {
         value = (value << 8) | b as u64;

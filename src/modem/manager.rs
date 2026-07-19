@@ -669,10 +669,15 @@ impl ModemManager {
         let mut futures = FuturesUnordered::new();
 
         for sim_id in new_sim_ids {
-            let modems = self.modems.clone();
+            // Clone the modem Arc and release the map lock BEFORE the slow
+            // full-SIM SMS scan below; holding the read guard across it stalls
+            // all other promotions/demotions.
+            let modem = {
+                let modems = self.modems.read().await;
+                modems.get(&sim_id).cloned()
+            };
             futures.push(async move {
-                let modems = modems.read().await;
-                if let Some(modem) = modems.get(&sim_id) {
+                if let Some(modem) = modem {
                     match modem.read_sms_sync_insert(SmsType::All).await {
                         Ok(()) => info!("Initialized SMS data for new SIM: {}", sim_id),
                         Err(e) => error!("Failed to initialize SMS data for {}: {}", sim_id, e),
@@ -686,6 +691,14 @@ impl ModemManager {
 
     pub async fn get_sim_ids(&self) -> Vec<String> {
         self.modems.read().await.keys().cloned().collect()
+    }
+
+    /// All configured (com_port, baud_rate) pairs, in config order.
+    pub fn configured_ports(&self) -> Vec<(String, u32)> {
+        self.devices
+            .iter()
+            .map(|d| (d.com_port.clone(), d.baud_rate))
+            .collect()
     }
 
     pub async fn get_modem(&self, sim_id: &str) -> Option<Arc<Modem>> {
@@ -822,20 +835,23 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         webhook_manager: Option<webhook::WebhookManager>,
     ) {
-        let modems = self.modems.read().await;
+        // Snapshot the active modems and release the map lock BEFORE any serial
+        // I/O. Holding the read guard across the SMS reads below blocks all
+        // writers (SIM promotions/demotions) for the duration of the slowest
+        // modem, which stalled dashboard updates for minutes after a SIM move.
+        let entries: Vec<(String, Arc<Modem>)> = {
+            let modems = self.modems.read().await;
+            modems
+                .iter()
+                .filter(|(sim_id, _)| !sim_id.starts_with("fallback_sim_"))
+                .map(|(sim_id, modem)| (sim_id.clone(), modem.clone()))
+                .collect()
+        };
+
         let mut futures = FuturesUnordered::new();
-
-        for (sim_id, modem) in modems.iter() {
-            // Skip modems without a SIM card — they cannot receive SMS
-            if sim_id.starts_with("fallback_sim_") {
-                continue;
-            }
-
-            let modem = modem.clone();
+        for (sim_id, modem) in entries {
             let sse_manager = sse_manager.clone();
             let webhook_manager = webhook_manager.clone();
-            let sim_id = sim_id.clone();
-
             futures.push(async move {
                 if let Err(e) = modem
                     .read_sms_async_insert(sms_type, sse_manager, webhook_manager)

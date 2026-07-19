@@ -648,18 +648,17 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
         }));
     }
 
-    // Append stubs for ports that failed to open at startup, but avoid duplicates
-    // with ports that have since reconnected.
+    // Append stubs for unavailable ports, avoiding duplicates with ports that
+    // have since reconnected. Then append stubs for any configured port that is
+    // momentarily in neither list (mid-initialization at startup, or a brief
+    // USB re-enumeration window), so the dashboard always lists every port.
     let unavailable_ports = modem_manager.unavailable_ports.read().await.clone();
-    let active_ports: std::collections::HashSet<String> = details
+    let mut listed_ports: std::collections::HashSet<String> = details
         .iter()
         .filter_map(|d| d.get("com_port").and_then(|v| v.as_str()).map(String::from))
         .collect();
-    for (com_port, baud_rate) in unavailable_ports {
-        if active_ports.contains(&com_port) {
-            continue;
-        }
-        details.push(json!({
+    let unavailable_stub = |com_port: &str, baud_rate: u32| {
+        json!({
             "available": false,
             "sim_id": null,
             "has_sim": false,
@@ -675,7 +674,19 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
             "sim_status": null,
             "memory_status": null,
             "phone_number": null
-        }));
+        })
+    };
+    for (com_port, baud_rate) in unavailable_ports {
+        if !listed_ports.insert(com_port.clone()) {
+            continue;
+        }
+        details.push(unavailable_stub(&com_port, baud_rate));
+    }
+    for (com_port, baud_rate) in modem_manager.configured_ports() {
+        if !listed_ports.insert(com_port.clone()) {
+            continue;
+        }
+        details.push(unavailable_stub(&com_port, baud_rate));
     }
 
     // Sort by COM port number (COM1, COM2, ..., COM10, COM11, ...)

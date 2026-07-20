@@ -51,6 +51,9 @@ impl TranscribeConfig {
 pub struct ModemManager {
     modems: Arc<RwLock<HashMap<String, Arc<Modem>>>>,
     sim_cards_cache: Arc<RwLock<HashMap<String, SimCard>>>,
+    /// Last SIM ID observed on each COM port so unavailable-port rows can
+    /// still display the prior SIM identity instead of going blank.
+    last_known_sim_ids_by_port: Arc<RwLock<HashMap<String, String>>>,
     /// Semaphore shared by unavailable-port quick probes to limit concurrent
     /// serial port opens (especially important on large USB hubs).
     probe_semaphore: Arc<Semaphore>,
@@ -224,6 +227,10 @@ impl ModemManager {
                         Ok(cards) => {
                             if let Some(card) = cards.into_iter().next() {
                                 self.sim_cards_cache.write().await.insert(sim_id.clone(), card);
+                                self.last_known_sim_ids_by_port
+                                    .write()
+                                    .await
+                                    .insert(com_port.clone(), sim_id.clone());
                                 log::info!(
                                     "[recheck] Updated cache for reconnected SIM {} on port {}",
                                     sim_id, com_port
@@ -319,6 +326,7 @@ impl ModemManager {
         Self {
             modems: Arc::new(RwLock::new(HashMap::new())),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_known_sim_ids_by_port: Arc::new(RwLock::new(HashMap::new())),
             probe_semaphore: Arc::new(Semaphore::new(
                 config.settings.max_concurrent_modem_init.unwrap_or(3).max(1),
             )),
@@ -345,20 +353,9 @@ impl ModemManager {
         }
     }
 
-    async fn run_post_register_recovery(&self, sim_id: &str) {
+    async fn run_post_register_recovery(&self, modem: Arc<Modem>, sim_id: &str) {
         const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(15);
         const NETWORK_POLL_MAX_TIMES: u8 = 4;
-
-        let modem = match self.get_modem(sim_id).await {
-            Some(m) => m,
-            None => {
-                log::warn!(
-                    "[force_register][recovery] SIM {} not found when delayed recovery started",
-                    sim_id
-                );
-                return;
-            }
-        };
 
         let mut last_status_code = "unknown".to_string();
         let mut last_operator_id = "unknown".to_string();
@@ -433,6 +430,10 @@ impl ModemManager {
             last_operator_id
         );
 
+        log::warn!(
+            "[force_register][recovery] SIM {} sending AT+CFUN=1,1 before retrying COPS",
+            sim_id
+        );
         modem.reboot().await;
 
         // Wait up to 90s for the module to become responsive again.
@@ -452,6 +453,12 @@ impl ModemManager {
             );
         }
 
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        log::warn!(
+            "[force_register][recovery] SIM {} sending AT+COPS=1,2,\"46001\",7 after reboot",
+            sim_id
+        );
         match modem.register_cops_46001().await {
             Ok(()) => log::info!(
                 "[force_register][recovery] SIM {} AT+COPS=1,2,\"46001\",7 succeeded",
@@ -467,13 +474,16 @@ impl ModemManager {
 
     /// Start post-register recovery for one SIM immediately in the background.
     /// Any existing recovery task for the same SIM is cancelled and replaced.
-    pub async fn start_post_register_recovery(self: Arc<Self>, sim_id: String) {
+    pub async fn start_post_register_recovery(self: Arc<Self>, modem: Arc<Modem>, sim_id: String) {
         let task_id = self.post_register_recovery_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let manager = self.clone();
+        let modem_for_task = modem.clone();
         let sim_id_for_task = sim_id.clone();
 
         let handle = tokio::spawn(async move {
-            manager.run_post_register_recovery(&sim_id_for_task).await;
+            manager
+                .run_post_register_recovery(modem_for_task, &sim_id_for_task)
+                .await;
             manager
                 .clear_post_register_recovery_task_if_current(&sim_id_for_task, task_id)
                 .await;
@@ -755,6 +765,15 @@ impl ModemManager {
         let mut cache = self.sim_cards_cache.write().await;
         *cache = sim_cards;
         drop(cache);
+
+        {
+            let mut last_known = self.last_known_sim_ids_by_port.write().await;
+            last_known.clear();
+            for (sim_id, modem) in modems.iter() {
+                last_known.insert(modem.com_port.clone(), sim_id.clone());
+            }
+        }
+
         drop(modems);
 
         for (iccid, modem) in missing {
@@ -1641,6 +1660,35 @@ impl ModemManager {
         self.sim_cards_cache.read().await.get(sim_id).cloned()
     }
 
+    pub async fn get_last_known_sim_card_for_port(&self, com_port: &str) -> Option<SimCard> {
+        let sim_id = self.last_known_sim_ids_by_port.read().await.get(com_port).cloned()?;
+        self.get_sim_card_cached(&sim_id).await
+    }
+
+    pub async fn update_sim_cache(&self, sim_card: SimCard) {
+        let mut cache = self.sim_cards_cache.write().await;
+        cache.insert(sim_card.id.clone(), sim_card);
+    }
+
+    /// Refresh the in-memory SIM cache for the given SIM IDs from the database.
+    pub async fn refresh_sim_cache(&self, sim_ids: &[String]) {
+        if sim_ids.is_empty() {
+            return;
+        }
+        let refs: Vec<&str> = sim_ids.iter().map(|s| s.as_str()).collect();
+        match SimCard::get_by_ids(&refs).await {
+            Ok(cards) => {
+                let mut cache = self.sim_cards_cache.write().await;
+                for (sim_id, card) in cards {
+                    cache.insert(sim_id, card);
+                }
+            }
+            Err(e) => {
+                log::warn!("[refresh_sim_cache] Failed to refresh SIM cache: {}", e);
+            }
+        }
+    }
+
     /// Find the sim_id (ICCID) that matches a given SIM phone number.
     /// Searches the in-memory cache, so the SIM must have been seen at least once.
     /// Normalizes both numbers before comparing (removes leading '+' and any
@@ -1676,30 +1724,6 @@ impl ModemManager {
                 }
             })
         })
-    }
-
-    pub async fn update_sim_cache(&self, sim_card: SimCard) {
-        let mut cache = self.sim_cards_cache.write().await;
-        cache.insert(sim_card.id.clone(), sim_card);
-    }
-
-    /// Refresh the in-memory SIM cache for the given SIM IDs from the database.
-    pub async fn refresh_sim_cache(&self, sim_ids: &[String]) {
-        if sim_ids.is_empty() {
-            return;
-        }
-        let refs: Vec<&str> = sim_ids.iter().map(|s| s.as_str()).collect();
-        match SimCard::get_by_ids(&refs).await {
-            Ok(cards) => {
-                let mut cache = self.sim_cards_cache.write().await;
-                for (sim_id, card) in cards {
-                    cache.insert(sim_id, card);
-                }
-            }
-            Err(e) => {
-                log::warn!("[refresh_sim_cache] Failed to refresh SIM cache: {}", e);
-            }
-        }
     }
     // ─── Voice call delegation ────────────────────────────────────────────────
 

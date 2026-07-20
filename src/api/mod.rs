@@ -652,11 +652,12 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
     // Append stubs for ports that failed to open at startup
     let unavailable_ports = modem_manager.unavailable_ports.read().await.clone();
     for (com_port, baud_rate) in unavailable_ports {
+        let last_known = modem_manager.get_last_known_sim_card_for_port(&com_port).await;
         details.push(json!({
             "available": false,
-            "sim_id": null,
+            "sim_id": last_known.as_ref().map(|card| card.id.clone()),
             "has_sim": false,
-            "name": null,
+            "name": last_known.as_ref().map(|card| card.id.clone()),
             "com_port": com_port,
             "baud_rate": baud_rate,
             "signal_quality": null,
@@ -667,7 +668,7 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
             "sms_center": null,
             "sim_status": null,
             "memory_status": null,
-            "phone_number": null
+            "phone_number": last_known.and_then(|card| card.phone_number)
         }));
     }
 
@@ -714,12 +715,20 @@ async fn force_register_sims(
     for sim_id in request.sim_ids.clone() {
         let mm = modem_manager.clone();
         futs.push(async move {
-            let com_port = mm.get_modem(&sim_id).await.map(|m| m.com_port.clone());
+            let modem = mm.get_modem(&sim_id).await;
+            let com_port = modem.as_ref().map(|m| m.com_port.clone());
             let result = mm.force_register(&sim_id).await;
             if result.is_ok() {
-                mm.clone()
-                    .start_post_register_recovery(sim_id.clone())
-                    .await;
+                if let Some(modem) = modem {
+                    mm.clone()
+                        .start_post_register_recovery(modem, sim_id.clone())
+                        .await;
+                } else {
+                    log::warn!(
+                        "[force_register] SIM {} was not available for immediate recovery start",
+                        sim_id
+                    );
+                }
             }
             (sim_id, com_port, result)
         });

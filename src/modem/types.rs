@@ -107,6 +107,14 @@ impl NetworkRegistrationStatus {
             .find(|line| line.trim().starts_with("+CEREG:"))
             .and_then(|line| Self::parse_from_line(line))
     }
+
+    pub fn status_code(&self) -> &str {
+        self.status.as_str()
+    }
+
+    pub fn is_roaming(&self) -> bool {
+        self.status.trim() == "5"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,18 +134,26 @@ impl OperatorInfo {
                 let parts: Vec<&str> = data.split(',').collect();
 
                 if parts.len() >= 3 {
+                    let operator = parts[2].trim().trim_matches('"').to_string();
                     Some(OperatorInfo {
                         registration_status: parts[0].trim().to_string(),
-                        operator_name: parts[2].trim_matches('"').to_string(),
-                        operator_id: parts
-                            .get(3)
-                            .map(|s| s.trim_matches('"').to_string())
-                            .unwrap_or_else(|| parts[2].trim_matches('"').to_string()),
+                        operator_name: operator.clone(),
+                        // +COPS: <mode>,<format>,<oper>[,<AcT>]
+                        // <oper> is at parts[2]; parts[3] is access technology (e.g. 7), not operator ID.
+                        operator_id: operator,
                     })
                 } else {
                     None
                 }
             })
+    }
+
+    pub fn operator_id(&self) -> &str {
+        self.operator_id.as_str()
+    }
+
+    pub fn is_operator(&self, operator_id: &str) -> bool {
+        self.operator_id.trim() == operator_id
     }
 }
 

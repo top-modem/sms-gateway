@@ -1,4 +1,4 @@
-use chrono::{Timelike, Utc};
+﻿use chrono::{Timelike, Utc};
 use log::{debug, error, info, warn};
 use std::io;
 use std::sync::Arc;
@@ -847,18 +847,38 @@ impl Modem {
         // Manual operator selection may take a long time while the modem scans
         // and registers; give it a longer outer timeout like send_cops_command.
         tokio::time::sleep(Duration::from_millis(300)).await;
+        self.register_cops_46001().await?;
+        info!("[force_register] AT+COPS succeeded on {}", self.com_port);
+        Ok(())
+    }
+
+    /// Manually register to China Unicom 46001 (LTE) via AT+COPS=1,2,"46001",7.
+    /// Uses a 30s outer timeout since network registration is slow.
+    pub async fn register_cops_46001(&self) -> Result<(), String> {
         let response = self
             .send_command_outer_timeout("AT+COPS=1,2,\"46001\",7\r\n", 30)
             .await
             .map_err(|e| format!("AT+COPS failed: {}", e))?;
         if !response.contains("OK") {
-            return Err(format!(
-                "AT+COPS failed: {}",
-                Self::format_log(&response)
-            ));
+            return Err(format!("AT+COPS failed: {}", Self::format_log(&response)));
         }
-        info!("[force_register] AT+COPS succeeded on {}", self.com_port);
         Ok(())
+    }
+
+    /// Reboot the module via AT+CFUN=1,1. The module may reset before replying,
+    /// so OK, timeout, or a dropped connection all count as "reboot initiated".
+    pub async fn reboot(&self) {
+        let _ = self
+            .send_command_outer_timeout("AT+CFUN=1,1\r\n", 8)
+            .await;
+    }
+
+    /// Quick liveness probe: send AT with a short timeout and expect OK.
+    pub async fn probe_alive(&self) -> bool {
+        matches!(
+            self.send_command_outer_timeout("AT\r\n", 3).await,
+            Ok(resp) if resp.contains("OK")
+        )
     }
 
     async fn send_command_priority(&self, command: &str, priority: u8) -> io::Result<String> {
@@ -1120,21 +1140,12 @@ impl Modem {
                                                 if sms.send {
                                                     continue;
                                                 }
-                                                let item_id = crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await.ok().flatten();
-                                                let upload_content = if let Some(ref id) = item_id {
-                                                    crate::db::build_upload_sms_content(id, &sms.message).await.unwrap_or_else(|e| {
-                                                        log::error!("[{}] Failed to build upload content for incoming SMS, using original: {}", sim_id, e);
-                                                        sms.message.clone()
-                                                    })
-                                                } else {
-                                                    sms.message.clone()
-                                                };
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,
                                                     country_id,
                                                     phone_num,
-                                                    &upload_content,
+                                                    &sms.message,
                                                 )
                                                 .await
                                                 {

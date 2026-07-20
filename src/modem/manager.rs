@@ -2,6 +2,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use log::{error, info};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -71,6 +72,10 @@ pub struct ModemManager {
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
     /// True once the initial background modem initialization has completed.
     initialization_complete: RwLock<bool>,
+    /// One delayed post-register recovery task per SIM (task_id, handle).
+    post_register_recovery_tasks: RwLock<HashMap<String, (u64, JoinHandle<()>)>>,
+    /// Monotonic sequence used to avoid stale task cleanup races.
+    post_register_recovery_seq: AtomicU64,
 }
 
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
@@ -326,7 +331,181 @@ impl ModemManager {
             default_sms_storage: config.settings.sms_storage,
             sim_probe_fail_counts: RwLock::new(HashMap::new()),
             initialization_complete: RwLock::new(false),
+            post_register_recovery_tasks: RwLock::new(HashMap::new()),
+            post_register_recovery_seq: AtomicU64::new(0),
         }
+    }
+
+    async fn clear_post_register_recovery_task_if_current(&self, sim_id: &str, task_id: u64) {
+        let mut tasks = self.post_register_recovery_tasks.write().await;
+        if let Some((current_id, _)) = tasks.get(sim_id) {
+            if *current_id == task_id {
+                tasks.remove(sim_id);
+            }
+        }
+    }
+
+    async fn run_post_register_recovery(&self, sim_id: &str) {
+        const ROAMING_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+        const ROAMING_RECHECK_MAX_TIMES: u8 = 10;
+
+        let modem = match self.get_modem(sim_id).await {
+            Some(m) => m,
+            None => {
+                log::warn!(
+                    "[force_register][recovery] SIM {} not found when delayed recovery started",
+                    sim_id
+                );
+                return;
+            }
+        };
+
+        let mut network;
+        let mut operator;
+        let mut status_code;
+        let mut operator_id;
+
+        let mut roaming_rechecks = 0u8;
+        loop {
+            network = match modem.check_network_registration().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "[force_register][recovery] SIM {} failed to read network status: {}",
+                        sim_id,
+                        e
+                    );
+                    None
+                }
+            };
+
+            operator = match modem.check_operator().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "[force_register][recovery] SIM {} failed to read operator: {}",
+                        sim_id,
+                        e
+                    );
+                    None
+                }
+            };
+
+            let is_roaming = network.as_ref().is_some_and(|n| n.is_roaming());
+            let is_unicom_46001 = operator.as_ref().is_some_and(|o| o.is_operator("46001"));
+            status_code = network
+                .as_ref()
+                .map(|n| n.status_code().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            operator_id = operator
+                .as_ref()
+                .map(|o| o.operator_id().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            if is_unicom_46001 {
+                log::info!(
+                    "[force_register][recovery] SIM {} already on 46001 (status={}, operator_id={})",
+                    sim_id,
+                    status_code,
+                    operator_id
+                );
+                return;
+            }
+
+            if !is_roaming {
+                break;
+            }
+
+            if roaming_rechecks >= ROAMING_RECHECK_MAX_TIMES {
+                log::warn!(
+                    "[force_register][recovery] SIM {} stayed roaming after {} rechecks; skipping reboot/COPS this round (status={}, operator_id={})",
+                    sim_id,
+                    ROAMING_RECHECK_MAX_TIMES,
+                    status_code,
+                    operator_id
+                );
+                return;
+            }
+
+            roaming_rechecks += 1;
+            log::info!(
+                "[force_register][recovery] SIM {} still roaming (status={}, operator_id={}); rechecking in {}s ({}/{})",
+                sim_id,
+                status_code,
+                operator_id,
+                ROAMING_RECHECK_INTERVAL.as_secs(),
+                roaming_rechecks,
+                ROAMING_RECHECK_MAX_TIMES
+            );
+            tokio::time::sleep(ROAMING_RECHECK_INTERVAL).await;
+        }
+
+        log::warn!(
+            "[force_register][recovery] SIM {} still not on 46001 and not roaming after 5 minutes (status={}, operator_id={}); rebooting",
+            sim_id,
+            status_code,
+            operator_id
+        );
+
+        modem.reboot().await;
+
+        // Wait up to 90s for the module to become responsive again.
+        let mut alive = false;
+        for _ in 0..45 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if modem.probe_alive().await {
+                alive = true;
+                break;
+            }
+        }
+
+        if !alive {
+            log::warn!(
+                "[force_register][recovery] SIM {} did not become responsive after reboot; attempting COPS anyway",
+                sim_id
+            );
+        }
+
+        match modem.register_cops_46001().await {
+            Ok(()) => log::info!(
+                "[force_register][recovery] SIM {} AT+COPS=1,2,\"46001\",7 succeeded",
+                sim_id
+            ),
+            Err(e) => log::error!(
+                "[force_register][recovery] SIM {} AT+COPS=1,2,\"46001\",7 failed: {}",
+                sim_id,
+                e
+            ),
+        }
+    }
+
+    /// Schedule delayed post-register recovery for one SIM.
+    /// Any existing timer for the same SIM is cancelled and replaced.
+    pub async fn schedule_post_register_recovery(self: Arc<Self>, sim_id: String) {
+        const RECOVERY_DELAY: Duration = Duration::from_secs(300);
+
+        let task_id = self.post_register_recovery_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let manager = self.clone();
+        let sim_id_for_task = sim_id.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(RECOVERY_DELAY).await;
+            manager.run_post_register_recovery(&sim_id_for_task).await;
+            manager
+                .clear_post_register_recovery_task_if_current(&sim_id_for_task, task_id)
+                .await;
+        });
+
+        let mut tasks = self.post_register_recovery_tasks.write().await;
+        if let Some((_old_id, old_handle)) = tasks.insert(sim_id.clone(), (task_id, handle)) {
+            old_handle.abort();
+        }
+
+        log::info!(
+            "[force_register][recovery] Scheduled 5-minute recovery timer for SIM {} (task_id={})",
+            sim_id,
+            task_id
+        );
     }
 
     /// Initialize all configured modems and start their URC handlers.

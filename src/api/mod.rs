@@ -694,8 +694,8 @@ struct ForceRegisterRequest {
     sim_ids: Vec<String>,
 }
 
-/// Force network registration sequence immediately, then schedule a 5-minute
-/// delayed recovery check per selected SIM.
+/// Force network registration sequence immediately, then start an immediate
+/// background recovery check per selected SIM.
 async fn force_register_sims(
     State(modem_manager): State<ModemManagerRef>,
     Json(request): Json<ForceRegisterRequest>,
@@ -718,7 +718,7 @@ async fn force_register_sims(
             let result = mm.force_register(&sim_id).await;
             if result.is_ok() {
                 mm.clone()
-                    .schedule_post_register_recovery(sim_id.clone())
+                    .start_post_register_recovery(sim_id.clone())
                     .await;
             }
             (sim_id, com_port, result)
@@ -732,7 +732,7 @@ async fn force_register_sims(
             "com_port": com_port,
             "success": result.is_ok(),
             "message": match &result {
-                Ok(()) => "OK (5-minute recovery scheduled)".to_string(),
+                Ok(()) => "OK (immediate recovery started)".to_string(),
                 Err(e) => e.clone(),
             },
         }));

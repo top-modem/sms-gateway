@@ -346,8 +346,8 @@ impl ModemManager {
     }
 
     async fn run_post_register_recovery(&self, sim_id: &str) {
-        const ROAMING_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
-        const ROAMING_RECHECK_MAX_TIMES: u8 = 10;
+        const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(15);
+        const NETWORK_POLL_MAX_TIMES: u8 = 4;
 
         let modem = match self.get_modem(sim_id).await {
             Some(m) => m,
@@ -360,14 +360,13 @@ impl ModemManager {
             }
         };
 
-        let mut network;
-        let mut operator;
-        let mut status_code;
-        let mut operator_id;
+        let mut last_status_code = "unknown".to_string();
+        let mut last_operator_id = "unknown".to_string();
 
-        let mut roaming_rechecks = 0u8;
-        loop {
-            network = match modem.check_network_registration().await {
+        for attempt in 1..=NETWORK_POLL_MAX_TIMES {
+            tokio::time::sleep(NETWORK_POLL_INTERVAL).await;
+
+            let network = match modem.check_network_registration().await {
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!(
@@ -379,7 +378,7 @@ impl ModemManager {
                 }
             };
 
-            operator = match modem.check_operator().await {
+            let operator = match modem.check_operator().await {
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!(
@@ -393,58 +392,45 @@ impl ModemManager {
 
             let is_roaming = network.as_ref().is_some_and(|n| n.is_roaming());
             let is_unicom_46001 = operator.as_ref().is_some_and(|o| o.is_operator("46001"));
-            status_code = network
+            let status_code = network
                 .as_ref()
                 .map(|n| n.status_code().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
-            operator_id = operator
+            let operator_id = operator
                 .as_ref()
                 .map(|o| o.operator_id().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
+            last_status_code = status_code.clone();
+            last_operator_id = operator_id.clone();
 
-            if is_unicom_46001 {
+            if is_roaming && is_unicom_46001 {
                 log::info!(
-                    "[force_register][recovery] SIM {} already on 46001 (status={}, operator_id={})",
+                    "[force_register][recovery] SIM {} reached target roaming registration on 46001 after {}s (status={}, operator_id={})",
                     sim_id,
+                    attempt as u64 * NETWORK_POLL_INTERVAL.as_secs(),
                     status_code,
                     operator_id
                 );
                 return;
             }
 
-            if !is_roaming {
-                break;
-            }
-
-            if roaming_rechecks >= ROAMING_RECHECK_MAX_TIMES {
-                log::warn!(
-                    "[force_register][recovery] SIM {} stayed roaming after {} rechecks; skipping reboot/COPS this round (status={}, operator_id={})",
-                    sim_id,
-                    ROAMING_RECHECK_MAX_TIMES,
-                    status_code,
-                    operator_id
-                );
-                return;
-            }
-
-            roaming_rechecks += 1;
             log::info!(
-                "[force_register][recovery] SIM {} still roaming (status={}, operator_id={}); rechecking in {}s ({}/{})",
+                "[force_register][recovery] SIM {} not yet at target state after {}s (status={}, operator_id={}); rechecking ({}/{})",
                 sim_id,
+                attempt as u64 * NETWORK_POLL_INTERVAL.as_secs(),
                 status_code,
                 operator_id,
-                ROAMING_RECHECK_INTERVAL.as_secs(),
-                roaming_rechecks,
-                ROAMING_RECHECK_MAX_TIMES
+                attempt,
+                NETWORK_POLL_MAX_TIMES
             );
-            tokio::time::sleep(ROAMING_RECHECK_INTERVAL).await;
         }
 
         log::warn!(
-            "[force_register][recovery] SIM {} still not on 46001 and not roaming after 5 minutes (status={}, operator_id={}); rebooting",
+            "[force_register][recovery] SIM {} did not reach roaming on 46001 within {}s (status={}, operator_id={}); rebooting",
             sim_id,
-            status_code,
-            operator_id
+            NETWORK_POLL_INTERVAL.as_secs() * NETWORK_POLL_MAX_TIMES as u64,
+            last_status_code,
+            last_operator_id
         );
 
         modem.reboot().await;
@@ -479,17 +465,14 @@ impl ModemManager {
         }
     }
 
-    /// Schedule delayed post-register recovery for one SIM.
-    /// Any existing timer for the same SIM is cancelled and replaced.
-    pub async fn schedule_post_register_recovery(self: Arc<Self>, sim_id: String) {
-        const RECOVERY_DELAY: Duration = Duration::from_secs(300);
-
+    /// Start post-register recovery for one SIM immediately in the background.
+    /// Any existing recovery task for the same SIM is cancelled and replaced.
+    pub async fn start_post_register_recovery(self: Arc<Self>, sim_id: String) {
         let task_id = self.post_register_recovery_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let manager = self.clone();
         let sim_id_for_task = sim_id.clone();
 
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(RECOVERY_DELAY).await;
             manager.run_post_register_recovery(&sim_id_for_task).await;
             manager
                 .clear_post_register_recovery_task_if_current(&sim_id_for_task, task_id)
@@ -502,7 +485,7 @@ impl ModemManager {
         }
 
         log::info!(
-            "[force_register][recovery] Scheduled 5-minute recovery timer for SIM {} (task_id={})",
+            "[force_register][recovery] Started immediate recovery task for SIM {} (task_id={})",
             sim_id,
             task_id
         );

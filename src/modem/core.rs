@@ -824,13 +824,15 @@ impl Modem {
     }
 
     /// Force network registration to China Unicom (46001) using the Quectel
-    /// scan-control + COPS sequence:
-    ///   1. AT+QOPSCFG="scancontrol",2,0,80,0
-    ///   2. AT+QCFG="cops_control",1
-    ///   3. AT+COPS=1,2,"46001",7
+    /// band/scan-control + COPS sequence:
+    ///   1. AT+QCFG="band",0,80,0,1
+    ///   2. AT+QOPSCFG="scancontrol",2,0,80,0
+    ///   3. AT+QCFG="cops_control",1
+    ///   4. AT+COPS=1,2,"46001",7
     /// Steps are strictly ordered; the sequence aborts on the first failure.
     pub async fn force_register(&self) -> Result<(), String> {
         for (command, name) in [
+            ("AT+QCFG=\"band\",0,80,0,1\r\n", "AT+QCFG(band)"),
             ("AT+QOPSCFG=\"scancontrol\",2,0,80,0\r\n", "AT+QOPSCFG"),
             ("AT+QCFG=\"cops_control\",1\r\n", "AT+QCFG"),
         ] {

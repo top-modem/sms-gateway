@@ -1562,6 +1562,15 @@ impl ModemManager {
         modem.force_register().await
     }
 
+    /// Re-register a SIM using the 46000 COPS command only.
+    pub async fn re_register(&self, sim_id: &str) -> Result<(), String> {
+        let modem = self
+            .get_modem(sim_id)
+            .await
+            .ok_or_else(|| format!("Modem not found for SIM ID: {}", sim_id))?;
+        modem.register_cops_46000().await
+    }
+
     pub async fn set_sms_storage(
         &self,
         sim_id: &str,

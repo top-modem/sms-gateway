@@ -195,6 +195,8 @@
     try {
       await apiClient.deleteAllFromPlatform();
       deleteResult = $t('msg_delete_success');
+      selected = new Set();
+      await fetchData();
     } catch (e) {
       deleteError = e?.data?.error ?? e?.message ?? $t('err_delete_failed');
     } finally {
@@ -416,8 +418,8 @@
                     />
                   </th>
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_com_port')}</th>
-                  <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_iccid')}</th>
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_phone_number')}</th>
+                  <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_iccid')}</th>
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('saved_country_label')}</th>
                 </tr>
               </thead>
@@ -435,8 +437,8 @@
                       />
                     </td>
                     <td class="px-3 py-2 font-mono text-gray-700 dark:text-gray-200">{sim.com_port ?? '—'}</td>
-                    <td class="px-3 py-2 font-mono text-gray-500 dark:text-gray-400">{sim.sim_id}</td>
                     <td class="px-3 py-2 font-mono text-gray-700 dark:text-gray-200">{sim.card?.phone_number ?? '—'}</td>
+                    <td class="px-3 py-2 font-mono text-gray-500 dark:text-gray-400">{sim.sim_id}</td>
                     <td class="px-3 py-2 text-gray-600 dark:text-gray-300">{countryName(sim.card?.country_code) ?? '—'}</td>
                   </tr>
                 {:else}

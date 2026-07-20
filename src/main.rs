@@ -343,8 +343,19 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             let mut mark_task_processed = true;
                             match modem_manager.read_sms_and_get_latest(&sim_id).await {
                                 Ok(Some(sms)) => {
+                                    let upload_content = db::build_upload_sms_content(&item_id, &sms.message)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            log::error!(
+                                                "[火狐狸轮询] 构建上传短信内容失败 (SMS ID: {}, Item_ID: {}): {}，使用原始短信内容",
+                                                sms.id,
+                                                item_id,
+                                                e
+                                            );
+                                            sms.message.clone()
+                                        });
                                     log::info!("[火狐狸轮询] 获取到短信内容 ({}): {}, 上传中 - 号码: {}", sms.contact_id, sms.message, phone_num);
-                                    match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &sms.message).await {
+                                    match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &upload_content).await {
                                         Ok(upload_resp) if upload_resp.code == "1" => {
                                             let response_json = serde_json::to_string(&upload_resp).ok();
                                             if let Err(e) = db::Sms::mark_platform_attempt(
@@ -458,8 +469,19 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                                 for result_item in arr {
                                                     if let Some(content) = result_item.get("Phone_SmsContent").and_then(|v| v.as_str()) {
                                                         if !content.is_empty() {
+                                                            let upload_content = db::build_upload_sms_content(&item_id, content)
+                                                                .await
+                                                                .unwrap_or_else(|e| {
+                                                                    log::error!(
+                                                                        "[火狐狸轮询] 构建平台列表上传短信内容失败 (SIM: {}, Item_ID: {}): {}，使用原始短信内容",
+                                                                        sim_id,
+                                                                        item_id,
+                                                                        e
+                                                                    );
+                                                                    content.to_string()
+                                                                });
                                                             log::info!("[火狐狸轮询] 从平台获取到短信内容, 上传中 - 号码: {}, Item_ID: {}", phone_num, item_id);
-                                                            match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, content).await {
+                                                            match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &upload_content).await {
                                                                 Ok(upload_resp) if upload_resp.code == "1" => {
                                                                     let response_json = serde_json::to_string(&upload_resp).ok();
                                                                     if let Err(e) = db::Sms::mark_platform_attempt_by_phone_message(

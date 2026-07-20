@@ -823,32 +823,24 @@ impl Modem {
         }
     }
 
-    /// Force network registration to China Unicom (46001) using the Quectel
-    /// band/scan-control + COPS sequence:
-    ///   1. AT+QCFG="band",0,80,0,1
-    ///   2. AT+QOPSCFG="scancontrol",2,0,80,0
-    ///   3. AT+QCFG="cops_control",1
-    ///   4. AT+COPS=1,2,"46001",7
-    /// Steps are strictly ordered; the sequence aborts on the first failure.
+    /// Force network registration to China Unicom (46001) using only
+    /// AT+COPS=1,2,"46001",7.
     pub async fn force_register(&self) -> Result<(), String> {
-        for (command, name) in [
-            ("AT+QCFG=\"band\",0,80,0,1\r\n", "AT+QCFG(band)"),
-            ("AT+QOPSCFG=\"scancontrol\",2,0,80,0\r\n", "AT+QOPSCFG"),
-            ("AT+QCFG=\"cops_control\",1\r\n", "AT+QCFG"),
-        ] {
-            // Brief gap so the modem can apply the previous setting.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            self.send_command_with_ok(command)
-                .await
-                .map_err(|e| format!("{} failed: {}", name, e))?;
-            info!("[force_register] {} succeeded on {}", name, self.com_port);
-        }
-
-        // Manual operator selection may take a long time while the modem scans
-        // and registers; give it a longer outer timeout like send_cops_command.
-        tokio::time::sleep(Duration::from_millis(300)).await;
         self.register_cops_46001().await?;
         info!("[force_register] AT+COPS succeeded on {}", self.com_port);
+        Ok(())
+    }
+
+    /// Force network registration to China Unicom 46000 using only
+    /// AT+COPS=1,2,"46000",7.
+    pub async fn register_cops_46000(&self) -> Result<(), String> {
+        let response = self
+            .send_command_outer_timeout("AT+COPS=1,2,\"46000\",7\r\n", 30)
+            .await
+            .map_err(|e| format!("AT+COPS failed: {}", e))?;
+        if !response.contains("OK") {
+            return Err(format!("AT+COPS failed: {}", Self::format_log(&response)));
+        }
         Ok(())
     }
 

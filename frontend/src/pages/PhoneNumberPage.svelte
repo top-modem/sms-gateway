@@ -1,5 +1,5 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import Icon from '@iconify/svelte';
   import { apiClient } from '../js/api.js';
   import { t } from '../js/i18n.js';
@@ -7,7 +7,7 @@
   let { onBack = () => {} } = $props();
 
   // ── State ──────────────────────────────────────────────────────────────────
-  let activeTab = $state('import'); // 'import' | 'barcode' | 'call' | 'sms' | 'ussd'
+  let activeTab = $state('barcode'); // 'barcode' | 'import' | 'call' | 'sms' | 'ussd'
   let sims = $state([]);
   let simCards = $state([]);
   let loading = $state(true);
@@ -114,14 +114,27 @@
     pollStatus();
   }
 
-  function setActiveTab(tabId) {
+  async function focusBarcodeIccidInput() {
+    await tick();
+    iccidInput?.focus();
+    iccidInput?.select?.();
+  }
+
+  async function setActiveTab(tabId) {
     activeTab = tabId;
     error = '';
     if (tabId === 'barcode') {
       fetchBarcodeScans();
-      setTimeout(() => iccidInput?.focus(), 50);
+      await focusBarcodeIccidInput();
     }
   }
+
+  $effect(() => {
+    if (activeTab === 'barcode' && !loading) {
+      // Re-apply focus when the barcode pane becomes rendered after async loads.
+      void focusBarcodeIccidInput();
+    }
+  });
 
   // ── Import tab ─────────────────────────────────────────────────────────────
   function parseImportText(text) {
@@ -333,7 +346,13 @@
     }
   }
 
-  onMount(fetchData);
+  onMount(async () => {
+    await fetchData();
+    if (activeTab === 'barcode') {
+      await fetchBarcodeScans();
+      await focusBarcodeIccidInput();
+    }
+  });
   onDestroy(() => {
     if (statusTask) clearTimeout(statusTask);
   });
@@ -353,8 +372,8 @@
   <div class="px-4 pt-4 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800">
     <div class="flex gap-1 overflow-x-auto">
       {#each [
-        { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },
         { id: 'barcode', label: $t('phone_tab_barcode'), icon: 'carbon:scan' },
+        { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },
         { id: 'call', label: $t('phone_tab_call'), icon: 'carbon:phone-outgoing' },
         { id: 'sms', label: $t('phone_tab_sms'), icon: 'carbon:send-alt' },
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
@@ -551,6 +570,7 @@
                 <table class="min-w-full text-sm">
                   <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
                     <tr>
+                      <th class="px-3 py-2 text-left font-medium">#</th>
                       <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_iccid')}</th>
                       <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_msisdn')}</th>
                       <th class="px-3 py-2 text-left font-medium">{$t('barcode_col_current_phone')}</th>
@@ -558,8 +578,9 @@
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
-                    {#each barcodeScans as scan}
+                    {#each barcodeScans as scan, index}
                       <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                        <td class="px-3 py-2 font-mono text-xs text-gray-500 dark:text-gray-400">{index + 1}</td>
                         <td class="px-3 py-2 font-mono text-xs">{scan.iccid}</td>
                         <td class="px-3 py-2 font-mono text-xs">{scan.msisdn}</td>
                         <td class="px-3 py-2 font-mono text-xs">{scan.phone_number ?? '-'}</td>

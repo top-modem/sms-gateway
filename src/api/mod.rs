@@ -20,7 +20,7 @@ pub use sse_manager::{CallEvent, SseManager};
 
 use crate::{
     config::SmsStorage,
-    db::{AppSetting, Call, Contact, Conversation, SimCard, Sms},
+    db::{AppSetting, BarcodeScan, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
     phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
@@ -157,6 +157,10 @@ pub async fn run_api(
             post(force_register_sims).with_state(modem_manager.clone()),
         )
         .route(
+            "/sims/re-register",
+            post(re_register_sims).with_state(modem_manager.clone()),
+        )
+        .route(
             "/sims/{sim_id}/info",
             get(get_enhanced_sim_info).with_state(modem_manager.clone()),
         )
@@ -187,7 +191,23 @@ pub async fn run_api(
         )
         .route(
             "/phone-numbers/barcode-scan",
+            post(phone_numbers_barcode_submit).with_state(barcode_state.clone()),
+        )
+        .route(
+            "/phone-numbers/barcode-scan",
             get(phone_numbers_barcode_scan).with_state(barcode_state.clone()),
+        )
+        .route(
+            "/phone-numbers/barcode-scans",
+            get(phone_numbers_barcode_scans_list),
+        )
+        .route(
+            "/phone-numbers/barcode-scans",
+            delete(phone_numbers_barcode_scans_clear),
+        )
+        .route(
+            "/phone-numbers/barcode-scans/import",
+            post(phone_numbers_barcode_scans_import).with_state(modem_manager.clone()),
         )
         .route(
             "/phone-numbers/barcode-scan/launch",
@@ -715,21 +735,8 @@ async fn force_register_sims(
     for sim_id in request.sim_ids.clone() {
         let mm = modem_manager.clone();
         futs.push(async move {
-            let modem = mm.get_modem(&sim_id).await;
-            let com_port = modem.as_ref().map(|m| m.com_port.clone());
+            let com_port = mm.get_modem(&sim_id).await.map(|m| m.com_port.clone());
             let result = mm.force_register(&sim_id).await;
-            if result.is_ok() {
-                if let Some(modem) = modem {
-                    mm.clone()
-                        .start_post_register_recovery(modem, sim_id.clone())
-                        .await;
-                } else {
-                    log::warn!(
-                        "[force_register] SIM {} was not available for immediate recovery start",
-                        sim_id
-                    );
-                }
-            }
             (sim_id, com_port, result)
         });
     }
@@ -748,6 +755,51 @@ async fn force_register_sims(
     }
 
     (StatusCode::OK, Json(json!({ "results": results }))).into_response()
+}
+
+async fn re_register_sims(
+    State(modem_manager): State<ModemManagerRef>,
+    Json(request): Json<ForceRegisterRequest>,
+) -> Response {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    if request.sim_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "sim_ids is required"})),
+        )
+            .into_response();
+    }
+
+    let mut futs = FuturesUnordered::new();
+    for sim_id in request.sim_ids.clone() {
+        let mm = modem_manager.clone();
+        futs.push(async move {
+            let com_port = mm.get_modem(&sim_id).await.map(|m| m.com_port.clone());
+            let result = mm.re_register(&sim_id).await;
+            (sim_id, com_port, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some((sim_id, com_port, result)) = futs.next().await {
+        results.push(json!({
+            "sim_id": sim_id,
+            "com_port": com_port,
+            "success": result.is_ok(),
+            "message": match &result {
+                Ok(()) => "OK".to_string(),
+                Err(e) => e.clone(),
+            }
+        }));
+    }
+
+    results = results
+        .into_iter()
+        .map(|item| item)
+        .collect();
+
+    (StatusCode::OK, Json(json!({"results": results}))).into_response()
 }
 
 async fn send_at_command_handler(
@@ -800,6 +852,12 @@ fn get_phone_number_task() -> &'static TaskHandle {
 
 #[derive(Serialize)]
 struct BarcodeScanEntry {
+    iccid: String,
+    msisdn: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BarcodeSubmitRequest {
     iccid: String,
     msisdn: String,
 }
@@ -877,6 +935,40 @@ fn normalize_msisdn(raw: &str) -> String {
     }
 }
 
+fn normalize_iccid(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+fn validate_barcode_pair(iccid: &str, msisdn: &str) -> Result<(), String> {
+    if !iccid.starts_with("8944") || iccid.len() != 20 {
+        return Err("Invalid ICCID".to_string());
+    }
+
+    if msisdn.trim_start_matches('+').is_empty() {
+        return Err("Invalid MSISDN".to_string());
+    }
+
+    Ok(())
+}
+
+async fn phone_numbers_barcode_submit(Json(payload): Json<BarcodeSubmitRequest>) -> Response {
+    let iccid = normalize_iccid(&payload.iccid);
+    let msisdn = normalize_msisdn(&payload.msisdn);
+
+    if let Err(err) = validate_barcode_pair(&iccid, &msisdn) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response();
+    }
+
+    match BarcodeScan::upsert(&iccid, &msisdn).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "saved"}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to save barcode scan: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
 async fn phone_numbers_barcode_scan(State(state): State<BarcodeState>) -> Response {
     let output_path = resolve_barcode_output_file(state.output_file.as_deref());
     let source_file = output_path.to_string_lossy().to_string();
@@ -934,23 +1026,14 @@ async fn phone_numbers_barcode_scan(State(state): State<BarcodeState>) -> Respon
             continue;
         }
 
-        let iccid: String = iccid_raw.chars().filter(|c| c.is_ascii_digit()).collect();
+        let iccid = normalize_iccid(iccid_raw);
         let msisdn = normalize_msisdn(msisdn_raw);
 
-        if !iccid.starts_with("8944") || iccid.len() != 20 {
+        if let Err(reason) = validate_barcode_pair(&iccid, &msisdn) {
             invalid_lines.push(BarcodeInvalidLine {
                 line_no: idx + 1,
                 raw: raw.to_string(),
-                reason: "Invalid ICCID".to_string(),
-            });
-            continue;
-        }
-
-        if msisdn.trim_start_matches('+').is_empty() {
-            invalid_lines.push(BarcodeInvalidLine {
-                line_no: idx + 1,
-                raw: raw.to_string(),
-                reason: "Invalid MSISDN".to_string(),
+                reason,
             });
             continue;
         }
@@ -970,6 +1053,64 @@ async fn phone_numbers_barcode_scan(State(state): State<BarcodeState>) -> Respon
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn phone_numbers_barcode_scans_list() -> Response {
+    match BarcodeScan::list_unimported().await {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to load barcode scans: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn phone_numbers_barcode_scans_clear() -> Response {
+    match BarcodeScan::delete_all().await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "cleared"}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to clear barcode scans: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn phone_numbers_barcode_scans_import(State(mm): State<ModemManagerRef>) -> Response {
+    let rows = match BarcodeScan::list_unimported().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to load barcode scans: {}", e)})),
+            )
+                .into_response()
+        }
+    };
+
+    let entries: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| (row.iccid.clone(), normalize_msisdn(&row.msisdn)))
+        .collect();
+    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+
+    if entries.is_empty() {
+        return (StatusCode::OK, Json(json!({"status": "empty"}))).into_response();
+    }
+
+    match BarcodeScan::mark_imported(&ids).await {
+        Ok(()) => {
+            let task = get_phone_number_task().clone();
+            tokio::spawn(import_phone_numbers(mm, task, entries));
+            (StatusCode::ACCEPTED, Json(json!({"status": "started", "count": ids.len()}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to mark barcode scans imported: {}", e)})),
+        )
+            .into_response(),
+    }
 }
 
 async fn phone_numbers_barcode_launch(State(state): State<BarcodeState>) -> Response {

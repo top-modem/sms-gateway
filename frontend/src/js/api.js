@@ -159,6 +159,14 @@ class ApiClient {
         return FetchApi.post('/api/sims/force-register', { sim_ids: simIds }, {}, 'application/json');
     }
 
+    /**
+     * Reboot selected SIM modems, wait 10 seconds, then retry registration to 46001.
+     * @param {string[]} simIds - SIM card IDs (ICCID)
+     */
+    async reRegister(simIds) {
+        return FetchApi.post('/api/sims/re-register', { sim_ids: simIds }, {}, 'application/json');
+    }
+
     // ── 火狐狸 platform integration ─────────────────────────────────────────
 
     /**

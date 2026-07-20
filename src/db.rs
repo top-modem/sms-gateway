@@ -1397,7 +1397,7 @@ impl BarcodeScan {
              ON CONFLICT(iccid) DO UPDATE SET \
              msisdn = excluded.msisdn, \
              imported = 0, \
-             created_at = datetime('now')",
+               created_at = datetime('now', 'localtime')",
         )
         .bind(iccid)
         .bind(msisdn)

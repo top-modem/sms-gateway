@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import Icon from '@iconify/svelte';
   import { apiClient } from '../js/api.js';
+  import { getModuleLabel } from '../js/modem.js';
   import { logout } from '../stores/auth.js';
   import { t, lang } from '../js/i18n.js';
 
@@ -237,6 +238,7 @@
 
   // ── Force registration (强制注册) ─────────────────────────────────────────
   let forceRegBusy    = $state(false);
+  let reRegisterBusy  = $state(false);
 
   async function forceRegister() {
     if (selected.size === 0 || forceRegBusy) return;
@@ -249,6 +251,19 @@
       console.error('Force register failed', e);
     } finally {
       forceRegBusy = false;
+    }
+  }
+
+  async function reRegister() {
+    if (selected.size === 0 || reRegisterBusy) return;
+    reRegisterBusy = true;
+    try {
+      await apiClient.reRegister([...selected]);
+      fetchData();
+    } catch (e) {
+      console.error('Re-register failed', e);
+    } finally {
+      reRegisterBusy = false;
     }
   }
 
@@ -267,8 +282,12 @@
     selected = next;
   }
 
+  function areAllRowsSelected() {
+    return rows.length > 0 && rows.every(r => selected.has(r.info.sim_id));
+  }
+
   function toggleAll() {
-    if (selected.size === rows.length) {
+    if (areAllRowsSelected()) {
       selected = new Set();
     } else {
       selected = new Set(rows.map(r => r.info.sim_id));
@@ -359,7 +378,7 @@
       </button>
       <button
         onclick={forceRegister}
-        disabled={selected.size === 0 || forceRegBusy}
+        disabled={selected.size === 0 || forceRegBusy || reRegisterBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -368,6 +387,18 @@
       >
         <Icon icon="carbon:network-3" class="w-4 h-4" />
         {forceRegBusy ? $t('force_register_running') : $t('btn_force_register')}
+      </button>
+      <button
+        onclick={reRegister}
+        disabled={selected.size === 0 || reRegisterBusy || forceRegBusy}
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+               border border-gray-200 dark:border-zinc-700
+               text-gray-600 dark:text-gray-300
+               hover:bg-gray-50 dark:hover:bg-zinc-800 transition
+               disabled:opacity-60 disabled:cursor-not-allowed"
+      >
+        <Icon icon="carbon:reset" class="w-4 h-4" />
+        {reRegisterBusy ? $t('register_again_running') : $t('btn_register_again')}
       </button>
       <button
         onclick={() => { loading = true; error = ''; fetchData(); fetchServiceStatus(); }}
@@ -426,7 +457,7 @@
               {#if !loading && rows.length > 0}
                 <input
                   type="checkbox"
-                  checked={selected.size === rows.length && rows.length > 0}
+                  checked={areAllRowsSelected()}
                   onchange={toggleAll}
                   class="rounded cursor-pointer accent-blue-500"
                 />
@@ -434,7 +465,7 @@
                 <span class="text-gray-400 font-semibold">#</span>
               {/if}
             </th>
-            {#each [$t('col_com_port'),$t('col_module'),$t('col_signal'),$t('col_network_status'),$t('col_phone_number'),$t('col_operator'),$t('col_country'),$t('col_platform'),$t('col_sms'),'IMSI','ICCID','IMEI'] as col}
+            {#each [$t('col_com_port'),$t('col_module'),$t('col_signal'),$t('col_network_status'),$t('col_phone_number'),$t('col_operator'),$t('col_country'),$t('col_platform'),$t('col_sms'),'ICCID','IMSI','IMEI'] as col}
               <th class="px-3 py-2.5 text-left font-semibold text-gray-600 dark:text-gray-300
                          border-b border-gray-200 dark:border-zinc-700 whitespace-nowrap">
                 {col}
@@ -512,7 +543,7 @@
                   {#if info.available === false}
                     <span class="text-gray-400">—</span>
                   {:else}
-                    {info.model_info?.model === 'EC20F' ? '4G' : (info.model_info?.model ?? '—')}
+                    {getModuleLabel(info.model_info?.model)}
                   {/if}
                 </td>
 
@@ -619,21 +650,21 @@
                   {/if}
                 </td>
 
-                <!-- IMSI -->
-                <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {#if info.available === false}
-                    <span class="text-gray-400">—</span>
-                  {:else}
-                    {card.imsi ?? '—'}
-                  {/if}
-                </td>
-
                 <!-- ICCID (= sim_id / card.id) -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
                   {#if info.available === false}
                     <span class="text-gray-400">—</span>
                   {:else}
                     {card.id ?? info.sim_id ?? '—'}
+                  {/if}
+                </td>
+
+                <!-- IMSI -->
+                <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {card.imsi ?? '—'}
                   {/if}
                 </td>
 

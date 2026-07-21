@@ -109,18 +109,6 @@ class ApiClient {
         return FetchApi.get('/api/sims/stats');
     }
 
-    async getServiceStatus() {
-        return FetchApi.get('/api/service/status');
-    }
-
-    async startService() {
-        return FetchApi.post('/api/service/start', {}, {}, 'application/json');
-    }
-
-    async stopService() {
-        return FetchApi.post('/api/service/stop', {}, {}, 'application/json');
-    }
-
     /**
      * Update SIM card alias
      * @param {number} simId - SIM card ID

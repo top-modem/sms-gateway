@@ -255,13 +255,10 @@
     }
   }
 
-  async function clearBarcodeScans() {
-    try {
-      await apiClient.clearBarcodeScans();
-      await fetchBarcodeScans();
-    } catch (e) {
-      error = e?.data?.error ?? e?.message ?? $t('barcode_scan_clear_error');
-    }
+  async function clearBarcodeInputs() {
+    barcodeIccid = '';
+    barcodeMsisdn = '';
+    await focusBarcodeIccidInput();
   }
 
   async function importBarcodeScans() {
@@ -539,8 +536,8 @@
               </div>
               <div class="flex items-center gap-2">
                 <button
-                  onclick={clearBarcodeScans}
-                  disabled={barcodeScans.length === 0 || barcodeImporting}
+                  onclick={clearBarcodeInputs}
+                  disabled={(!barcodeIccid && !barcodeMsisdn) || barcodeImporting}
                   class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
                          text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-zinc-800
                          hover:bg-gray-200 dark:hover:bg-zinc-700

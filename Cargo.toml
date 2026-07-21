@@ -42,9 +42,17 @@ futures = "0.3"
 [target.x86_64-unknown-linux-musl.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
 
+[target.'cfg(windows)'.dependencies]
+tray-item = "0.10"
+webbrowser = "1.0"
+native-dialog = "0.7"
+
 [dev-dependencies]
 wiremock = "0.5"
 serial_test = "2.0"
+
+[build-dependencies]
+winres = "0.1"
 
 # Vendored mio with the spurious Windows named-pipe debug_assert removed
 # (cancelled serial I/O legitimately completes with error + partial bytes;

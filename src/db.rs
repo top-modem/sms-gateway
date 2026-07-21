@@ -1118,6 +1118,7 @@ impl FirefoxBatchUpload {
         Ok(upload)
     }
 
+    #[allow(dead_code)]
     pub async fn exists() -> Result<bool> {
         let pool = get_pool()?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firefox_batch_uploads")
@@ -1135,6 +1136,7 @@ impl FirefoxBatchUpload {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn delete_all() -> Result<()> {
         let pool = get_pool()?;
         sqlx::query("DELETE FROM firefox_batch_uploads")
@@ -2299,7 +2301,10 @@ impl MmsInboxPart {
 pub async fn db_init() -> Result<()> {
     #[cfg(debug_assertions)]
     let db_path = "sqlite://./data/data.db";
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    let db_path = "sqlite://./data/data.db";
     #[cfg(not(debug_assertions))]
+    #[cfg(not(target_os = "windows"))]
     let db_path = "sqlite:///var/lib/sms-gateway/data.db";
 
     // Ensure directory exists before creating database
@@ -2307,7 +2312,12 @@ pub async fn db_init() -> Result<()> {
     {
         std::fs::create_dir_all("./data")?;
     }
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    {
+        std::fs::create_dir_all("./data")?;
+    }
     #[cfg(not(debug_assertions))]
+    #[cfg(not(target_os = "windows"))]
     {
         std::fs::create_dir_all("/var/lib/sms-gateway")?;
     }

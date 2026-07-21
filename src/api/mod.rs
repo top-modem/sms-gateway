@@ -927,19 +927,8 @@ fn resolve_barcode_launcher_file(configured: Option<&str>) -> PathBuf {
 }
 
 fn normalize_msisdn(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with('+') {
-        let digits: String = trimmed[1..].chars().filter(|c| c.is_ascii_digit()).collect();
-        let normalized = digits.trim_start_matches('0');
-        if normalized.is_empty() {
-            "+".to_string()
-        } else {
-            format!("+{}", normalized)
-        }
-    } else {
-        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
-        digits.trim_start_matches('0').to_string()
-    }
+    let digits: String = raw.trim().chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.trim_start_matches('0').to_string()
 }
 
 fn normalize_iccid(raw: &str) -> String {
@@ -951,7 +940,7 @@ fn validate_barcode_pair(iccid: &str, msisdn: &str) -> Result<(), String> {
         return Err("Invalid ICCID".to_string());
     }
 
-    if msisdn.trim_start_matches('+').is_empty() {
+    if msisdn.is_empty() {
         return Err("Invalid MSISDN".to_string());
     }
 
@@ -1926,11 +1915,8 @@ async fn set_sim_phone_number(
             .into_response();
     }
 
-    // Basic sanity check: allow digits, plus, and common separators.
-    let normalized: String = phone_number
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '+')
-        .collect();
+    // Normalize to digits only (no '+' prefix, no leading zeros).
+    let normalized = crate::phone_number::normalize_msisdn(phone_number);
     if normalized.is_empty() {
         return (
             StatusCode::BAD_REQUEST,

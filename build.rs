@@ -1,6 +1,16 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(target_os = "windows")]
+fn compile_windows_resources() {
+    println!("cargo:rerun-if-changed=assets/sms-gateway.ico");
+    let mut res = winres::WindowsResource::new();
+    res.set_icon("assets/sms-gateway.ico");
+    if let Err(err) = res.compile() {
+        panic!("Failed to compile Windows resources: {}", err);
+    }
+}
+
 fn emit_rerun_for_dir(path: &Path) {
     if !path.exists() {
         return;
@@ -26,6 +36,9 @@ fn emit_rerun_for_dir(path: &Path) {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    compile_windows_resources();
+
     // frontend/dist is embedded into the Rust binary via rust-embed.
     // Re-run build when any embedded asset changes.
     println!("cargo:rerun-if-changed=frontend/dist");

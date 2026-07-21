@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::{path::PathBuf, sync::Arc};
 
 use api::SseManager;
@@ -48,28 +50,34 @@ async fn main() {
         }
         return;
     }
-    if let Err(err) = log_init(&param.log_path, &param.log_level) {
+    #[cfg(target_os = "windows")]
+    maybe_start_windows_tray(&param);
+
+    if let Err(err) = run_gateway(&param).await {
         eprintln!("Error: {}", err);
         std::process::exit(1);
+    }
+}
+
+async fn run_gateway(param: &Param) -> anyhow::Result<()> {
+    if let Err(err) = log_init(&param.log_path, &param.log_level) {
+        return Err(err);
     };
     if let Err(err) = db_init().await {
-        eprintln!("Error: {}", err);
-        std::process::exit(1);
+        return Err(err.into());
     }
     #[cfg(debug_assertions)]
     let config = match config::AppConfig::load(&PathBuf::from("./config.toml")) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("Error: {}", err);
-            std::process::exit(1);
+            return Err(err);
         }
     };
     #[cfg(not(debug_assertions))]
     let config = match config::AppConfig::load(&param.config_file) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("Error: {}", err);
-            std::process::exit(1);
+            return Err(err);
         }
     };
 
@@ -133,7 +141,7 @@ async fn main() {
         config.settings.mms_send_timeout_secs.unwrap_or(60),
     );
 
-    if let Ok(_) = api::run_api(
+    api::run_api(
         modem_manager.clone(),
         &config.settings.server_host,
         &config.settings.server_port,
@@ -143,8 +151,56 @@ async fn main() {
         None,
         None,
     )
-    .await
-    {};
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_start_windows_tray(param: &Param) {
+    if param.no_tray {
+        return;
+    }
+
+    let url = "http://localhost:8080".to_string();
+    let tray_url = url.clone();
+    std::thread::spawn(move || {
+        if let Err(err) = run_windows_tray(tray_url) {
+            eprintln!("Tray startup failed: {}", err);
+        }
+    });
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let _ = webbrowser::open(&url);
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_tray(url: String) -> anyhow::Result<()> {
+    let _ = native_dialog::MessageDialog::new()
+        .set_type(native_dialog::MessageType::Info)
+        .set_title("SMS Gateway")
+        .set_text("SMS Gateway is running in tray.")
+        .show_alert();
+
+    let mut tray = tray_item::TrayItem::new(
+        "SMS Gateway",
+        tray_item::IconSource::Resource("sms-gateway"),
+    )?;
+
+    let open_url = url.clone();
+    tray.add_menu_item("Open Panel", move || {
+        let _ = webbrowser::open(&open_url);
+    })?;
+
+    tray.add_menu_item("Exit", || {
+        std::process::exit(0);
+    })?;
+
+    loop {
+        std::thread::park();
+    }
 }
 
 async fn read_sms_worker(
@@ -710,7 +766,7 @@ pub struct Param {
         short = "l",
         long = "log",
         parse(from_os_str),
-        default_value = "/var/lib/sms-gateway/log"
+        default_value = "./logs"
     )]
     pub log_path: PathBuf,
 
@@ -736,9 +792,13 @@ pub struct Param {
         short = "c",
         long = "config",
         parse(from_os_str),
-        default_value = "/etc/sms-gateway/config.toml"
+        default_value = "./config.toml"
     )]
     pub config_file: PathBuf,
+
+    #[cfg(target_os = "windows")]
+    #[structopt(long = "no-tray")]
+    pub no_tray: bool,
 }
 
 #[derive(Debug, StructOpt)]

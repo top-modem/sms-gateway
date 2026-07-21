@@ -787,9 +787,15 @@ const translations = {
 };
 
 // ── Store ─────────────────────────────────────────────────────────────────────
-const stored = typeof localStorage !== 'undefined'
-  ? (localStorage.getItem('lang') || 'en')
-  : 'en';
+const stored = (() => {
+  if (typeof localStorage === 'undefined') return 'zh';
+
+  const hasExplicitChoice = localStorage.getItem('lang_user_set') === '1';
+  if (!hasExplicitChoice) return 'zh';
+
+  const saved = localStorage.getItem('lang');
+  return saved === 'en' || saved === 'zh' ? saved : 'zh';
+})();
 
 export const lang = writable(stored);
 
@@ -810,5 +816,6 @@ export const t = derived(lang, ($lang) => (key, params = {}) => {
 });
 
 export function toggleLang() {
+  if (typeof localStorage !== 'undefined') localStorage.setItem('lang_user_set', '1');
   lang.update(l => (l === 'en' ? 'zh' : 'en'));
 }

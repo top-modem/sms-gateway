@@ -155,6 +155,12 @@
     return `${-113 + rssi * 2} dBm`;
   }
 
+  function normalizePhoneForDisplay(raw) {
+    if (!raw) return '';
+    const digits = String(raw).replace(/\D/g, '');
+    return digits.replace(/^0+/, '');
+  }
+
   // Signal bar count (0-4)
   function signalBars(rssi) {
     if (rssi == null || rssi === 99) return 0;
@@ -588,7 +594,7 @@
                       {#if info.available === false}
                         —
                       {:else}
-                        {card.phone_number ?? info.phone_number ?? '—'}
+                        {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
                       {/if}
                     </span>
                     {#if hasSim}
@@ -630,7 +636,7 @@
                 <td class="px-3 py-2.5 whitespace-nowrap">
                   {#if info.available === false}
                     <span class="text-gray-400">—</span>
-                  {:else if card.country_code}
+                  {:else if card.country_code && ['1', '5'].includes(String(info.network_registration?.status ?? '').trim())}
                     <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
                       <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
                       {$t('platform_connected')}

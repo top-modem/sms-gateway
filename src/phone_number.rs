@@ -45,22 +45,12 @@ pub fn new_task_handle() -> TaskHandle {
 }
 
 fn normalize_import_msisdn(raw: &str) -> String {
-    let cleaned: String = raw
+    let digits: String = raw
         .trim()
         .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .filter(|c| c.is_ascii_digit())
         .collect();
-
-    if let Some(rest) = cleaned.strip_prefix('+') {
-        let digits = rest.trim_start_matches('0');
-        if digits.is_empty() {
-            "+".to_string()
-        } else {
-            format!("+{}", digits)
-        }
-    } else {
-        cleaned.trim_start_matches('0').to_string()
-    }
+    digits.trim_start_matches('0').to_string()
 }
 
 /// Normalize a modem-reported MSISDN (AT+CNUM etc.) for storage/display:
@@ -96,7 +86,7 @@ pub async fn import_phone_numbers(
             t.current = format!("正在导入 ICCID {} → {}", iccid, msisdn_clean);
         }
 
-        if msisdn_clean.trim_start_matches('+').is_empty() {
+        if msisdn_clean.is_empty() {
             let result = PhoneResult {
                 com_port: String::new(),
                 sim_id: iccid.clone(),

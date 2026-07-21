@@ -55,6 +55,8 @@
                     await updateStorageValue("auth", {
                         username,
                         token: authToken,
+                    }, {
+                        persistent: rememberMe,
                     });
                     rememberMe
                         ? localStorage.setItem("auth_username", username)

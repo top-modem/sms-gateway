@@ -1,4 +1,5 @@
 const baseUrl = ''
+const DEFAULT_AUTH_TOKEN = 'YWRtaW46MTIzNDU2'; // admin:123456
 
 //参数转换
 const queryString = (/** @type {{ [x: string]: string | number | boolean; }} */ params) => '?' + Object
@@ -80,7 +81,6 @@ class Fetch {
                 if (response.status === 401) {
                     localStorage.removeItem("auth");
                     sessionStorage.removeItem("auth");
-                    window.location.reload(); 
                 }
                 return response;
             })
@@ -89,14 +89,18 @@ class Fetch {
     }
 
     _getAuthHeader() {
-        const auth = sessionStorage.getItem("auth");
-        if (!auth) return {};
+        const auth = sessionStorage.getItem("auth") || localStorage.getItem("auth");
+        if (!auth) {
+            return { 'Authorization': `Basic ${DEFAULT_AUTH_TOKEN}` };
+        }
 
         try {
             const { token } = JSON.parse(auth);
-            return token ? { 'Authorization': `Basic ${token}` } : {};
+            return token
+                ? { 'Authorization': `Basic ${token}` }
+                : { 'Authorization': `Basic ${DEFAULT_AUTH_TOKEN}` };
         } catch (_) {
-            return {};
+            return { 'Authorization': `Basic ${DEFAULT_AUTH_TOKEN}` };
         }
     }    /**
      * @param {string} partialUrl

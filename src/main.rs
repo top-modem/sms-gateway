@@ -50,12 +50,62 @@ async fn main() {
         }
         return;
     }
-    #[cfg(target_os = "windows")]
-    maybe_start_windows_tray(&param);
 
-    if let Err(err) = run_gateway(&param).await {
-        eprintln!("Error: {}", err);
-        std::process::exit(1);
+    #[cfg(target_os = "windows")]
+    {
+        if param.no_tray {
+            if let Err(err) = run_gateway(&param).await {
+                eprintln!("Error: {}", err);
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        // Start backend first; only show tray/browser after it survives startup.
+        let run_param = param.clone();
+        let mut gateway = tokio::spawn(async move { run_gateway(&run_param).await });
+
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut gateway).await {
+            Ok(joined) => {
+                // Backend exited quickly: treat as startup failure and show clear error.
+                let err_text = match joined {
+                    Ok(Ok(())) => "SMS Gateway exited unexpectedly.".to_string(),
+                    Ok(Err(err)) => format_startup_error_message(&err.to_string()),
+                    Err(join_err) => format!("SMS Gateway startup task failed: {}", join_err),
+                };
+                show_windows_error_dialog(&err_text);
+                eprintln!("Error: {}", err_text);
+                std::process::exit(1);
+            }
+            Err(_) => {
+                // Backend is running; now start tray and open browser.
+                maybe_start_windows_tray();
+
+                // Keep process alive until backend exits.
+                match gateway.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        let err_text = format_startup_error_message(&err.to_string());
+                        show_windows_error_dialog(&err_text);
+                        eprintln!("Error: {}", err_text);
+                    }
+                    Err(join_err) => {
+                        let err_text = format!("SMS Gateway runtime task failed: {}", join_err);
+                        show_windows_error_dialog(&err_text);
+                        eprintln!("Error: {}", err_text);
+                    }
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Err(err) = run_gateway(&param).await {
+            eprintln!("Error: {}", err);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -157,23 +207,44 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn maybe_start_windows_tray(param: &Param) {
-    if param.no_tray {
-        return;
-    }
-
+fn maybe_start_windows_tray() {
     let url = "http://localhost:8080".to_string();
     let tray_url = url.clone();
     std::thread::spawn(move || {
         if let Err(err) = run_windows_tray(tray_url) {
-            eprintln!("Tray startup failed: {}", err);
+            show_windows_error_dialog(&format!("Failed to start system tray: {}", err));
         }
     });
 
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        let _ = webbrowser::open(&url);
-    });
+    open_browser_with_fallback(&url);
+}
+
+#[cfg(target_os = "windows")]
+fn format_startup_error_message(err: &str) -> String {
+    if err.contains("10048") || err.contains("Only one usage") || err.contains("通常每个套接字地址") {
+        return "SMS Gateway is already running (port is in use). Please check the tray icons, or stop the existing instance first.".to_string();
+    }
+    format!("SMS Gateway failed to start: {}", err)
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_error_dialog(message: &str) {
+    let _ = native_dialog::MessageDialog::new()
+        .set_type(native_dialog::MessageType::Error)
+        .set_title("SMS Gateway")
+        .set_text(message)
+        .show_alert();
+}
+
+#[cfg(target_os = "windows")]
+fn open_browser_with_fallback(url: &str) {
+    if webbrowser::open(url).is_ok() {
+        return;
+    }
+
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
 }
 
 #[cfg(target_os = "windows")]
@@ -184,14 +255,11 @@ fn run_windows_tray(url: String) -> anyhow::Result<()> {
         .set_text("SMS Gateway is running in tray.")
         .show_alert();
 
-    let mut tray = tray_item::TrayItem::new(
-        "SMS Gateway",
-        tray_item::IconSource::Resource("sms-gateway"),
-    )?;
+    let mut tray = create_windows_tray_item()?;
 
     let open_url = url.clone();
     tray.add_menu_item("Open Panel", move || {
-        let _ = webbrowser::open(&open_url);
+        open_browser_with_fallback(&open_url);
     })?;
 
     tray.add_menu_item("Exit", || {
@@ -201,6 +269,52 @@ fn run_windows_tray(url: String) -> anyhow::Result<()> {
     loop {
         std::thread::park();
     }
+}
+
+#[cfg(target_os = "windows")]
+fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        LoadIconW, LoadImageW, HICON, IDI_APPLICATION, IMAGE_ICON, LR_LOADFROMFILE,
+    };
+
+    fn try_load_icon_from_exe_dir() -> Option<HICON> {
+        let exe = std::env::current_exe().ok()?;
+        let icon_path = exe.parent()?.join("sms-gateway.ico");
+        if !icon_path.exists() {
+            return None;
+        }
+
+        let wide: Vec<u16> = icon_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let h = unsafe {
+            LoadImageW(
+                0,
+                wide.as_ptr(),
+                IMAGE_ICON,
+                64,
+                64,
+                LR_LOADFROMFILE,
+            )
+        };
+        if h == 0 { None } else { Some(h as HICON) }
+    }
+
+    let hicon = try_load_icon_from_exe_dir().unwrap_or_else(|| unsafe {
+        // Guaranteed Windows fallback so tray creation never fails on icon loading.
+        LoadIconW(0, IDI_APPLICATION as *const u16)
+    });
+
+    if hicon == 0 {
+        anyhow::bail!("unable to load tray icon handle")
+    }
+
+    tray_item::TrayItem::new("SMS Gateway", tray_item::IconSource::RawIcon(hicon))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 async fn read_sms_worker(
@@ -747,7 +861,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
     }
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Clone, StructOpt)]
 pub struct Param {
     #[structopt(subcommand)]
     pub command: Option<Command>,
@@ -801,7 +915,7 @@ pub struct Param {
     pub no_tray: bool,
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Clone, StructOpt)]
 pub enum Command {
     /// Update sms-gateway to the latest release
     Update,

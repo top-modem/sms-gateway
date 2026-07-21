@@ -3,12 +3,9 @@ use std::path::Path;
 
 #[cfg(target_os = "windows")]
 fn compile_windows_resources() {
-    println!("cargo:rerun-if-changed=assets/sms-gateway.ico");
-    let mut res = winres::WindowsResource::new();
-    res.set_icon("assets/sms-gateway.ico");
-    if let Err(err) = res.compile() {
-        panic!("Failed to compile Windows resources: {}", err);
-    }
+    println!("cargo:rerun-if-changed=assets/icons/sms-gateway.ico");
+    println!("cargo:rerun-if-changed=assets/icons/sms-gateway.rc");
+    embed_resource::compile("assets/icons/sms-gateway.rc", embed_resource::NONE);
 }
 
 fn emit_rerun_for_dir(path: &Path) {

@@ -360,6 +360,16 @@
         {$t('col_sms')}
       </button>
       <button
+        onclick={() => onNavigateCall(selected.size === 1 ? [...selected][0] : null)}
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+               border border-gray-200 dark:border-zinc-700
+               text-gray-600 dark:text-gray-300
+               hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
+      >
+        <Icon icon="carbon:phone" class="w-4 h-4" />
+        {$t('call_log')}
+      </button>
+      <button
         onclick={forceRegister}
         disabled={selected.size === 0 || forceRegBusy || reRegisterBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
@@ -382,16 +392,6 @@
       >
         <Icon icon="carbon:reset" class="w-4 h-4" />
         {reRegisterBusy ? $t('register_again_running') : $t('btn_register_again')}
-      </button>
-      <button
-        onclick={() => onNavigateCall(selected.size === 1 ? [...selected][0] : null)}
-        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
-               border border-gray-200 dark:border-zinc-700
-               text-gray-600 dark:text-gray-300
-               hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
-      >
-        <Icon icon="carbon:phone" class="w-4 h-4" />
-        {$t('call_log')}
       </button>
       <button
         onclick={() => { loading = true; error = ''; fetchData(); }}

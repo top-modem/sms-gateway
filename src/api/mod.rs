@@ -2048,6 +2048,31 @@ async fn firefox_upload(
             .into_response();
     }
 
+    let mut invalid_network_sim_ids = Vec::new();
+    for sim_id in &request.sim_ids {
+        let is_allowed = match modem_manager.check_network_registration(sim_id).await {
+            Ok(Some(status)) => matches!(status.status_code().trim(), "1" | "5"),
+            _ => false,
+        };
+
+        if !is_allowed {
+            invalid_network_sim_ids.push(sim_id.clone());
+        }
+    }
+
+    if !invalid_network_sim_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "Only SIM cards registered on home or roaming networks can be uploaded: {}",
+                    invalid_network_sim_ids.join(", ")
+                )
+            })),
+        )
+            .into_response();
+    }
+
     let (api_key, client) = match get_firefox_client().await {
         Ok(v) => v,
         Err(e) => return e,

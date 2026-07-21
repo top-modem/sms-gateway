@@ -230,6 +230,7 @@ const translations = {
     msg_upload_success:       'Uploaded {n} number(s) successfully.',
     err_key_save_failed:      'Failed to save API key.',
     err_no_sims_selected:     'Please select at least one SIM card.',
+    err_platform_requires_registered_network: 'Only SIM cards registered on home or roaming networks can be uploaded.',
     err_no_country_selected:  'Please select a country code.',
     err_no_api_key:           'Please save your API key first.',
     btn_delete_from_platform:  'Delete from Platform',
@@ -275,7 +276,7 @@ const translations = {
     loading_detail:                  'Loading detail...',
     select_row_hint:                 'Select a current or legacy row to inspect its SMS attempts.',
 
-    platform_sim_hint:        'Only SIM cards with a phone number can be uploaded.',
+    platform_sim_hint:        'Only SIM cards with a phone number and a home or roaming network status can be uploaded.',
     net_not_registered:       'Not Registered',
     net_home:                 'Home',
     net_searching:            'Searching',
@@ -474,12 +475,12 @@ const translations = {
     err_send_failed:          '发送失败，请稍后重试',
 
     // CallLog
-    call_log_title:           '通话记录',
+    call_log_title:           '通话',
     sse_connected:            '已连接',
     sse_disconnected:         '未连接',
     make_a_call:              '拨打电话',
     phone_number_ph:          '电话号码',
-    no_calls:                 '暂无通话记录',
+    no_calls:                 '暂无通话',
     unknown:                  '未知',
 
     // IncomingCallBanner
@@ -620,6 +621,7 @@ const translations = {
     msg_upload_success:       '成功上传 {n} 个号码。',
     err_key_save_failed:      '保存 API Key 失败。',
     err_no_sims_selected:     '请至少选择一张SIM卡。',
+    err_platform_requires_registered_network: '只有网络状态为本地或漫游的SIM卡才能上传。',
     err_no_country_selected:  '请选择国家代码。',
     err_no_api_key:           '请先保存 API Key。',
     btn_delete_from_platform:  '从平台删除',
@@ -665,7 +667,7 @@ const translations = {
     loading_detail:                  '加载详情中...',
     select_row_hint:                 '选择当前项目或历史记录以查看其 SMS 尝试。',
 
-    platform_sim_hint:        '只有已设置电话号码的SIM卡才能上传。',
+    platform_sim_hint:        '只有已设置电话号码且网络状态为本地或漫游的SIM卡才能上传。',
     net_not_registered:       '未注册',
     net_home:                 '本地',
     net_searching:            '搜索中',

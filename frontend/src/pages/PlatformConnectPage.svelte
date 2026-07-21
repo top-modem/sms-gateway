@@ -100,6 +100,35 @@
     return '';
   }
 
+  const allowedNetworkStatuses = new Set(['1', '5']);
+
+  function getNetworkStatusCode(sim) {
+    return String(sim?.network_registration?.status ?? '').trim();
+  }
+
+  function canUploadToPlatform(sim) {
+    return !!sim.card?.phone_number && allowedNetworkStatuses.has(getNetworkStatusCode(sim));
+  }
+
+  function getNetworkStatusLabel(sim) {
+    switch (getNetworkStatusCode(sim)) {
+      case '1':
+        return $t('net_reg_home');
+      case '2':
+        return $t('net_searching');
+      case '3':
+        return $t('net_reg_denied');
+      case '5':
+        return $t('net_reg_roaming');
+      case '0':
+        return $t('net_not_registered');
+      case '4':
+        return $t('net_unknown');
+      default:
+        return $t('unknown');
+    }
+  }
+
   // ── Data fetching ──────────────────────────────────────────────────────────
   async function fetchData() {
     loading = true;
@@ -152,6 +181,8 @@
 
   // ── Selection ──────────────────────────────────────────────────────────────
   function toggleSim(simId) {
+    const sim = sims.find(item => item.sim_id === simId);
+    if (!sim || !canUploadToPlatform(sim)) return;
     const next = new Set(selected);
     next.has(simId) ? next.delete(simId) : next.add(simId);
     selected = next;
@@ -161,12 +192,12 @@
     if (selected.size === selectableCount) {
       selected = new Set();
     } else {
-      selected = new Set(sims.filter(s => s.card?.phone_number).map(s => s.sim_id));
+      selected = new Set(sims.filter(canUploadToPlatform).map(s => s.sim_id));
     }
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
-  const selectableCount = $derived(sims.filter(s => s.card?.phone_number).length);
+  const selectableCount = $derived(sims.filter(canUploadToPlatform).length);
 
   function countryName(code) {
     return countries.find(c => c.id === code)?.name ?? code;
@@ -208,8 +239,15 @@
     uploadResult = null;
     uploadError = '';
 
+    const selectedSims = sims.filter(sim => selected.has(sim.sim_id));
+    const eligibleSimIds = selectedSims.filter(canUploadToPlatform).map(sim => sim.sim_id);
+
     if (selected.size === 0) {
       uploadError = $t('err_no_sims_selected');
+      return;
+    }
+    if (eligibleSimIds.length !== selectedSims.length || eligibleSimIds.length === 0) {
+      uploadError = $t('err_platform_requires_registered_network');
       return;
     }
     if (!selectedCountry) {
@@ -224,7 +262,7 @@
     uploading = true;
     try {
       const response = await apiClient.uploadToFirefox(
-        Array.from(selected),
+        eligibleSimIds,
         selectedCountry,
       );
       uploadResult = response.data ?? response;
@@ -420,18 +458,20 @@
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_com_port')}</th>
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_phone_number')}</th>
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_iccid')}</th>
+                  <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('col_network_status')}</th>
                   <th class="px-3 py-2 text-left font-semibold text-gray-600 dark:text-gray-300">{$t('saved_country_label')}</th>
                 </tr>
               </thead>
               <tbody>
                 {#each sims as sim}
                   {@const hasPhone = !!sim.card?.phone_number}
-                  <tr class="border-t border-gray-100 dark:border-zinc-800 {hasPhone ? '' : 'opacity-50'}">
+                  {@const canUpload = canUploadToPlatform(sim)}
+                  <tr class="border-t border-gray-100 dark:border-zinc-800 {(hasPhone && canUpload) ? '' : 'opacity-50'}">
                     <td class="px-2 py-2 text-center">
                       <input
                         type="checkbox"
                         checked={selected.has(sim.sim_id)}
-                        disabled={!hasPhone}
+                        disabled={!canUpload}
                         onchange={() => toggleSim(sim.sim_id)}
                         class="rounded accent-blue-500"
                       />
@@ -439,11 +479,12 @@
                     <td class="px-3 py-2 font-mono text-gray-700 dark:text-gray-200">{sim.com_port ?? '—'}</td>
                     <td class="px-3 py-2 font-mono text-gray-700 dark:text-gray-200">{sim.card?.phone_number ?? '—'}</td>
                     <td class="px-3 py-2 font-mono text-gray-500 dark:text-gray-400">{sim.sim_id}</td>
+                    <td class="px-3 py-2 text-gray-600 dark:text-gray-300 whitespace-nowrap">{getNetworkStatusLabel(sim)}</td>
                     <td class="px-3 py-2 text-gray-600 dark:text-gray-300">{countryName(sim.card?.country_code) ?? '—'}</td>
                   </tr>
                 {:else}
                   <tr>
-                    <td colspan="5" class="px-6 py-8 text-center text-gray-400">
+                    <td colspan="6" class="px-6 py-8 text-center text-gray-400">
                       <Icon icon="carbon:sim-card" class="w-8 h-8 mx-auto mb-2 opacity-40" />
                       <p>{$t('no_sim_cards')}</p>
                     </td>

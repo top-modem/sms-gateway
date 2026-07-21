@@ -126,6 +126,7 @@
   let error      = $state('');
   let isFetching = false;
   let selected   = $state(new Set());
+  let lastClickedRowIndex = $state(null);
   let hoveredRow = $state(null);
   let serviceRunning = $state(true);
   let serviceBusy = $state(false);
@@ -276,10 +277,29 @@
   onDestroy(() => clearInterval(pollTimer));
 
   // ── Selection ─────────────────────────────────────────────────────────────
-  function toggleRow(id) {
+  function handleRowSelection(event, id, index) {
+    const isShift = !!(event?.shiftKey);
     const next = new Set(selected);
+
+    if (
+      isShift &&
+      lastClickedRowIndex !== null &&
+      lastClickedRowIndex >= 0 &&
+      lastClickedRowIndex < rows.length
+    ) {
+      const start = Math.min(lastClickedRowIndex, index);
+      const end = Math.max(lastClickedRowIndex, index);
+      for (const row of rows.slice(start, end + 1)) {
+        next.add(row.info.sim_id);
+      }
+      selected = next;
+      lastClickedRowIndex = index;
+      return;
+    }
+
     next.has(id) ? next.delete(id) : next.add(id);
     selected = next;
+    lastClickedRowIndex = index;
   }
 
   function areAllRowsSelected() {
@@ -292,6 +312,7 @@
     } else {
       selected = new Set(rows.map(r => r.info.sim_id));
     }
+    lastClickedRowIndex = null;
   }
 
   // ── Logout ────────────────────────────────────────────────────────────────
@@ -514,7 +535,7 @@
                        {isSelected
                          ? 'bg-blue-50 dark:bg-blue-900/20'
                          : 'hover:bg-gray-50 dark:hover:bg-zinc-800/50'}"
-                onclick={() => toggleRow(info.sim_id)}
+                onclick={(e) => handleRowSelection(e, info.sim_id, i)}
                 onmouseenter={() => hoveredRow = info.sim_id}
                 onmouseleave={() => hoveredRow = null}
               >
@@ -524,7 +545,7 @@
                     <input
                       type="checkbox"
                       checked={isSelected}
-                      onchange={() => toggleRow(info.sim_id)}
+                      onchange={(e) => handleRowSelection(e, info.sim_id, i)}
                        onclick={(e) => e.stopPropagation()}
                       class="rounded cursor-pointer accent-blue-500"
                     />

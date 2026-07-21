@@ -358,8 +358,14 @@
 <div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-zinc-950 text-sm font-sans">
   <!-- ── Header ─────────────────────────────────────────────────────────────── -->
   <header class="flex items-center gap-3 px-4 py-3 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800 shadow-sm">
-    <button onclick={onBack} class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-zinc-800 transition">
-      <Icon icon="carbon:chevron-left" class="w-5 h-5 text-gray-600 dark:text-gray-300" />
+    <button
+      onclick={onBack}
+      class="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-full bg-blue-600 text-white
+             shadow-sm shadow-blue-600/30 hover:bg-blue-700 transition"
+      aria-label="Back"
+    >
+      <Icon icon="carbon:arrow-left" class="w-4 h-4" />
+      <span class="text-xs font-semibold">{$t('btn_back')}</span>
     </button>
     <Icon icon="carbon:phone-voice" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
     <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('phone_number_title')}</h1>

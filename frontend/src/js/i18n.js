@@ -101,6 +101,7 @@ const translations = {
     // Dashboard
     close:                    'Close',
     conversations:            'Conversations',
+    btn_back:                 'Back',
 
     // MessageItem
     code_copied:              'Code copied',
@@ -492,6 +493,7 @@ const translations = {
     // Dashboard
     close:                    '关闭',
     conversations:            '对话',
+    btn_back:                 '返回',
 
     // MessageItem
     code_copied:              '验证码已复制',
@@ -510,7 +512,7 @@ const translations = {
     col_module:               '网络',
     col_signal:               '信号',
     col_network_status:       '网络状态',
-    col_phone_number:         '电话号码',
+    col_phone_number:         '号码',
     col_operator:             '运营商',
     col_sms_recv:             '收到短信',
     col_sms_sent:             '发送短信',
@@ -538,7 +540,7 @@ const translations = {
     err_no_sim_selected:      '未选择SIM卡。',
 
     // Phone number management
-    btn_phone_number:         '电话号码',
+    btn_phone_number:         '号码',
     phone_number_title:       '电话号码管理',
     phone_tab_import:         '导入号码',
     phone_tab_call:           '互相呼叫',
@@ -600,8 +602,8 @@ const translations = {
     err_no_ussd_code:         '请输入 USSD 代码。',
 
     // Platform integration
-    btn_connect_platform:     '接入平台',
-    btn_platform_stats:       '平台统计',
+    btn_connect_platform:     '平台',
+    btn_platform_stats:       '统计',
     btn_force_register:       '注册',
     force_register_running:   '注册中…',
     btn_register_again:       '再次注册',

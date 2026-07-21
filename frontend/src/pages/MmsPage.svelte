@@ -397,14 +397,16 @@
 
 <div class="h-dvh overflow-y-auto bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
   <div class="sticky top-0 z-10 border-b border-gray-200 dark:border-gray-700 bg-white/90 dark:bg-gray-800/90 backdrop-blur">
-    <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
+    <div class="flex items-center justify-between px-4 py-3">
       <div class="flex items-center gap-3">
         <button
           onclick={onBack}
-          class="rounded-lg p-2 transition-colors hover:bg-gray-100 dark:hover:bg-gray-700"
+          class="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-full bg-blue-600 text-white
+                 shadow-sm shadow-blue-600/30 hover:bg-blue-700 transition"
           aria-label="Back"
         >
-          <Icon icon="carbon:chevron-left" class="h-5 w-5" />
+          <Icon icon="carbon:arrow-left" class="h-4 w-4" />
+          <span class="text-xs font-semibold">{$t('btn_back')}</span>
         </button>
         <div class="flex items-center gap-2">
           <Icon icon="carbon:image" class="h-5 w-5 text-gray-500 dark:text-gray-400" />

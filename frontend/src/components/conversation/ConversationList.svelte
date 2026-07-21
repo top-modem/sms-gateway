@@ -108,13 +108,14 @@
   <div class="flex items-center justify-between mb-3">
     <div class="flex items-center gap-2">
       <button
-        class="inline-flex items-center justify-center w-8 h-8 rounded-lg border border-gray-200 dark:border-zinc-700
-               text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
+        class="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-full bg-blue-600 text-white
+               shadow-sm shadow-blue-600/30 hover:bg-blue-700 transition"
         onclick={() => window.location.href = '/'}
         aria-label="Back to Dashboard"
         title="Back to Dashboard"
       >
-        <Icon icon="carbon:chevron-left" class="w-5 h-5" />
+        <Icon icon="carbon:arrow-left" class="w-4 h-4" />
+        <span class="text-xs font-semibold">{$t('btn_back')}</span>
       </button>
       <h2 class="text-base font-semibold text-gray-800 dark:text-gray-200">{$t('messages')}</h2>
     </div>

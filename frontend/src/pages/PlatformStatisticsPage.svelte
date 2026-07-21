@@ -175,15 +175,17 @@
 </script>
 
 <div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
-  <header class="shrink-0 z-10 border-b border-gray-200 dark:border-gray-700 bg-white/90 dark:bg-gray-800/90 backdrop-blur">
-    <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
+  <header class="shrink-0 z-10 border-b border-gray-200 dark:border-gray-700 bg-white/90 dark:bg-gray-800/90 backdrop-blur shadow-sm">
+    <div class="flex items-center justify-between px-4 py-3">
       <div class="flex items-center gap-3">
         <button
           onclick={onBack}
-          class="rounded-lg p-2 transition-colors hover:bg-gray-100 dark:hover:bg-gray-700"
+          class="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-full bg-blue-600 text-white
+                 shadow-sm shadow-blue-600/30 hover:bg-blue-700 transition"
           aria-label="Back"
         >
-          <Icon icon="carbon:chevron-left" class="h-5 w-5" />
+          <Icon icon="carbon:arrow-left" class="h-4 w-4" />
+          <span class="text-xs font-semibold">{$t('btn_back')}</span>
         </button>
         <div>
           <h1 class="text-lg font-semibold">{$t('platform_stats_title')}</h1>

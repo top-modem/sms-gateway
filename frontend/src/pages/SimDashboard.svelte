@@ -128,6 +128,8 @@
   let selected   = $state(new Set());
   let lastClickedRowIndex = $state(null);
   let hoveredRow = $state(null);
+  let showOperatorColumn = $state(false);
+  let visibleDataColumnCount = $derived(showOperatorColumn ? 12 : 11);
 
   // ── Network status map ────────────────────────────────────────────────────
   const netStatusKeys = {
@@ -355,7 +357,7 @@
                hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
       >
         <Icon icon="carbon:chat" class="w-4 h-4" />
-        {$t('btn_messages')}
+        {$t('col_sms')}
       </button>
       <button
         onclick={forceRegister}
@@ -402,6 +404,17 @@
         {$t('btn_refresh')}
       </button>
       <button
+        onclick={() => { showOperatorColumn = !showOperatorColumn; }}
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+               border border-gray-200 dark:border-zinc-700
+               text-gray-600 dark:text-gray-300
+               hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
+        title={showOperatorColumn ? $t('hide_operator_column') : $t('show_operator_column')}
+      >
+        <Icon icon={showOperatorColumn ? 'carbon:chevron-left' : 'carbon:chevron-right'} class="w-4 h-4" />
+        {showOperatorColumn ? $t('hide_operator_column') : $t('show_operator_column')}
+      </button>
+      <button
         onclick={logout}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
@@ -441,7 +454,19 @@
                 <span class="text-gray-400 font-semibold">#</span>
               {/if}
             </th>
-            {#each [$t('col_com_port'),$t('col_module'),$t('col_signal'),$t('col_network_status'),$t('col_phone_number'),$t('col_operator'),$t('col_country'),$t('col_platform'),$t('col_sms'),'ICCID','IMSI','IMEI'] as col}
+            {#each [$t('col_com_port'),$t('col_module'),$t('col_signal'),$t('col_network_status'),$t('col_phone_number')] as col}
+              <th class="px-3 py-2.5 text-left font-semibold text-gray-600 dark:text-gray-300
+                         border-b border-gray-200 dark:border-zinc-700 whitespace-nowrap">
+                {col}
+              </th>
+            {/each}
+            {#if showOperatorColumn}
+              <th class="px-3 py-2.5 text-left font-semibold text-gray-600 dark:text-gray-300
+                         border-b border-gray-200 dark:border-zinc-700 whitespace-nowrap">
+                {$t('col_operator')}
+              </th>
+            {/if}
+            {#each [$t('col_country'),$t('col_platform'),$t('col_sms'),'ICCID','IMSI','IMEI'] as col}
               <th class="px-3 py-2.5 text-left font-semibold text-gray-600 dark:text-gray-300
                          border-b border-gray-200 dark:border-zinc-700 whitespace-nowrap">
                 {col}
@@ -459,7 +484,7 @@
                 <td class="px-3 py-2.5 text-center">
                   <div class="w-5 h-5 bg-gray-200 dark:bg-zinc-700 rounded mx-auto"></div>
                 </td>
-                {#each Array(11) as _}
+                {#each Array(visibleDataColumnCount) as _}
                   <td class="px-3 py-2.5">
                     <div class="h-3 bg-gray-200 dark:bg-zinc-700 rounded w-3/4"></div>
                   </td>
@@ -468,7 +493,7 @@
             {/each}
           {:else if rows.length === 0}
             <tr>
-              <td colspan="13" class="px-6 py-12 text-center text-gray-400">
+              <td colspan={visibleDataColumnCount + 1} class="px-6 py-12 text-center text-gray-400">
                 <Icon icon="carbon:sim-card" class="w-8 h-8 mx-auto mb-2 opacity-40" />
                 <p>{$t('no_sim_cards')}</p>
               </td>
@@ -582,13 +607,15 @@
                 </td>
 
                 <!-- Operator -->
-                <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {#if info.available === false}
-                    <span class="text-gray-400">—</span>
-                  {:else}
-                    {info.operator_info?.operator_name ?? '—'}
-                  {/if}
-                </td>
+                {#if showOperatorColumn}
+                  <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
+                    {#if info.available === false}
+                      <span class="text-gray-400">—</span>
+                    {:else}
+                      {info.operator_info?.operator_name ?? '—'}
+                    {/if}
+                  </td>
+                {/if}
 
                 <!-- Country -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">

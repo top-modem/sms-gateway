@@ -3,7 +3,7 @@ use std::path::Path;
 
 #[cfg(target_os = "windows")]
 fn compile_windows_resources() {
-    println!("cargo:rerun-if-changed=assets/icons/sms-gateway.ico");
+    println!("cargo:rerun-if-changed=assets/icons/xiaoniu-zhika.ico");
     println!("cargo:rerun-if-changed=assets/icons/sms-gateway.rc");
     embed_resource::compile("assets/icons/sms-gateway.rc", embed_resource::NONE);
 }

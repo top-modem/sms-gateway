@@ -69,9 +69,9 @@ async fn main() {
             Ok(joined) => {
                 // Backend exited quickly: treat as startup failure and show clear error.
                 let err_text = match joined {
-                    Ok(Ok(())) => "SMS Gateway exited unexpectedly.".to_string(),
+                    Ok(Ok(())) => "小牛智卡意外退出。".to_string(),
                     Ok(Err(err)) => format_startup_error_message(&err.to_string()),
-                    Err(join_err) => format!("SMS Gateway startup task failed: {}", join_err),
+                    Err(join_err) => format!("小牛智卡启动任务失败: {}", join_err),
                 };
                 show_windows_error_dialog(&err_text);
                 eprintln!("Error: {}", err_text);
@@ -90,7 +90,7 @@ async fn main() {
                         eprintln!("Error: {}", err_text);
                     }
                     Err(join_err) => {
-                        let err_text = format!("SMS Gateway runtime task failed: {}", join_err);
+                        let err_text = format!("小牛智卡运行任务失败: {}", join_err);
                         show_windows_error_dialog(&err_text);
                         eprintln!("Error: {}", err_text);
                     }
@@ -222,16 +222,16 @@ fn maybe_start_windows_tray() {
 #[cfg(target_os = "windows")]
 fn format_startup_error_message(err: &str) -> String {
     if err.contains("10048") || err.contains("Only one usage") || err.contains("通常每个套接字地址") {
-        return "SMS Gateway is already running (port is in use). Please check the tray icons, or stop the existing instance first.".to_string();
+        return "小牛智卡已在运行（端口被占用）。请检查系统托盘图标，或先关闭正在运行的实例。".to_string();
     }
-    format!("SMS Gateway failed to start: {}", err)
+    format!("小牛智卡启动失败: {}", err)
 }
 
 #[cfg(target_os = "windows")]
 fn show_windows_error_dialog(message: &str) {
     let _ = native_dialog::MessageDialog::new()
         .set_type(native_dialog::MessageType::Error)
-        .set_title("SMS Gateway")
+        .set_title("小牛智卡")
         .set_text(message)
         .show_alert();
 }
@@ -249,25 +249,59 @@ fn open_browser_with_fallback(url: &str) {
 
 #[cfg(target_os = "windows")]
 fn run_windows_tray(url: String) -> anyhow::Result<()> {
-    let _ = native_dialog::MessageDialog::new()
-        .set_type(native_dialog::MessageType::Info)
-        .set_title("SMS Gateway")
-        .set_text("SMS Gateway is running in tray.")
-        .show_alert();
+    show_windows_info_message_box("小牛智卡正在系统托盘中运行。", 2500);
 
     let mut tray = create_windows_tray_item()?;
 
     let open_url = url.clone();
-    tray.add_menu_item("Open Panel", move || {
+    tray.add_menu_item("打开面板", move || {
         open_browser_with_fallback(&open_url);
     })?;
 
-    tray.add_menu_item("Exit", || {
+    tray.add_menu_item("退出", || {
         std::process::exit(0);
     })?;
 
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_info_message_box(message: &str, timeout_ms: u32) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxTimeoutW(
+            hwnd: isize,
+            lpText: *const u16,
+            lpCaption: *const u16,
+            uType: u32,
+            wLanguageId: u16,
+            dwMilliseconds: u32,
+        ) -> i32;
+    }
+
+    let text: Vec<u16> = OsStr::new(message)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption: Vec<u16> = OsStr::new("小牛智卡")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let _ = MessageBoxTimeoutW(
+            0,
+            text.as_ptr(),
+            caption.as_ptr(),
+            0x0000_0040,
+            0,
+            timeout_ms,
+        );
     }
 }
 
@@ -280,28 +314,41 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
 
     fn try_load_icon_from_exe_dir() -> Option<HICON> {
         let exe = std::env::current_exe().ok()?;
-        let icon_path = exe.parent()?.join("sms-gateway.ico");
-        if !icon_path.exists() {
-            return None;
+        let base = exe.parent()?;
+        let candidates = [
+            base.join("icon").join("tray.ico"),
+            base.join("icon").join("xiaoniu-zhika.ico"),
+            base.join("xiaoniu-zhika.ico"),
+            base.join("sms-gateway.ico"),
+        ];
+
+        for icon_path in candidates {
+            if !icon_path.exists() {
+                continue;
+            }
+
+            let wide: Vec<u16> = icon_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let h = unsafe {
+                LoadImageW(
+                    0,
+                    wide.as_ptr(),
+                    IMAGE_ICON,
+                    64,
+                    64,
+                    LR_LOADFROMFILE,
+                )
+            };
+            if h != 0 {
+                return Some(h as HICON);
+            }
         }
 
-        let wide: Vec<u16> = icon_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let h = unsafe {
-            LoadImageW(
-                0,
-                wide.as_ptr(),
-                IMAGE_ICON,
-                64,
-                64,
-                LR_LOADFROMFILE,
-            )
-        };
-        if h == 0 { None } else { Some(h as HICON) }
+        None
     }
 
     let hicon = try_load_icon_from_exe_dir().unwrap_or_else(|| unsafe {
@@ -313,7 +360,7 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
         anyhow::bail!("unable to load tray icon handle")
     }
 
-    tray_item::TrayItem::new("SMS Gateway", tray_item::IconSource::RawIcon(hicon))
+    tray_item::TrayItem::new("小牛智卡", tray_item::IconSource::RawIcon(hicon))
         .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 

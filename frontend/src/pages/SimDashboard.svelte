@@ -304,7 +304,7 @@
   <!-- ── Top bar ──────────────────────────────────────────────────────────── -->
   <header class="flex items-center justify-between px-6 py-3 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800 shadow-sm">
     <div class="flex items-center gap-3">
-      <Icon icon="carbon:sim-card" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+      <img src="/cow.png" alt="小牛智卡" class="w-5 h-5 rounded-sm object-cover" />
       <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('sim_dashboard_title')}</h1>
       {#if !loading}
         <span class="text-xs text-gray-400 dark:text-gray-500">
@@ -322,7 +322,7 @@
                text-gray-600 dark:text-gray-300
                hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
       >
-        <Icon icon="carbon:phone-voice" class="w-4 h-4" />
+        <Icon icon="carbon:notebook-reference" class="w-4 h-4" />
         {$t('btn_phone_number')}
       </button>
       <button

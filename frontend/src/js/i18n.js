@@ -8,7 +8,7 @@ const translations = {
 
     // Login
     login_welcome:            'Welcome back',
-    login_subtitle:           'Sign in to continue to SMS Gateway',
+    login_subtitle:           'Sign in to continue to 小牛智卡',
     login_username:           'Username',
     login_username_ph:        'Enter your username',
     login_password:           'Password',
@@ -107,7 +107,7 @@ const translations = {
     code_copied:              'Code copied',
 
     // SimDashboard
-    sim_dashboard_title:      'SIM Dashboard',
+    sim_dashboard_title:      'Xiaoniu Zhika',
     sim_count:                '{n} SIM',
     sim_count_plural:         '{n} SIMs',
     selected_count:           '{n} selected',
@@ -400,7 +400,7 @@ const translations = {
 
     // Login
     login_welcome:            '欢迎回来',
-    login_subtitle:           '登录 SMS Gateway',
+    login_subtitle:           '登录小牛智卡',
     login_username:           '用户名',
     login_username_ph:        '请输入用户名',
     login_password:           '密码',
@@ -499,7 +499,7 @@ const translations = {
     code_copied:              '验证码已复制',
 
     // SimDashboard
-    sim_dashboard_title:      'SIM 仪表盘',
+    sim_dashboard_title:      '小牛智卡',
     sim_count:                '{n} 张SIM',
     sim_count_plural:         '{n} 张SIM',
     selected_count:           '已选 {n}',

@@ -97,7 +97,7 @@
         <Icon icon="carbon:send-filled" class="w-5 h-5 text-gray-100 dark:text-gray-900" />
     </div>
     <div>
-        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">SMS Gateway</h1>
+        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">小牛智卡</h1>
         <p class="text-xs text-gray-500 dark:text-gray-400">{$t('app_tagline')}</p>
     </div>
 </div>

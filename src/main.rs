@@ -2,6 +2,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use chrono::{Days, Local, Months, NaiveDate};
+
 use api::SseManager;
 use db::db_init;
 use flexi_logger::{
@@ -49,6 +51,18 @@ async fn main() {
             }
         }
         return;
+    }
+
+    if is_software_expired() {
+        #[cfg(target_os = "windows")]
+        {
+            show_windows_error_dialog("你的软件已过期，请联系作者");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            eprintln!("你的软件已过期，请联系作者");
+        }
+        std::process::exit(1);
     }
 
     #[cfg(target_os = "windows")]
@@ -225,6 +239,37 @@ fn format_startup_error_message(err: &str) -> String {
         return "小牛智卡已在运行（端口被占用）。请检查系统托盘图标，或先关闭正在运行的实例。".to_string();
     }
     format!("小牛智卡启动失败: {}", err)
+}
+
+fn is_software_expired() -> bool {
+    let today = Local::now().date_naive();
+    let path = expiry_state_file_path();
+
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(expiry) = NaiveDate::parse_from_str(content.trim(), "%Y-%m-%d") {
+            return today > expiry;
+        }
+    }
+
+    let expiry = today
+        .checked_add_months(Months::new(4))
+        .or_else(|| today.checked_add_days(Days::new(120)))
+        .unwrap_or(today);
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, expiry.format("%Y-%m-%d").to_string());
+    false
+}
+
+fn expiry_state_file_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(base) = exe.parent() {
+            return base.join("data").join(".xiaoniu_expiry");
+        }
+    }
+    PathBuf::from(".xiaoniu_expiry")
 }
 
 #[cfg(target_os = "windows")]

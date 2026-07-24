@@ -652,6 +652,7 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
 
         details.push(json!({
             "available": true,
+            "is_invalid": false,
             "sim_id": json_sim_id,
             "has_sim": has_sim,
             "name": sim_id.clone(),
@@ -680,8 +681,10 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
         }
 
         let last_known = modem_manager.get_last_known_sim_card_for_port(&com_port).await;
+        let is_invalid = modem_manager.is_invalid_port(&com_port).await;
         details.push(json!({
             "available": false,
+            "is_invalid": is_invalid,
             "sim_id": last_known.as_ref().map(|card| card.id.clone()),
             "has_sim": false,
             "name": last_known.as_ref().map(|card| card.id.clone()),

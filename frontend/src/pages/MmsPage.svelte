@@ -5,7 +5,7 @@
   import { t } from '../js/i18n.js';
   import Modal from '../components/common/Modal.svelte';
 
-  let { onBack = () => {} } = $props();
+  let { onBack = () => {}, initialSimId = null } = $props();
 
   // ── SIM list (active modems) ────────────────────────────────────────────
   let sims = $state([]);
@@ -54,6 +54,9 @@
   let inboxDetailParts = $state([]);
   let inboxDetailLoading = $state(false);
   let inboxDetailOpen = $state(false);
+  let inboxPartPreviewOpen = $state(false);
+  let inboxPartPreviewTitle = $state('');
+  let inboxPartPreviewText = $state('');
 
   let pollTimer = null;
 
@@ -68,7 +71,11 @@
       const infos = Array.isArray(response) ? response : (response?.data ?? []);
       sims = infos;
       if (!selectedSimId && sims.length > 0) {
-        selectedSimId = sims[0].sim_id;
+        const preferred = initialSimId && sims.find((sim) => sim.sim_id === initialSimId);
+        selectedSimId = preferred ? preferred.sim_id : sims[0].sim_id;
+      } else if (selectedSimId && !sims.some((sim) => sim.sim_id === selectedSimId) && sims.length > 0) {
+        const preferred = initialSimId && sims.find((sim) => sim.sim_id === initialSimId);
+        selectedSimId = preferred ? preferred.sim_id : sims[0].sim_id;
       }
     } catch (e) {
       console.error('Failed to load SIM list:', e);
@@ -327,12 +334,30 @@
     inboxDetailOpen = false;
     inboxDetailItem = null;
     inboxDetailParts = [];
+    inboxPartPreviewOpen = false;
+    inboxPartPreviewTitle = '';
+    inboxPartPreviewText = '';
+  }
+
+  function isLikelyTextPart(part, blob) {
+    const contentType = String(part?.content_type || blob?.type || '').toLowerCase();
+    const filename = String(part?.filename || '').toLowerCase();
+    return contentType.startsWith('text/')
+      || contentType.includes('smil')
+      || filename.includes('text')
+      || filename.includes('smil');
   }
 
   async function viewInboxPart(part) {
     if (!inboxDetailItem) return;
     try {
       const blob = await apiClient.getMmsInboxPartBlob(inboxDetailItem.id, part.id);
+      if (isLikelyTextPart(part, blob)) {
+        inboxPartPreviewTitle = part.filename || part.content_type || 'text/plain';
+        inboxPartPreviewText = await blob.text();
+        inboxPartPreviewOpen = true;
+        return;
+      }
       const url = URL.createObjectURL(blob);
       window.open(url, '_blank');
       // Give the new tab time to load the resource before revoking it.
@@ -370,6 +395,31 @@
   function formatMmsSize(bytes) {
     if (bytes === null || bytes === undefined) return '-';
     return formatBytes(bytes);
+  }
+
+  function normalizeMmsSender(value) {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '';
+
+    // Typical format: +8618126101015/TYPE=PLMN
+    const noType = raw.split('/')[0].trim();
+    const digits = noType.replace(/\D/g, '');
+
+    // Mainland China mobile numbers: drop country code when present.
+    if (digits.length === 13 && digits.startsWith('86') && digits[2] === '1') {
+      return digits.slice(2);
+    }
+    if (digits.length === 11 && digits.startsWith('1')) {
+      return digits;
+    }
+
+    return noType || raw;
+  }
+
+  function mmsSenderDisplay(item) {
+    const from = normalizeMmsSender(item?.from_address);
+    if (from) return from;
+    return normalizeMmsSender(item?.sender) || '-';
   }
 
   $effect(() => {
@@ -808,7 +858,7 @@
                   <td class="whitespace-nowrap px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
                     {formatDate(item.created_at)}
                   </td>
-                  <td class="px-4 py-3">{item.sender}</td>
+                  <td class="px-4 py-3">{mmsSenderDisplay(item)}</td>
                   <td class="max-w-[220px] truncate px-4 py-3 font-mono text-xs" title={item.transaction_id}>
                     {item.transaction_id}
                   </td>
@@ -855,7 +905,7 @@
       <dl class="space-y-2">
         <div class="flex justify-between gap-4">
           <dt class="text-gray-500 dark:text-gray-400">{$t('col_sender')}</dt>
-          <dd class="font-medium">{inboxDetailItem.sender}</dd>
+          <dd class="font-medium">{mmsSenderDisplay(inboxDetailItem)}</dd>
         </div>
         {#if inboxDetailItem.subject}
           <div class="flex justify-between gap-4">
@@ -935,6 +985,18 @@
         {/if}
       </dl>
     {/if}
+  </div>
+</Modal>
+
+<Modal isOpen={inboxPartPreviewOpen} onClose={() => (inboxPartPreviewOpen = false)} maxWidth="max-w-2xl">
+  <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-zinc-700">
+    <div class="font-semibold text-gray-800 dark:text-gray-100">{inboxPartPreviewTitle || $t('mms_inbox_view_part')}</div>
+    <button onclick={() => (inboxPartPreviewOpen = false)} class="rounded-lg p-1.5 hover:bg-gray-100 dark:hover:bg-zinc-800" aria-label="Close">
+      <Icon icon="carbon:close" class="h-4 w-4" />
+    </button>
+  </div>
+  <div class="max-h-[65vh] overflow-auto p-4 text-sm">
+    <pre class="whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 font-mono text-xs dark:bg-zinc-900">{inboxPartPreviewText || '-'}</pre>
   </div>
 </Modal>
 

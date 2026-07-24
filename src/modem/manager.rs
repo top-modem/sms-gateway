@@ -14,7 +14,7 @@ use crate::config::{Settings, SmsStorage};
 use crate::db::{Call, Contact, ModemSMS, SimCard, Sms, SmsStatus};
 use crate::webhook;
 
-use super::core::Modem;
+use super::core::{ApreadyProbeResult, Modem};
 use super::types::*;
 
 /// Configuration for local whisper.cpp speech-to-text transcription.
@@ -61,6 +61,8 @@ pub struct ModemManager {
     urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
+    /// COM ports that responded to APREADY but are not valid modules.
+    invalid_ports: RwLock<HashSet<String>>,
     /// Background tasks that periodically quick-probe unavailable ports.
     unavailable_port_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// Original device list so unavailable ports can be retried later.
@@ -164,13 +166,25 @@ impl ModemManager {
 
             // Quick probe: empty ports fail fast. Acquire the shared probe semaphore
             // so a large number of unavailable ports cannot overwhelm the USB hub.
-            let present = {
+            let (present, apready_probe) = {
                 let _permit = self.probe_semaphore.acquire().await;
-                Modem::quick_probe_port(&com_port, baud_rate).await
+                let present = Modem::quick_probe_port(&com_port, baud_rate).await;
+                let apready_probe = if present {
+                    Modem::quick_probe_apready_port(&com_port, baud_rate).await
+                } else {
+                    ApreadyProbeResult::Unavailable
+                };
+                (present, apready_probe)
             };
             if !present {
                 continue;
             }
+
+            if matches!(apready_probe, ApreadyProbeResult::Invalid) {
+                self.invalid_ports.write().await.insert(com_port.clone());
+                continue;
+            }
+            self.invalid_ports.write().await.remove(&com_port);
 
             // Full init for ports that look like they have a modem/SIM.
             match Self::initialize_single_modem_safe(
@@ -332,6 +346,7 @@ impl ModemManager {
             )),
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
+            invalid_ports: RwLock::new(HashSet::new()),
             unavailable_port_tasks: RwLock::new(HashMap::new()),
             devices: config.devices.clone(),
             force_uk_mcc_to_46001: config.settings.force_uk_mcc_to_46001.unwrap_or(true),
@@ -533,24 +548,45 @@ impl ModemManager {
             probe_futs.push(async move {
                 let _permit = sem.acquire().await;
                 let present = Modem::quick_probe_port(&port, baud_rate).await;
-                (index, port, baud_rate, present)
+                let apready_probe = if present {
+                    Modem::quick_probe_apready_port(&port, baud_rate).await
+                } else {
+                    ApreadyProbeResult::Unavailable
+                };
+                (index, port, baud_rate, present, apready_probe)
             });
         }
 
         let mut probe_results = Vec::new();
-        while let Some((index, port, baud_rate, present)) = probe_futs.next().await {
-            probe_results.push((index, port, baud_rate, present));
+        while let Some((index, port, baud_rate, present, apready_probe)) = probe_futs.next().await {
+            probe_results.push((index, port, baud_rate, present, apready_probe));
+        }
+
+        let invalid_ports_set: HashSet<String> = probe_results
+            .iter()
+            .filter_map(|(_, port, _, present, apready_probe)| match (*present, apready_probe) {
+                (true, ApreadyProbeResult::Invalid) => Some(port.clone()),
+                _ => None,
+            })
+            .collect();
+        {
+            let mut invalid = self.invalid_ports.write().await;
+            *invalid = invalid_ports_set;
         }
 
         let probed_present: Vec<usize> = probe_results
             .iter()
-            .filter(|(_, _, _, present)| *present)
-            .map(|(index, _, _, _)| *index)
+            .filter(|(_, _, _, present, apready_probe)| {
+                *present && !matches!(apready_probe, ApreadyProbeResult::Invalid)
+            })
+            .map(|(index, _, _, _, _)| *index)
             .collect();
         let probed_absent: Vec<usize> = probe_results
             .iter()
-            .filter(|(_, _, _, present)| !present)
-            .map(|(index, _, _, _)| *index)
+            .filter(|(_, _, _, present, apready_probe)| {
+                !(*present && !matches!(apready_probe, ApreadyProbeResult::Invalid))
+            })
+            .map(|(index, _, _, _, _)| *index)
             .collect();
 
         info!(
@@ -1672,6 +1708,10 @@ impl ModemManager {
     pub async fn get_last_known_sim_card_for_port(&self, com_port: &str) -> Option<SimCard> {
         let sim_id = self.last_known_sim_ids_by_port.read().await.get(com_port).cloned()?;
         self.get_sim_card_cached(&sim_id).await
+    }
+
+    pub async fn is_invalid_port(&self, com_port: &str) -> bool {
+        self.invalid_ports.read().await.contains(com_port)
     }
 
     pub async fn update_sim_cache(&self, sim_card: SimCard) {

@@ -50,7 +50,8 @@
     currentPage = 'platform-stats';
   }
 
-  function goToMms() {
+  function goToMms(simId) {
+    filterSimId = simId;
     currentPage = 'mms';
   }
 
@@ -117,7 +118,7 @@
 
     {:else if currentPage === 'mms'}
       <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
-        <MmsPage onBack={goToSim} />
+        <MmsPage onBack={goToSim} initialSimId={filterSimId} />
       </div>
 
     {:else if currentPage === 'phonenumber'}

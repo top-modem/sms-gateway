@@ -6,6 +6,8 @@
   import { logout } from '../stores/auth.js';
   import { t, lang } from '../js/i18n.js';
 
+  const appVersion = __APP_VERSION__;
+
   // ── MCC → Country map ─────────────────────────────────────────────────────
   const mccMap = {
     '460': { en: 'China',        zh: '中国' },
@@ -306,10 +308,10 @@
     <div class="flex items-center gap-3">
       <img src="/cow.png" alt="小牛智卡" class="w-5 h-5 rounded-sm object-cover" />
       <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('sim_dashboard_title')}</h1>
-      {#if !loading}
+      <span class="text-xs text-gray-400 dark:text-gray-500">v{appVersion}</span>
+      {#if !loading && selected.size > 0}
         <span class="text-xs text-gray-400 dark:text-gray-500">
-          {rows.length === 1 ? $t('sim_count', { n: rows.length }) : $t('sim_count_plural', { n: rows.length })}
-          {#if selected.size > 0}· {$t('selected_count', { n: selected.size })}{/if}
+          {$t('selected_count', { n: selected.size })}
         </span>
       {/if}
     </div>
@@ -346,7 +348,7 @@
         {$t('btn_platform_stats')}
       </button>
       <button
-        onclick={() => onNavigateMms()}
+        onclick={() => onNavigateMms(selected.size === 1 ? [...selected][0] : null)}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -543,7 +545,9 @@
 
                 <!-- Module name -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {#if info.available === false}
+                  {#if info.is_invalid === true}
+                    <span class="text-red-500">无效</span>
+                  {:else if info.available === false}
                     <span class="text-gray-400">—</span>
                   {:else}
                     {getModuleLabel(info.model_info?.model)}

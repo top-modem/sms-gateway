@@ -2094,13 +2094,18 @@ impl MmsInboxNotification {
             r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
                       message_class, expiry_at, status, error_message, retry_count, next_retry_at,
                       subject, from_address, fetched_at, notification_raw, created_at, updated_at
-               FROM mms_inbox ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
+               FROM mms_inbox
+               WHERE transaction_id NOT LIKE 'undecoded-%'
+               ORDER BY created_at DESC
+               LIMIT ? OFFSET ?"#,
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
         .await?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mms_inbox")
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mms_inbox WHERE transaction_id NOT LIKE 'undecoded-%'",
+        )
             .fetch_one(pool)
             .await?;
         Ok((items, total))

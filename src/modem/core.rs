@@ -17,6 +17,13 @@ use crate::webhook;
 use super::pdu::{build_pdus, string_to_ucs2_pub};
 use super::types::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApreadyProbeResult {
+    Valid,
+    Invalid,
+    Unavailable,
+}
+
 /// All SMS timestamps (incoming and outgoing) are normalized to GMT+8 so they
 /// don't depend on the host OS's configured timezone. See also
 /// `decode::parse_timestamp`, which applies the same target offset when
@@ -239,14 +246,30 @@ impl Modem {
         }
     }
 
-    /// Quick probe used by the reconnection worker: open a port with a short
-    /// timeout, send AT+CPIN?, and report whether a SIM (or at least a modem
-    /// responding to CPIN) is present. This avoids the ~10-20 second cost of a
-    /// full modem initialization on every empty port.
+    fn parse_apready_last_value(response: &str) -> Option<i32> {
+        response.lines().find_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("+QCFG:") || !trimmed.contains("\"apready\"") {
+                return None;
+            }
+
+            let mut parts = trimmed.split(',');
+            let _ = parts.next();
+            parts
+                .next_back()
+                .and_then(|v| v.trim().trim_matches('"').parse::<i32>().ok())
+        })
+    }
+
+    /// Quick APREADY probe used during startup/recheck.
+    /// Returns:
+    /// - Valid:   modem responded and APREADY last value is 510/511
+    /// - Invalid: modem responded but APREADY value is not 510/511
+    /// - Unavailable: port cannot be opened or no usable QCFG response
     pub async fn quick_probe_port(com_port: &str, baud_rate: u32) -> bool {
         const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
         const READ_TIMEOUT: Duration = Duration::from_millis(300);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
         let open_result = tokio::time::timeout(
             OPEN_TIMEOUT,
@@ -268,7 +291,7 @@ impl Modem {
             _ => return false,
         };
 
-        // Drain any stale bytes that may be sitting in the port buffer.
+        // Drain stale bytes to avoid matching historical responses.
         let mut drain = [0u8; 256];
         while let Ok(Ok(n)) =
             tokio::time::timeout(Duration::from_millis(100), stream.read(&mut drain)).await
@@ -292,6 +315,69 @@ impl Modem {
             match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if response.contains("+CPIN:")
+                        || response.contains("\r\nOK\r\n")
+                        || response.contains("\r\nERROR")
+                    {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        response.contains("+CPIN:") || response.contains("\r\nOK\r\n")
+    }
+
+    pub async fn quick_probe_apready_port(com_port: &str, baud_rate: u32) -> ApreadyProbeResult {
+        const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+        const READ_TIMEOUT: Duration = Duration::from_millis(300);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+        let open_result = tokio::time::timeout(
+            OPEN_TIMEOUT,
+            tokio::task::spawn_blocking({
+                let port = com_port.to_string();
+                move || {
+                    tokio_serial::new(&port, baud_rate)
+                        .timeout(READ_TIMEOUT)
+                        .flow_control(tokio_serial::FlowControl::None)
+                        .open_native_async()
+                        .map_err(|e| io::Error::other(format!("Failed to open {}: {}", port, e)))
+                }
+            }),
+        )
+        .await;
+
+        let mut stream = match open_result {
+            Ok(Ok(Ok(stream))) => stream,
+            _ => return ApreadyProbeResult::Unavailable,
+        };
+
+        // Drain any stale bytes that may be sitting in the port buffer.
+        let mut drain = [0u8; 256];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut drain)).await
+        {
+            if n == 0 {
+                break;
+            }
+        }
+
+        if stream.write_all(b"AT+QCFG=\"apready\"\r\n").await.is_err() {
+            return ApreadyProbeResult::Unavailable;
+        }
+        if stream.flush().await.is_err() {
+            return ApreadyProbeResult::Unavailable;
+        }
+
+        let mut buf = [0u8; 512];
+        let mut response = String::new();
+        let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    response.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if response.contains("\r\nOK\r\n") || response.contains("\r\nERROR") {
                         break;
                     }
@@ -300,14 +386,11 @@ impl Modem {
             }
         }
 
-        let upper = response.to_uppercase();
-        if upper.contains("+CPIN:") && !upper.contains("REMOVED") && !upper.contains("NOT INSERTED")
-        {
-            return true;
+        match Self::parse_apready_last_value(&response) {
+            Some(510) | Some(511) => ApreadyProbeResult::Valid,
+            Some(_) => ApreadyProbeResult::Invalid,
+            None => ApreadyProbeResult::Unavailable,
         }
-        // A plain OK with no CPIN info is unusual for a modem; still treat it as
-        // present so the full init can decide.
-        upper.contains("OK")
     }
 
     // ─── Background reader task ────────────────────────────────────────────────
@@ -1514,6 +1597,12 @@ impl Modem {
         }
 
         false
+    }
+
+    pub async fn check_apready_valid(&self) -> io::Result<bool> {
+        let raw_response = self.send_command_with_ok("AT+QCFG=\"apready\"\r\n").await?;
+        let last = Self::parse_apready_last_value(&raw_response);
+        Ok(matches!(last, Some(510) | Some(511)))
     }
 
     pub async fn get_signal_quality(&self) -> io::Result<Option<SignalQuality>> {

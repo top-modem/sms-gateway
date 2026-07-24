@@ -22,7 +22,10 @@ use crate::{
     config::SmsStorage,
     db::{AppSetting, BarcodeScan, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
-    modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
+    modem::{
+        ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality,
+        SmsSendMode, SmsType,
+    },
     phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
     service_control,
     ModemManagerRef,
@@ -447,7 +450,7 @@ async fn send_sms(
     }
 
     match modem_manager
-        .send_sms(&sim_id, &payload.contact, &payload.message)
+        .send_sms(&sim_id, &payload.contact, &payload.message, payload.sms_format)
         .await
     {
         Ok((sms_id, contact_id)) => {
@@ -1711,6 +1714,8 @@ pub struct SmsPayload {
     contact: Contact,
     message: String,
     new: bool,
+    #[serde(default)]
+    sms_format: SmsSendMode,
 }
 
 #[derive(Serialize)]

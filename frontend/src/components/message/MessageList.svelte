@@ -115,7 +115,7 @@
     }
   }
 
-  function handleSendMessage(simId) {
+  function handleSendMessage(simId, smsFormat = 'pdu') {
     if (sendMessageContent.trim() === "") {
       return;
     }
@@ -152,7 +152,7 @@
         : $currentContact;
 
     apiClient
-      .sendSms(simId, concat, newMessage.message, $currentContact.new ?? false)
+      .sendSms(simId, concat, newMessage.message, $currentContact.new ?? false, smsFormat)
       .then((res) => {
         isNewMessage = false;
         const messageId = res.data;

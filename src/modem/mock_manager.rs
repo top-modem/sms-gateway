@@ -10,7 +10,9 @@ use crate::config::{AppConfig, SmsStorage};
 use crate::db::{Contact, SimCard, Sms, SmsStatus};
 use crate::webhook;
 
-use super::types::{ModemInfo, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType};
+use super::types::{
+    ModemInfo, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsSendMode, SmsType,
+};
 
 pub struct MockModem {
     pub com_port: String,
@@ -195,6 +197,7 @@ impl ModemManager {
         sim_id: &str,
         contact: &Contact,
         message: &str,
+        _mode: SmsSendMode,
     ) -> anyhow::Result<(i64, String)> {
         let sms = Sms {
             id: 0,

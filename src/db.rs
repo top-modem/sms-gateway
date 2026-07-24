@@ -2095,7 +2095,17 @@ impl MmsInboxNotification {
                       message_class, expiry_at, status, error_message, retry_count, next_retry_at,
                       subject, from_address, fetched_at, notification_raw, created_at, updated_at
                FROM mms_inbox
-               WHERE transaction_id NOT LIKE 'undecoded-%'
+                             WHERE NOT (
+                                 transaction_id LIKE 'undecoded-%'
+                                 AND EXISTS (
+                                     SELECT 1
+                                     FROM mms_inbox d
+                                     WHERE d.sim_id = mms_inbox.sim_id
+                                         AND d.sender = mms_inbox.sender
+                                         AND d.transaction_id NOT LIKE 'undecoded-%'
+                                         AND ABS(strftime('%s', d.created_at) - strftime('%s', mms_inbox.created_at)) <= 300
+                                 )
+                             )
                ORDER BY created_at DESC
                LIMIT ? OFFSET ?"#,
         )
@@ -2104,7 +2114,19 @@ impl MmsInboxNotification {
         .fetch_all(pool)
         .await?;
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM mms_inbox WHERE transaction_id NOT LIKE 'undecoded-%'",
+                        r#"SELECT COUNT(*)
+                             FROM mms_inbox
+                             WHERE NOT (
+                                 transaction_id LIKE 'undecoded-%'
+                                 AND EXISTS (
+                                     SELECT 1
+                                     FROM mms_inbox d
+                                     WHERE d.sim_id = mms_inbox.sim_id
+                                         AND d.sender = mms_inbox.sender
+                                         AND d.transaction_id NOT LIKE 'undecoded-%'
+                                         AND ABS(strftime('%s', d.created_at) - strftime('%s', mms_inbox.created_at)) <= 300
+                                 )
+                             )"#,
         )
             .fetch_one(pool)
             .await?;

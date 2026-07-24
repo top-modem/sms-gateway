@@ -72,15 +72,18 @@ class ApiClient {
      */
     async getSmsByDirection(direction, page = 1, perPage = 100) {
         return FetchApi.get('/api/sms', { direction, page, per_page: perPage });
-    }    /**
+    }
+
+    /**
      * Send an SMS
      * @param {string} simId - Modem ID
      * @param {object} contact - Target phone number
      * @param {string} message - SMS content
      * @param {boolean} new_message - Whether to send a new message
+     * @param {'pdu'|'text'} [smsFormat='pdu'] - SMS modem send format
      */
-    async sendSms(simId, contact, message, new_message) {
-        const payload = { sim_id: simId, contact, message, new: new_message };
+    async sendSms(simId, contact, message, new_message, smsFormat = 'pdu') {
+        const payload = { sim_id: simId, contact, message, new: new_message, sms_format: smsFormat };
         return FetchApi.post('/api/sms', payload)
     }
 

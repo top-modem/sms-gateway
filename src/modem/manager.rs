@@ -927,13 +927,17 @@ impl ModemManager {
         sim_id: &str,
         contact: &Contact,
         message: &str,
+        mode: SmsSendMode,
     ) -> anyhow::Result<(i64, String)> {
         let modem = self
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        modem.send_sms_pdu(contact, message).await
+        match mode {
+            SmsSendMode::Pdu => modem.send_sms_pdu(contact, message).await,
+            SmsSendMode::Text => modem.send_sms_text(contact, message).await,
+        }
     }
 
     pub async fn read_sms(&self, sim_id: &str, sms_type: SmsType) -> anyhow::Result<Vec<ModemSMS>> {

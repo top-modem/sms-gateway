@@ -10,4 +10,6 @@ pub mod types;
 pub use manager::ModemManager;
 #[cfg(feature = "mock-data")]
 pub use mock_manager::ModemManager;
-pub use types::{ModemInfo, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType};
+pub use types::{
+	ModemInfo, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsSendMode, SmsType,
+};

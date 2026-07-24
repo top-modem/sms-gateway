@@ -1771,10 +1771,118 @@ impl Modem {
     }
 
     async fn send_text_message(&self, phone: &str, message: &str) -> anyhow::Result<()> {
-        self.send_sms_content(&format!("AT+CMGS=\"{}\"\r", phone), message, |msg| {
-            string_to_ucs2_pub(msg)
-        })
-        .await?;
+        // Keep receive-side PDU parsing intact: enter text mode only for the
+        // send operation, then always restore CMGF=0.
+        self.send_command_with_ok("AT+CMGF=1\r\n").await?;
+        self.send_command_with_ok("AT+CSCS=\"UCS2\"\r\n").await?;
+        self.send_command_with_ok("AT+CSMP=17,167,0,8\r\n").await?;
+
+        // Modem init keeps CSCS=UCS2. In text mode under UCS2 charset,
+        // destination number passed to AT+CMGS must also be UCS2 encoded
+        // (not plain digits), otherwise +CMS ERROR is returned before prompt.
+        let phone_ucs2 = string_to_ucs2_pub(phone)?;
+        let segments = Self::split_text_mode_segments(message, 67);
+
+        let send_result = if segments.len() <= 1 {
+            self.send_sms_content(&format!("AT+CMGS=\"{}\"\r", phone_ucs2), message, |msg| {
+                string_to_ucs2_pub(msg)
+            })
+            .await
+            .map(|_| ())
+        } else {
+            self.send_text_message_long_qcmgs(&phone_ucs2, &segments).await
+        };
+
+        let restore_result = self.send_command_with_ok("AT+CMGF=0\r\n").await;
+
+        match (send_result, restore_result) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(e), Ok(_)) => Err(e),
+            (Ok(_), Err(e)) => Err(anyhow::anyhow!(
+                "SMS sent in text mode but failed to restore PDU mode: {}",
+                e
+            )),
+            (Err(send_err), Err(restore_err)) => Err(anyhow::anyhow!(
+                "Text SMS send failed: {}; also failed to restore PDU mode: {}",
+                send_err,
+                restore_err
+            )),
+        }
+    }
+
+    fn split_text_mode_segments(message: &str, max_utf16_units: usize) -> Vec<String> {
+        if message.is_empty() {
+            return vec![String::new()];
+        }
+
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_units = 0usize;
+
+        for ch in message.chars() {
+            let units = ch.len_utf16();
+            if current_units + units > max_utf16_units && !current.is_empty() {
+                segments.push(current);
+                current = String::new();
+                current_units = 0;
+            }
+
+            current.push(ch);
+            current_units += units;
+        }
+
+        if !current.is_empty() {
+            segments.push(current);
+        }
+
+        if segments.is_empty() {
+            vec![String::new()]
+        } else {
+            segments
+        }
+    }
+
+    async fn send_text_message_long_qcmgs(
+        &self,
+        phone_ucs2: &str,
+        segments: &[String],
+    ) -> anyhow::Result<()> {
+        let total = segments.len();
+        anyhow::ensure!(
+            total <= u8::MAX as usize,
+            "Too many text segments for QCMGS: {}",
+            total
+        );
+
+        for (idx, segment) in segments.iter().enumerate() {
+            let setup_cmd = format!(
+                "AT+QCMGS=\"{}\",10,{},{}\r",
+                phone_ucs2,
+                idx + 1,
+                total
+            );
+            let prompt_response = self.send_command_priority(&setup_cmd, 1).await?;
+            if !prompt_response.contains("> ") {
+                return Err(anyhow::anyhow!(
+                    "QCMGS prompt not received for segment {}/{}: {}",
+                    idx + 1,
+                    total,
+                    Self::format_log(&prompt_response)
+                ));
+            }
+
+            let body = format!("{}\x1A", string_to_ucs2_pub(segment)?);
+            let final_response = self.send_command_priority(&body, 1).await?;
+            if !(final_response.contains("OK\r\n") && final_response.contains("+QCMGS:")) {
+                return Err(anyhow::anyhow!(
+                    "QCMGS segment {}/{} failed: {}",
+                    idx + 1,
+                    total,
+                    Self::format_log(&final_response)
+                ));
+            }
+        }
+
         Ok(())
     }
 

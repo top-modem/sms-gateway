@@ -10,6 +10,14 @@ pub enum SmsType {
     All,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SmsSendMode {
+    #[default]
+    Pdu,
+    Text,
+}
+
 impl SmsType {
     pub fn to_at_command_pdu(&self) -> u8 {
         match self {

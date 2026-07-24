@@ -729,6 +729,143 @@ impl Sms {
 }
 
 impl Contact {
+    fn normalized_phone_identity(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if !trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'))
+        {
+            return None;
+        }
+
+        let digits = crate::phone_number::normalize_msisdn(trimmed);
+        if digits.len() < 7 {
+            return None;
+        }
+
+        if digits.len() == 13 && digits.starts_with("86") && digits[2..].starts_with('1') {
+            return Some(digits[2..].to_string());
+        }
+
+        Some(digits)
+    }
+
+    fn phone_identity_matches(name: &str, normalized: &str) -> bool {
+        Self::normalized_phone_identity(name)
+            .as_deref()
+            .is_some_and(|candidate| candidate == normalized)
+    }
+
+    fn canonical_contact_rank(name: &str) -> (u8, usize) {
+        let trimmed = name.trim();
+        let rank = if trimmed.starts_with('+') {
+            0
+        } else if trimmed.starts_with("86") {
+            1
+        } else {
+            2
+        };
+        (rank, usize::MAX - trimmed.len())
+    }
+
+    async fn merge_equivalent_phone_contacts_for_name(
+        transaction: &mut Transaction<'_, Sqlite>,
+        raw_name: &str,
+    ) -> Result<Option<String>> {
+        let normalized = match Self::normalized_phone_identity(raw_name) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let contacts: Vec<Contact> = sqlx::query_as("SELECT id, name FROM contacts")
+            .fetch_all(&mut **transaction)
+            .await?;
+
+        let mut matching: Vec<Contact> = contacts
+            .into_iter()
+            .filter(|contact| Self::phone_identity_matches(&contact.name, &normalized))
+            .collect();
+
+        if matching.is_empty() {
+            return Ok(None);
+        }
+
+        matching.sort_by_key(|contact| Self::canonical_contact_rank(&contact.name));
+        let canonical = matching.remove(0);
+
+        for duplicate in matching {
+            sqlx::query("UPDATE sms SET contact_id = ? WHERE contact_id = ?")
+                .bind(&canonical.id)
+                .bind(&duplicate.id)
+                .execute(&mut **transaction)
+                .await?;
+
+            sqlx::query("DELETE FROM contacts WHERE id = ?")
+                .bind(&duplicate.id)
+                .execute(&mut **transaction)
+                .await?;
+        }
+
+        Ok(Some(canonical.id))
+    }
+
+    pub async fn merge_all_equivalent_phone_contacts() -> Result<()> {
+        let pool = get_pool()?;
+        let contacts: Vec<Contact> = sqlx::query_as("SELECT id, name FROM contacts")
+            .fetch_all(pool)
+            .await?;
+
+        let mut normalized_names = HashSet::new();
+        for contact in &contacts {
+            if let Some(normalized) = Self::normalized_phone_identity(&contact.name) {
+                normalized_names.insert(normalized);
+            }
+        }
+
+        if normalized_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut transaction = pool.begin().await?;
+        for normalized in normalized_names {
+            let contacts: Vec<Contact> = sqlx::query_as("SELECT id, name FROM contacts")
+                .fetch_all(&mut *transaction)
+                .await?;
+
+            let mut matching: Vec<Contact> = contacts
+                .into_iter()
+                .filter(|contact| Self::phone_identity_matches(&contact.name, &normalized))
+                .collect();
+
+            if matching.len() <= 1 {
+                continue;
+            }
+
+            matching.sort_by_key(|contact| Self::canonical_contact_rank(&contact.name));
+            let canonical = matching.remove(0);
+
+            for duplicate in matching {
+                sqlx::query("UPDATE sms SET contact_id = ? WHERE contact_id = ?")
+                    .bind(&canonical.id)
+                    .bind(&duplicate.id)
+                    .execute(&mut *transaction)
+                    .await?;
+
+                sqlx::query("DELETE FROM contacts WHERE id = ?")
+                    .bind(&duplicate.id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn query_all() -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let contacts = sqlx::query_as("SELECT id, name FROM contacts")
@@ -764,17 +901,26 @@ impl Contact {
     pub async fn find_or_create(&mut self) -> Result<()> {
         let pool = get_pool()?;
 
+        let mut transaction = pool.begin().await?;
+
+        if let Some(id) = Self::merge_equivalent_phone_contacts_for_name(&mut transaction, &self.name).await? {
+            self.id = id;
+            transaction.commit().await?;
+            return Ok(());
+        }
+
         let existing_id = sqlx::query_scalar::<_, Option<String>>(
             r#"
             SELECT id FROM contacts WHERE name = ?
             "#,
         )
         .bind(&self.name)
-        .fetch_one(pool)
+        .fetch_one(&mut *transaction)
         .await;
 
         if let Ok(Some(id)) = existing_id {
             self.id = id;
+            transaction.commit().await?;
             return Ok(());
         }
 
@@ -785,8 +931,10 @@ impl Contact {
         )
         .bind(&self.id)
         .bind(&self.name)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+
+        transaction.commit().await?;
 
         Ok(())
     }
@@ -1530,6 +1678,7 @@ impl AppSetting {
 
 impl Conversation {
     pub async fn query_all() -> Result<Vec<Self>> {
+        Contact::merge_all_equivalent_phone_contacts().await?;
         let pool = get_pool()?;
 
         let conversations = sqlx::query_as(
@@ -1554,6 +1703,7 @@ impl Conversation {
         Ok(conversations)
     }
     pub async fn query_by_contact_ids(contact_ids: &[String]) -> Result<Vec<Self>> {
+        Contact::merge_all_equivalent_phone_contacts().await?;
         let pool = get_pool()?;
 
         if contact_ids.is_empty() {
@@ -1606,6 +1756,10 @@ impl ModemSMS {
         &self,
         transaction: &'a mut Transaction<'_, Sqlite>,
     ) -> Result<String> {
+        if let Some(contact_id) = Contact::merge_equivalent_phone_contacts_for_name(transaction, &self.contact).await? {
+            return Ok(contact_id);
+        }
+
         let contact_id = sqlx::query_scalar::<_, String>(
             r#"
             SELECT id FROM contacts WHERE name = ?
@@ -1680,6 +1834,10 @@ impl ModemSMS {
         let pool = get_pool()?;
 
         let mut transaction = pool.begin().await?;
+
+        for record in records {
+            let _ = Contact::merge_equivalent_phone_contacts_for_name(&mut transaction, &record.contact).await?;
+        }
 
         let mut contact_names = HashSet::new();
         for record in records {

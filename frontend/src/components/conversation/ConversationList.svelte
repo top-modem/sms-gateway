@@ -17,7 +17,7 @@
 
   // 鈹€鈹€ Tab state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   let activeTab = $state("inbox");   // "inbox" | "sent"
-  let messages = $state([]);
+  let sentMessages = $state([]);
   let loading = $state(true);
   let searchValue = $state("");
   let searchFocused = $state(false);
@@ -29,13 +29,18 @@
 
   // 鈹€鈹€ Fetch on tab change or SSE push 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   async function fetchMessages(tab) {
+    if (tab === "inbox") {
+      loading = false;
+      return;
+    }
+
     loading = true;
     try {
       const res = await apiClient.getSmsByDirection(tab);
-      messages = res.data?.data ?? [];
+      sentMessages = res.data?.data ?? [];
     } catch (e) {
       console.error("Failed to load messages:", e);
-      messages = [];
+      sentMessages = [];
     } finally {
       loading = false;
     }
@@ -49,13 +54,26 @@
   });
 
   // 鈹€鈹€ Filtered list 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+  const inboxItems = $derived(
+    $conversations.map((conv) => ({
+      id: conv.contact.id,
+      contact_id: conv.contact.id,
+      contact_name: conv.contact.name,
+      message: conv.sms_preview?.message ?? "",
+      sim_id: conv.sms_preview?.sim_id ?? "",
+      status: conv.sms_preview?.status ?? 1,
+      timestamp: conv.sms_preview?.timestamp,
+      _contact: conv.contact,
+    }))
+  );
+
   let filtered = $derived(
-    messages
+    (activeTab === "inbox" ? inboxItems : sentMessages)
       .filter(m => !filterSimId || m.sim_id === filterSimId)
       .filter(m =>
         searchValue.trim() === "" ||
-        m.contact_name.toLowerCase().includes(searchValue.toLowerCase()) ||
-        m.message.toLowerCase().includes(searchValue.toLowerCase())
+        (m.contact_name ?? "").toLowerCase().includes(searchValue.toLowerCase()) ||
+        (m.message ?? "").toLowerCase().includes(searchValue.toLowerCase())
       )
   );
 
@@ -86,7 +104,7 @@
 
   // 鈹€鈹€ Open conversation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   function openMessage(msg) {
-    changeCurrentConversation({ id: msg.contact_id, name: msg.contact_name });
+    changeCurrentConversation(msg._contact ?? { id: msg.contact_id, name: msg.contact_name });
     onConversationSelect();
   }
 

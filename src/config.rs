@@ -3,11 +3,12 @@ use chrono::{NaiveTime, Weekday};
 use config::{Config, File};
 use fancy_regex::Regex;
 use serde::Deserialize;
-use std::{collections::HashMap, fmt, path::Path, str::FromStr};
+use std::{collections::{HashMap, HashSet}, fmt, path::Path, str::FromStr};
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub settings: Settings,
+    #[serde(default)]
     pub devices: Vec<Device>,
 }
 
@@ -42,6 +43,12 @@ pub struct Settings {
     /// Seconds to pass as the `AT+QMMSEND=<timeout>` argument and to wait for the
     /// modem's `+QMMSEND:` completion URC before giving up (default 60).
     pub mms_send_timeout_secs: Option<u64>,
+    /// Optional Windows COM start index for auto-populating device list.
+    /// Example: 1 means COM1.
+    pub windows_com_port_start: Option<u16>,
+    /// Optional Windows COM end index for auto-populating device list.
+    /// Clamped to a hard maximum of 128.
+    pub windows_com_port_end: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -179,12 +186,108 @@ impl AppConfig {
             .context("Failed to load config file")?;
 
         // Deserialize the config file into the `AppConfig` struct
-        let app_config: AppConfig = config.try_deserialize()?;
+        let mut app_config: AppConfig = config.try_deserialize()?;
+
+        // On Windows, optionally auto-fill COM ports in a configured range,
+        // while keeping explicit per-port overrides from the config file.
+        normalize_windows_com_ports(&mut app_config)?;
 
         // Validate the configuration
         test_config(&app_config)?;
 
         Ok(app_config)
+    }
+}
+
+const MAX_WINDOWS_COM_PORT: u16 = 128;
+
+fn parse_windows_com_index(port: &str) -> Option<u16> {
+    let upper = port.trim().to_uppercase();
+    let digits = upper.strip_prefix("COM")?;
+    digits.parse::<u16>().ok().filter(|n| *n >= 1)
+}
+
+fn sort_devices_by_port(devices: &mut [Device]) {
+    devices.sort_by(|a, b| {
+        let ai = parse_windows_com_index(&a.com_port).unwrap_or(u16::MAX);
+        let bi = parse_windows_com_index(&b.com_port).unwrap_or(u16::MAX);
+        ai.cmp(&bi)
+            .then_with(|| a.com_port.to_ascii_lowercase().cmp(&b.com_port.to_ascii_lowercase()))
+    });
+}
+
+fn normalize_windows_com_ports(app_config: &mut AppConfig) -> Result<()> {
+    let end_opt = app_config.settings.windows_com_port_end;
+    if end_opt.is_none() {
+        return Ok(());
+    }
+
+    let start = app_config.settings.windows_com_port_start.unwrap_or(1).max(1);
+    let requested_end = end_opt.unwrap();
+    if requested_end < start {
+        anyhow::bail!(
+            "Fatal: windows_com_port_end ({}) must be >= windows_com_port_start ({})",
+            requested_end,
+            start
+        );
+    }
+
+    if requested_end > MAX_WINDOWS_COM_PORT {
+        anyhow::bail!(
+            "Fatal: windows_com_port_end ({}) exceeds supported maximum ({})",
+            requested_end,
+            MAX_WINDOWS_COM_PORT
+        );
+    }
+
+    let default_baud = app_config
+        .devices
+        .first()
+        .map(|d| d.baud_rate)
+        .unwrap_or(115200);
+
+    let existing_indices: HashSet<u16> = app_config
+        .devices
+        .iter()
+        .filter_map(|d| parse_windows_com_index(&d.com_port))
+        .collect();
+
+    let detected_indices = detect_windows_com_ports_in_range(start, requested_end);
+    for idx in detected_indices {
+        if !existing_indices.contains(&idx) {
+            app_config.devices.push(Device {
+                com_port: format!("COM{}", idx),
+                baud_rate: default_baud,
+                sms_storage: None,
+            });
+        }
+    }
+
+    sort_devices_by_port(&mut app_config.devices);
+    Ok(())
+}
+
+fn detect_windows_com_ports_in_range(start: u16, end: u16) -> Vec<u16> {
+    #[cfg(windows)]
+    {
+        let Ok(ports) = tokio_serial::available_ports() else {
+            return Vec::new();
+        };
+
+        let mut detected: Vec<u16> = ports
+            .into_iter()
+            .filter_map(|p| parse_windows_com_index(&p.port_name))
+            .filter(|idx| *idx >= start && *idx <= end)
+            .collect();
+        detected.sort_unstable();
+        detected.dedup();
+        detected
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (start, end);
+        Vec::new()
     }
 }
 
@@ -196,6 +299,16 @@ fn test_config(app_config: &AppConfig) -> Result<()> {
     }
     if app_config.settings.server_port == 0 {
         anyhow::bail!("Fatal: server_port is not set");
+    }
+
+    if let Some(end) = app_config.settings.windows_com_port_end {
+        if end > MAX_WINDOWS_COM_PORT {
+            anyhow::bail!(
+                "Fatal: windows_com_port_end ({}) exceeds supported maximum ({})",
+                end,
+                MAX_WINDOWS_COM_PORT
+            );
+        }
     }
 
     // Validate DEVICES section

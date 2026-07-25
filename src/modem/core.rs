@@ -1283,7 +1283,14 @@ impl Modem {
                                                     continue;
                                                 }
                                                 let upload_content = match crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
-                                                    Ok(Some(item_id)) => crate::db::build_upload_sms_content(&item_id, &sms.message)
+                                                    Ok(Some(item_id)) => {
+                                                        log::debug!(
+                                                            "[{}] Direct upload resolved item_id={} for phone={} before content build",
+                                                            sim_id,
+                                                            item_id,
+                                                            phone_num
+                                                        );
+                                                        crate::db::build_upload_sms_content(&item_id, &sms.message)
                                                         .await
                                                         .unwrap_or_else(|e| {
                                                             log::error!(
@@ -1294,8 +1301,16 @@ impl Modem {
                                                                 e
                                                             );
                                                             sms.message.clone()
-                                                        }),
-                                                    Ok(None) => sms.message.clone(),
+                                                        })
+                                                    }
+                                                    Ok(None) => {
+                                                        log::debug!(
+                                                            "[{}] Direct upload no item_id mapping for phone={}, using raw SMS content",
+                                                            sim_id,
+                                                            phone_num
+                                                        );
+                                                        sms.message.clone()
+                                                    }
                                                     Err(e) => {
                                                         log::error!(
                                                             "[{}] Failed to resolve latest item_id for phone={} before upload: {}",

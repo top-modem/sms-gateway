@@ -1719,6 +1719,11 @@ pub async fn build_upload_sms_content(item_id: &str, raw_content: &str) -> Resul
     let raw_lower = raw_content.to_ascii_lowercase();
     let item_id_lower = item_id.to_ascii_lowercase();
     if raw_lower.contains(&item_id_lower) {
+        log::debug!(
+            "[Upload SMS] Content already contains item_id, no prefix needed: item_id={}, content={:?}",
+            item_id,
+            raw_content
+        );
         return Ok(raw_content.to_string());
     }
 
@@ -1726,11 +1731,21 @@ pub async fn build_upload_sms_content(item_id: &str, raw_content: &str) -> Resul
     if let Some(name) = item_name.as_deref() {
         let name_lower = name.to_ascii_lowercase();
         if raw_lower.contains(&name_lower) {
+            log::debug!(
+                "[Upload SMS] Content already contains full item_name, no prefix needed: item_id={}, item_name={:?}",
+                item_id,
+                item_name
+            );
             return Ok(raw_content.to_string());
         }
 
         if let Some(primary) = extract_primary_item_keyword(name) {
             if raw_lower.contains(&primary.to_ascii_lowercase()) {
+                log::debug!(
+                    "[Upload SMS] Content already contains primary keyword, no prefix needed: item_id={}, keyword={}",
+                    item_id,
+                    primary
+                );
                 return Ok(raw_content.to_string());
             }
             keyword = Some(primary);

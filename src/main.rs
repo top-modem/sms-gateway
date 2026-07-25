@@ -564,15 +564,32 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
                             let now = tokio::time::Instant::now();
 
+                            log::debug!(
+                                "[火狐狸轮询] 任务检查 - task_key={}, item_name={:?}",
+                                task_key,
+                                item_name
+                            );
+
                             if let Some(until) = no_sms_backoff_until.get(&task_key) {
                                 if *until > now {
+                                    let remain_secs = until.saturating_duration_since(now).as_secs();
+                                    log::debug!(
+                                        "[火狐狸轮询] 任务处于退避窗口，跳过本轮 - task_key={}, remaining={}s",
+                                        task_key,
+                                        remain_secs
+                                    );
                                     continue;
                                 }
                                 no_sms_backoff_until.remove(&task_key);
+                                log::debug!("[火狐狸轮询] 任务退避窗口结束 - task_key={}", task_key);
                             }
 
                             // Skip if we already processed this item
                             if processed_tasks.contains(&task_key) {
+                                log::debug!(
+                                    "[火狐狸轮询] 任务已处理，先检查释放状态 - task_key={}",
+                                    task_key
+                                );
                                 // Still check result list for release status
                                 if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
                                     if let Some(data) = result_resp.data {
@@ -600,7 +617,13 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             let sim_id = match sim_id {
                                 Some(id) => id,
                                 None => {
-                                    log::warn!("[火狐狸轮询] 未找到号码 {} 对应的 SIM 卡", phone_num);
+                                    log::warn!(
+                                        "[火狐狸轮询] 未找到号码对应的 SIM 卡 - task_key={}, phone={}, country={}, item_id={}",
+                                        task_key,
+                                        phone_num,
+                                        country_id,
+                                        item_id
+                                    );
                                     processed_tasks.insert(task_key.clone());
                                     continue;
                                 }
@@ -740,9 +763,20 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 }
                                 Ok(None) => {
                                     mark_task_processed = false;
-                                    log::warn!("[火狐狸轮询] 读取 SMS 后未找到短信 (SIM: {}, 号码: {})", sim_id, phone_num);
+                                    log::warn!(
+                                        "[火狐狸轮询] 读取 SMS 后未找到短信 - task_key={}, sim_id={}, phone={}",
+                                        task_key,
+                                        sim_id,
+                                        phone_num
+                                    );
                                     let fallback_sms = match db::Sms::find_recent_received_sms(&sim_id, 20).await {
                                         Ok(candidates) => {
+                                            log::debug!(
+                                                "[火狐狸轮询] DB兜底候选数量 - task_key={}, sim_id={}, count={}",
+                                                task_key,
+                                                sim_id,
+                                                candidates.len()
+                                            );
                                             let cutoff = Local::now().naive_local() - chrono::Duration::minutes(30);
                                             candidates.into_iter().find(|s| {
                                                 s.id > 0
@@ -888,13 +922,26 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                     }
 
                                     if mark_task_processed {
+                                        log::debug!(
+                                            "[火狐狸轮询] 兜底上传已处理任务，跳过平台结果列表检查 - task_key={}",
+                                            task_key
+                                        );
                                         continue;
                                     }
 
                                     // Check the result list in case platform already has content
+                                    log::debug!(
+                                        "[火狐狸轮询] 开始检查平台结果列表兜底 - task_key={}",
+                                        task_key
+                                    );
                                     if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
                                         if let Some(data) = result_resp.data {
                                             if let Some(arr) = data.as_array() {
+                                                log::debug!(
+                                                    "[火狐狸轮询] 平台结果列表条数 - task_key={}, count={}",
+                                                    task_key,
+                                                    arr.len()
+                                                );
                                                 for result_item in arr {
                                                     if let Some(content) = result_item.get("Phone_SmsContent").and_then(|v| v.as_str()) {
                                                         if !content.is_empty() {

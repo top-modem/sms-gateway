@@ -36,6 +36,21 @@
   let isNewMessage = $state(false);
   const loadingDuration = 150;
 
+  let latestStatusReport = $derived.by(() => {
+    for (const msg of messages) {
+      if (!msg?.send || !msg?.status_report_requested) continue;
+      if (!msg?.delivery_report_raw) continue;
+      return msg;
+    }
+    return null;
+  });
+
+  function statusReportLabel(deliveryStatus) {
+    if (deliveryStatus === 1) return "Delivered";
+    if (deliveryStatus === 2) return "Failed";
+    return "Pending";
+  }
+
   $effect(() => {
     if (!$conversationLoading) {
       if ($currentContact && $currentContact.new === true) {
@@ -145,7 +160,7 @@
     }
   }
 
-  function handleSendMessage(simId, smsFormat = 'pdu') {
+  function handleSendMessage(simId, smsFormat = 'pdu', statusReportEnabled = false) {
     if (sendMessageContent.trim() === "") {
       return;
     }
@@ -160,6 +175,8 @@
       send: true,
       timestamp: new Date(),
       status: SmsStatus.Loading,
+      status_report_requested: statusReportEnabled,
+      delivery_status: statusReportEnabled ? 0 : null,
     };
 
     // Add message to array
@@ -182,13 +199,28 @@
         : $currentContact;
 
     apiClient
-      .sendSms(simId, concat, newMessage.message, $currentContact.new ?? false, smsFormat)
+      .sendSms(
+        simId,
+        concat,
+        newMessage.message,
+        $currentContact.new ?? false,
+        smsFormat,
+        statusReportEnabled
+      )
       .then((res) => {
         isNewMessage = false;
         const messageId = res.data;
         messages = messages.map((msg) => {
           if (msg.id === -1 && msg.message === newMessage.message) {
-            return { ...msg, status: SmsStatus.Read, id: messageId.sms_id };
+            return {
+              ...msg,
+              // SMS is sent once backend accepts it; status report is a
+              // separate network callback that may arrive later (or never).
+              status: SmsStatus.Read,
+              id: messageId.sms_id,
+              status_report_requested: statusReportEnabled,
+              delivery_status: statusReportEnabled ? 0 : null,
+            };
           }
           return msg;
         });
@@ -226,15 +258,17 @@
       isNewMessage = false;
     }
 
-    // Remove duplicates to avoid repeated messages
-    const existingIds = new Set(messages.map((msg) => msg.id));
-    const uniqueNewMessages = newMessages.filter(
-      (msg) => !existingIds.has(msg.id)
-    );
+    // Merge by id so status-only updates (same id, new status) are reflected.
+    const incomingById = new Map(newMessages.map((msg) => [msg.id, msg]));
+    const mergedExisting = messages.map((msg) => {
+      const incoming = incomingById.get(msg.id);
+      return incoming ? { ...msg, ...incoming } : msg;
+    });
 
-    if (uniqueNewMessages.length > 0) {
-      messages = [...uniqueNewMessages, ...messages];
-    }
+    const mergedIds = new Set(mergedExisting.map((msg) => msg.id));
+    const onlyNew = newMessages.filter((msg) => !mergedIds.has(msg.id));
+
+    messages = onlyNew.length > 0 ? [...onlyNew, ...mergedExisting] : mergedExisting;
   }
 
   onMount(() => {
@@ -301,6 +335,20 @@
     bind:this={messageInputComponent}
     {initialSimId}
   />
+
+  {#if latestStatusReport}
+    <div class="absolute bottom-16 right-3 z-20 max-w-[min(92vw,560px)] rounded-lg border border-amber-300 bg-amber-50/95 px-3 py-2 text-xs text-amber-900 shadow-sm backdrop-blur dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-100">
+      <div class="mb-1 font-semibold">Last +CDS Debug</div>
+      <div class="mb-1 flex flex-wrap gap-x-3 gap-y-1">
+        <span>SIM: {latestStatusReport.sim_id || "-"}</span>
+        <span>MR: {latestStatusReport.submit_ref ?? "-"}</span>
+        <span>Status: {statusReportLabel(latestStatusReport.delivery_status)}</span>
+      </div>
+      <div class="break-all font-mono text-[11px] leading-4 opacity-90">
+        {latestStatusReport.delivery_report_raw}
+      </div>
+    </div>
+  {/if}
 
   
 </div>

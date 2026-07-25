@@ -261,7 +261,7 @@ pub async fn sms_exchange(mm: Arc<ModemManager>, task: TaskHandle) {
                 id: receiver_sim.clone(),
                 name: receiver_phone.clone(),
             };
-            mm.send_sms(&sender_sim, &contact, message, SmsSendMode::Pdu)
+            mm.send_sms(&sender_sim, &contact, message, SmsSendMode::Pdu, false)
                 .await
                 .map_err(|e| format!("发短信失败: {}", e))?;
 

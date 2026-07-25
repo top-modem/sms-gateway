@@ -14,6 +14,31 @@ use uuid::Uuid;
 const MAX_BATCH_SIZE: usize = 500;
 
 static POOL: OnceLock<SqlitePool> = OnceLock::new();
+static CACHED_STATUS_REPORTS: OnceLock<std::sync::Mutex<HashMap<(String, u8), (u8, String)>>> =
+    OnceLock::new();
+
+fn cached_status_reports() -> &'static std::sync::Mutex<HashMap<(String, u8), (u8, String)>> {
+    CACHED_STATUS_REPORTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn cache_status_report(sim_id: &str, submit_ref: u8, tp_status: u8, raw_report: &str) {
+    if let Ok(mut map) = cached_status_reports().lock() {
+        if map.len() > 2048 {
+            map.clear();
+        }
+        map.insert(
+            (sim_id.to_string(), submit_ref),
+            (tp_status, raw_report.to_string()),
+        );
+    }
+}
+
+fn take_cached_status_report(sim_id: &str, submit_ref: u8) -> Option<(u8, String)> {
+    cached_status_reports()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&(sim_id.to_string(), submit_ref)))
+}
 
 /// Represents a single SMS message
 #[derive(Debug, FromRow, Deserialize, Serialize, Default)]
@@ -29,6 +54,11 @@ pub struct Sms {
     pub platform_item_id: Option<String>,
     pub platform_uploaded_at: Option<NaiveDateTime>,
     pub platform_response: Option<String>,
+    pub status_report_requested: bool,
+    pub submit_ref: Option<i64>,
+    pub delivery_status: Option<i64>,
+    pub delivered_at: Option<NaiveDateTime>,
+    pub delivery_report_raw: Option<String>,
 }
 
 /// SMS row with contact name resolved — used for inbox/sent list view.
@@ -42,6 +72,10 @@ pub struct SmsRow {
     pub sim_id: String,
     pub send: bool,
     pub status: SmsStatus,
+    pub status_report_requested: bool,
+    pub submit_ref: Option<i64>,
+    pub delivery_status: Option<i64>,
+    pub delivered_at: Option<NaiveDateTime>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, sqlx::Type, Default)]
@@ -329,7 +363,8 @@ impl Sms {
         let sms_list = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
+                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
+                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
             FROM sms 
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
@@ -360,7 +395,8 @@ impl Sms {
         let sms_list = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
+                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
+                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
             FROM sms 
             WHERE contact_id = ?
             ORDER BY timestamp DESC, id DESC
@@ -411,7 +447,8 @@ impl Sms {
             r#"
             SELECT s.id, s.contact_id,
                    COALESCE(c.name, s.contact_id) AS contact_name,
-                   s.timestamp, s.message, s.sim_id, s.send, s.status
+                     s.timestamp, s.message, s.sim_id, s.send, s.status,
+                     s.status_report_requested, s.submit_ref, s.delivery_status, s.delivered_at
             FROM sms s
             LEFT JOIN contacts c ON s.contact_id = c.id
             WHERE s.send = ?
@@ -463,7 +500,8 @@ impl Sms {
         let sms_list = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
+                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
+                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
             FROM sms 
             WHERE contact_id = ? AND status = ?
             ORDER BY timestamp DESC
@@ -495,7 +533,8 @@ impl Sms {
         let sms = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
+                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
+                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
             FROM sms
             WHERE sim_id = ? AND send = 0
             ORDER BY timestamp DESC, id DESC
@@ -562,6 +601,113 @@ impl Sms {
         .await?;
 
         Ok(())
+    }
+
+    /// Mark an outgoing SMS row as requesting network status reports.
+    /// `submit_ref` is the TP-Message-Reference parsed from +CMGS/+QCMGS when available.
+    pub async fn mark_status_report_requested(id: i64, submit_ref: Option<u8>) -> Result<()> {
+        let pool = get_pool()?;
+        sqlx::query(
+            r#"
+            UPDATE sms
+            SET status_report_requested = 1,
+                submit_ref = ?,
+                delivery_status = 0,
+                status = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(submit_ref.map(|v| v as i64))
+        .bind(SmsStatus::Read as i32)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        if let Some(submit_ref) = submit_ref {
+            if let Some((tp_status, raw_report)) = take_cached_status_report(
+                &sqlx::query_scalar::<_, String>("SELECT sim_id FROM sms WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await?,
+                submit_ref,
+            ) {
+                let delivery_status = if tp_status == 0x00 { 1_i32 } else { 2_i32 };
+                sqlx::query(
+                    r#"
+                    UPDATE sms
+                    SET delivery_status = ?,
+                        delivered_at = datetime('now'),
+                        delivery_report_raw = ?,
+                        status = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(delivery_status)
+                .bind(raw_report)
+                .bind(if tp_status == 0x00 {
+                    SmsStatus::Read as i32
+                } else {
+                    SmsStatus::Failed as i32
+                })
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply an SMS-STATUS-REPORT (`+CDS`) by submit reference.
+    /// Delivery status convention:
+    /// 0 = pending, 1 = delivered (TP-ST=0x00), 2 = failed/other.
+    pub async fn apply_status_report_by_submit_ref(
+        sim_id: &str,
+        submit_ref: u8,
+        tp_status: u8,
+        raw_report: &str,
+    ) -> Result<u64> {
+        let pool = get_pool()?;
+        let delivery_status = if tp_status == 0x00 { 1_i32 } else { 2_i32 };
+
+        let result = sqlx::query(
+            r#"
+            UPDATE sms
+            SET delivery_status = ?,
+                delivered_at = datetime('now'),
+                delivery_report_raw = ?,
+                status = ?,
+                submit_ref = ?
+            WHERE id = (
+                SELECT id
+                FROM sms
+                WHERE sim_id = ?
+                  AND send = 1
+                  AND status_report_requested = 1
+                  AND submit_ref = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+            )
+            "#,
+        )
+        .bind(delivery_status)
+        .bind(raw_report)
+        .bind(if tp_status == 0x00 {
+            SmsStatus::Read as i32
+        } else {
+            SmsStatus::Failed as i32
+        })
+        .bind(submit_ref as i64)
+        .bind(sim_id)
+        .bind(submit_ref as i64)
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            cache_status_report(sim_id, submit_ref, tp_status, raw_report);
+        }
+
+        Ok(result.rows_affected())
     }
 
     fn resolve_platform_item_id(
@@ -657,7 +803,8 @@ impl Sms {
         let sms_records = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
+                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
+                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
             FROM sms
             WHERE sim_id = ? AND send = 0 AND uploaded_to_platform = 0
             ORDER BY timestamp DESC
@@ -1334,7 +1481,8 @@ impl Sms {
         let sms_list = if let Some(sim_id) = sim_id {
             sqlx::query_as(
                 "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-                 uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+                  uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response, \
+                  status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw \
                  FROM sms WHERE platform_item_id = ? AND sim_id = ? ORDER BY platform_uploaded_at DESC, id DESC",
             )
             .bind(item_id)
@@ -1344,7 +1492,8 @@ impl Sms {
         } else {
             sqlx::query_as(
                 "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-                 uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+                  uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response, \
+                  status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw \
                  FROM sms WHERE platform_item_id = ? ORDER BY platform_uploaded_at DESC, id DESC",
             )
             .bind(item_id)
@@ -1359,7 +1508,8 @@ impl Sms {
         let pool = get_pool()?;
         let sms = sqlx::query_as(
             "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
+               uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response, \
+               status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw \
              FROM sms WHERE sim_id = ? AND message = ? AND send = 0 \
              ORDER BY timestamp DESC LIMIT 1",
         )

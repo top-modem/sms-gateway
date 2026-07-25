@@ -46,8 +46,12 @@ fn parse_number(number: &str) -> anyhow::Result<(u8, String)> {
     Ok((addr_type, swapped))
 }
 
-fn encode_tpdu(mobile: &str, message: &str) -> anyhow::Result<(String, usize)> {
-    const FIRST_OCTET: &str = "11";
+fn encode_tpdu(
+    mobile: &str,
+    message: &str,
+    status_report_enabled: bool,
+) -> anyhow::Result<(String, usize)> {
+    let first_octet = if status_report_enabled { "31" } else { "11" };
     const MESSAGE_REF: &str = "00";
     const PID: &str = "00";
     const DCS: &str = "08";
@@ -63,16 +67,20 @@ fn encode_tpdu(mobile: &str, message: &str) -> anyhow::Result<(String, usize)> {
 
     let tpdu = format!(
         "{}{}{}{}{}{}{}{}",
-        FIRST_OCTET, MESSAGE_REF, destination, PID, DCS, VP, udl, encoded_text
+        first_octet, MESSAGE_REF, destination, PID, DCS, VP, udl, encoded_text
     );
 
     let tpdu_length = tpdu.len() / 2;
     Ok((tpdu, tpdu_length))
 }
 
-pub fn build_pdu(mobile: &str, message: &str) -> anyhow::Result<(String, usize)> {
+pub fn build_pdu(
+    mobile: &str,
+    message: &str,
+    status_report_enabled: bool,
+) -> anyhow::Result<(String, usize)> {
     const SMSC_INFO: &str = "00";
-    let (tpdu, tpdu_length) = encode_tpdu(mobile, message)?;
+    let (tpdu, tpdu_length) = encode_tpdu(mobile, message, status_report_enabled)?;
     let full_pdu = format!("{}{}", SMSC_INFO, tpdu);
     Ok((full_pdu, tpdu_length))
 }
@@ -83,8 +91,13 @@ fn encode_multipart_segment_tpdu(
     ref_num: u8,
     total: u8,
     part: u8,
+    status_report_enabled: bool,
 ) -> anyhow::Result<(String, usize)> {
-    const FIRST_OCTET: &str = "51"; // 0x11 | 0x40: TP-UDHI bit set
+    let first_octet = if status_report_enabled {
+        "71" // 0x31 | 0x40: TP-SRR + TP-UDHI
+    } else {
+        "51" // 0x11 | 0x40: TP-UDHI
+    };
     const MESSAGE_REF: &str = "00";
     const PID: &str = "00";
     const DCS: &str = "08";
@@ -105,7 +118,7 @@ fn encode_multipart_segment_tpdu(
 
     let tpdu = format!(
         "{}{}{}{}{}{}{}{}{}",
-        FIRST_OCTET, MESSAGE_REF, destination, PID, DCS, VP, udl, udh, ucs2_text
+        first_octet, MESSAGE_REF, destination, PID, DCS, VP, udl, udh, ucs2_text
     );
     let tpdu_length = tpdu.len() / 2;
     Ok((tpdu, tpdu_length))
@@ -113,11 +126,15 @@ fn encode_multipart_segment_tpdu(
 
 /// Build one or more PDUs for a message.
 /// Single PDU for messages <=70 chars; multiple PDUs with UDH concatenation header for longer.
-pub fn build_pdus(mobile: &str, message: &str) -> anyhow::Result<Vec<(String, usize)>> {
+pub fn build_pdus(
+    mobile: &str,
+    message: &str,
+    status_report_enabled: bool,
+) -> anyhow::Result<Vec<(String, usize)>> {
     let chars: Vec<char> = message.chars().collect();
 
     if chars.len() <= 70 {
-        let (pdu, tpdu_len) = build_pdu(mobile, message)?;
+        let (pdu, tpdu_len) = build_pdu(mobile, message, status_report_enabled)?;
         return Ok(vec![(pdu, tpdu_len)]);
     }
 
@@ -128,8 +145,14 @@ pub fn build_pdus(mobile: &str, message: &str) -> anyhow::Result<Vec<(String, us
 
     let mut result = Vec::new();
     for (i, seg) in raw_segments.iter().enumerate() {
-        let (tpdu, tpdu_len) =
-            encode_multipart_segment_tpdu(mobile, seg, ref_num, total, (i + 1) as u8)?;
+        let (tpdu, tpdu_len) = encode_multipart_segment_tpdu(
+            mobile,
+            seg,
+            ref_num,
+            total,
+            (i + 1) as u8,
+            status_report_enabled,
+        )?;
         result.push((format!("00{}", tpdu), tpdu_len));
     }
     Ok(result)
@@ -145,21 +168,21 @@ mod tests {
 
     #[test]
     fn short_message_produces_single_pdu() {
-        let pdus = build_pdus("+8613800001234", "Hello").unwrap();
+        let pdus = build_pdus("+8613800001234", "Hello", false).unwrap();
         assert_eq!(pdus.len(), 1);
     }
 
     #[test]
     fn exactly_70_chars_produces_single_pdu() {
         let msg = "A".repeat(70);
-        let pdus = build_pdus("+8613800001234", &msg).unwrap();
+        let pdus = build_pdus("+8613800001234", &msg, false).unwrap();
         assert_eq!(pdus.len(), 1);
     }
 
     #[test]
     fn exactly_71_chars_produces_two_pdus() {
         let msg = "A".repeat(71);
-        let pdus = build_pdus("+8613800001234", &msg).unwrap();
+        let pdus = build_pdus("+8613800001234", &msg, false).unwrap();
         assert_eq!(pdus.len(), 2);
     }
 
@@ -167,19 +190,19 @@ mod tests {
     fn long_message_correct_segment_count() {
         // 134 chars → 2 segments of 67
         let msg = "A".repeat(134);
-        let pdus = build_pdus("+8613800001234", &msg).unwrap();
+        let pdus = build_pdus("+8613800001234", &msg, false).unwrap();
         assert_eq!(pdus.len(), 2);
 
         // 135 chars → 3 segments (67+67+1)
         let msg2 = "A".repeat(135);
-        let pdus2 = build_pdus("+8613800001234", &msg2).unwrap();
+        let pdus2 = build_pdus("+8613800001234", &msg2, false).unwrap();
         assert_eq!(pdus2.len(), 3);
     }
 
     #[test]
     fn multipart_pdu_starts_with_smsc_00_and_first_octet_51() {
         let msg = "A".repeat(71);
-        let pdus = build_pdus("+8613800001234", &msg).unwrap();
+        let pdus = build_pdus("+8613800001234", &msg, false).unwrap();
         // full PDU hex: "00" (SMSC) + "51" (TP-UDHI first octet) + ...
         for (pdu, _) in &pdus {
             assert!(pdu.starts_with("00"), "PDU should start with SMSC 00");
@@ -189,7 +212,7 @@ mod tests {
 
     #[test]
     fn single_pdu_has_no_udhi_bit() {
-        let (pdu, _) = build_pdu("+8613800001234", "Hello").unwrap();
+        let (pdu, _) = build_pdu("+8613800001234", "Hello", false).unwrap();
         // First octet after SMSC ("00") should be "11", not "51"
         assert_eq!(&pdu[2..4], "11", "Single PDU should not have TP-UDHI set");
     }
@@ -198,12 +221,24 @@ mod tests {
     fn chinese_chars_produce_correct_segment_count() {
         // 70 Chinese chars → single PDU
         let msg: String = "你好".repeat(35); // 70 chars
-        let pdus = build_pdus("+8613800001234", &msg).unwrap();
+        let pdus = build_pdus("+8613800001234", &msg, false).unwrap();
         assert_eq!(pdus.len(), 1);
 
         // 71 Chinese chars → 2 PDUs
         let msg2: String = "你".repeat(71);
-        let pdus2 = build_pdus("+8613800001234", &msg2).unwrap();
+        let pdus2 = build_pdus("+8613800001234", &msg2, false).unwrap();
         assert_eq!(pdus2.len(), 2);
+    }
+
+    #[test]
+    fn status_report_sets_tp_srr_bit() {
+        let (single, _) = build_pdu("+8613800001234", "Hello", true).unwrap();
+        assert_eq!(&single[2..4], "31", "Single submit should set TP-SRR");
+
+        let long = "A".repeat(71);
+        let pdus = build_pdus("+8613800001234", &long, true).unwrap();
+        for (pdu, _) in &pdus {
+            assert_eq!(&pdu[2..4], "71", "Multipart submit should set TP-SRR + TP-UDHI");
+        }
     }
 }

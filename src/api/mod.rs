@@ -450,18 +450,28 @@ async fn send_sms(
     }
 
     match modem_manager
-        .send_sms(&sim_id, &payload.contact, &payload.message, payload.sms_format)
+        .send_sms(
+            &sim_id,
+            &payload.contact,
+            &payload.message,
+            payload.sms_format,
+            payload.status_report_enabled,
+        )
         .await
     {
-        Ok((sms_id, contact_id)) => {
+        Ok(outcome) => {
             if let Ok(convs) =
-                Conversation::query_by_contact_ids(&[contact_id.clone()]).await
+                Conversation::query_by_contact_ids(&[outcome.contact_id.clone()]).await
             {
                 sse_manager.send(convs);
             }
             (
                 StatusCode::OK,
-                Json(json!({ "sms_id": sms_id, "contact_id": contact_id })),
+                Json(json!({
+                    "sms_id": outcome.sms_id,
+                    "contact_id": outcome.contact_id,
+                    "message_refs": outcome.message_refs,
+                })),
             )
                 .into_response()
         }
@@ -1716,6 +1726,8 @@ pub struct SmsPayload {
     new: bool,
     #[serde(default)]
     sms_format: SmsSendMode,
+    #[serde(default)]
+    status_report_enabled: bool,
 }
 
 #[derive(Serialize)]

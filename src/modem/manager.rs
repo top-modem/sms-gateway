@@ -11,10 +11,11 @@ use tokio::task::JoinHandle;
 use crate::api::sse_manager::CallEvent;
 use crate::api::SseManager;
 use crate::config::{Settings, SmsStorage};
+use crate::decode::parse_status_report_pdus;
 use crate::db::{Call, Contact, ModemSMS, SimCard, Sms, SmsStatus};
 use crate::webhook;
 
-use super::core::{ApreadyProbeResult, Modem};
+use super::core::{ApreadyProbeResult, Modem, SmsSendOutcome};
 use super::types::*;
 
 /// Configuration for local whisper.cpp speech-to-text transcription.
@@ -86,6 +87,168 @@ pub struct ModemManager {
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
 
 impl ModemManager {
+    fn parse_cds_text_urc(line: &str) -> Option<(u8, u8)> {
+        let payload = line.strip_prefix("+CDS:")?.trim();
+        let parts: Vec<&str> = payload.split(',').map(|p| p.trim()).collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        // Text-mode +CDS commonly has MR as the second field and TP-ST as the last field.
+        let mr = parts.get(1)?.trim_matches('"').parse::<u16>().ok()? as u8;
+        let st = parts
+            .last()?
+            .trim_matches('"')
+            .parse::<u16>()
+            .ok()? as u8;
+        Some((mr, st))
+    }
+
+    fn parse_cdsi_urc(line: &str) -> Option<(String, u32)> {
+        let payload = line.strip_prefix("+CDSI:")?.trim();
+        let mut parts = payload.split(',').map(|p| p.trim());
+        let storage = parts.next()?.trim_matches('"').to_string();
+        let index = parts.next()?.parse::<u32>().ok()?;
+        if storage.is_empty() {
+            return None;
+        }
+        Some((storage, index))
+    }
+
+    fn parse_cpms_current_storage(response: &str) -> Option<String> {
+        let cpms_line = response
+            .lines()
+            .find(|line| line.trim_start().starts_with("+CPMS:"))?;
+        let first_quote = cpms_line.find('"')?;
+        let rest = &cpms_line[first_quote + 1..];
+        let end_quote = rest.find('"')?;
+        let storage = rest[..end_quote].trim();
+        if storage.is_empty() {
+            return None;
+        }
+        Some(storage.to_string())
+    }
+
+    async fn apply_status_reports_from_payload(
+        sim_id: &str,
+        sse: &Arc<SseManager>,
+        reports: Vec<crate::decode::SmsStatusReport>,
+        source: &str,
+    ) {
+        let mut applied_any = false;
+
+        for report in reports {
+            match Sms::apply_status_report_by_submit_ref(
+                sim_id,
+                report.submit_ref,
+                report.tp_status,
+                &report.raw_pdu_hex,
+            )
+            .await
+            {
+                Ok(affected) if affected > 0 => {
+                    applied_any = true;
+                    info!(
+                        "[URC {}] Applied {} status report: MR={}, TP-ST=0x{:02X}, rows={}",
+                        sim_id, source, report.submit_ref, report.tp_status, affected
+                    );
+                }
+                Ok(_) => {
+                    info!(
+                        "[URC {}] Ignored {} status report (no pending row): MR={}, TP-ST=0x{:02X}",
+                        sim_id, source, report.submit_ref, report.tp_status
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "[URC {}] Failed to apply {} status report MR={}: {}",
+                        sim_id, source, report.submit_ref, e
+                    );
+                }
+            }
+        }
+
+        if applied_any {
+            match crate::db::Conversation::query_all().await {
+                Ok(conversations) => sse.send(conversations),
+                Err(e) => error!(
+                    "[URC {}] Failed to refresh conversations after {}: {}",
+                    sim_id, source, e
+                ),
+            }
+        }
+    }
+
+    async fn handle_cdsi_notification(
+        sim_id: &str,
+        modem: &Arc<Modem>,
+        sse: &Arc<SseManager>,
+        line: &str,
+    ) -> anyhow::Result<bool> {
+        let Some((storage, index)) = Self::parse_cdsi_urc(line) else {
+            return Ok(false);
+        };
+
+        let previous_storage = match modem.send_command("AT+CPMS?\r\n").await {
+            Ok(resp) => Self::parse_cpms_current_storage(&resp),
+            Err(_) => None,
+        };
+
+        let set_storage_cmd = format!("AT+CPMS=\"{0}\",\"{0}\",\"{0}\"\r\n", storage);
+        let set_storage_resp = modem.send_command(&set_storage_cmd).await?;
+        if !set_storage_resp.contains("OK") {
+            info!(
+                "[URC {}] +CDSI storage switch failed for {}: {}",
+                sim_id,
+                storage,
+                set_storage_resp.trim()
+            );
+            return Ok(false);
+        }
+
+        let _ = modem.send_command("AT+CMGF=0\r\n").await;
+        let cmgr_cmd = format!("AT+CMGR={}\r\n", index);
+        let cmgr_resp = modem.send_command(&cmgr_cmd).await?;
+        let reports = parse_status_report_pdus(&cmgr_resp);
+        if reports.is_empty() {
+            info!(
+                "[URC {}] +CDSI slot {} in {} did not parse as status report; falling back to full read",
+                sim_id, index, storage
+            );
+            if let Some(prev) = previous_storage {
+                if prev != storage {
+                    let restore_cmd = format!("AT+CPMS=\"{0}\",\"{0}\",\"{0}\"\r\n", prev);
+                    let _ = modem.send_command(&restore_cmd).await;
+                }
+            }
+            return Ok(false);
+        }
+
+        Self::apply_status_reports_from_payload(sim_id, sse, reports, "+CDSI/CMGR").await;
+
+        let delete_cmd = format!("AT+CMGD={}\r\n", index);
+        if let Ok(resp) = modem.send_command(&delete_cmd).await {
+            if !resp.contains("OK") {
+                info!(
+                    "[URC {}] +CDSI slot delete failed ({}:{}): {}",
+                    sim_id,
+                    storage,
+                    index,
+                    resp.trim()
+                );
+            }
+        }
+
+        if let Some(prev) = previous_storage {
+            if prev != storage {
+                let restore_cmd = format!("AT+CPMS=\"{0}\",\"{0}\",\"{0}\"\r\n", prev);
+                let _ = modem.send_command(&restore_cmd).await;
+            }
+        }
+
+        Ok(true)
+    }
+
     pub async fn is_initialization_complete(&self) -> bool {
         *self.initialization_complete.read().await
     }
@@ -928,15 +1091,20 @@ impl ModemManager {
         contact: &Contact,
         message: &str,
         mode: SmsSendMode,
-    ) -> anyhow::Result<(i64, String)> {
+        status_report_enabled: bool,
+    ) -> anyhow::Result<SmsSendOutcome> {
         let modem = self
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
         match mode {
-            SmsSendMode::Pdu => modem.send_sms_pdu(contact, message).await,
-            SmsSendMode::Text => modem.send_sms_text(contact, message).await,
+            SmsSendMode::Pdu => modem
+                .send_sms_pdu(contact, message, status_report_enabled)
+                .await,
+            SmsSendMode::Text => modem
+                .send_sms_text(contact, message, status_report_enabled)
+                .await,
         }
     }
 
@@ -1047,6 +1215,11 @@ impl ModemManager {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
+            status_report_requested: false,
+            submit_ref: None,
+            delivery_status: None,
+            delivered_at: None,
+            delivery_report_raw: None,
         }))
     }
 
@@ -2004,6 +2177,8 @@ impl ModemManager {
         let mut call_answered = false;
         // Oneshot sender to cancel the 30-second recording timer. Some = recording active.
         let mut recording_cancel_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
+        // +CDS URC in PDU mode comes as two lines: header then PDU hex payload.
+        let mut pending_cds_header: Option<String> = None;
 
         info!("[URC {}] handler started", sim_id);
 
@@ -2018,6 +2193,91 @@ impl ModemManager {
 
             let line = line.trim().to_string();
             if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with("+CDSI:") {
+                info!(
+                    "[URC {}] Received +CDSI notification, reading indexed status slot: {}",
+                    sim_id, line
+                );
+                match Self::handle_cdsi_notification(&sim_id, &modem, &sse, &line).await {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        if let Err(e) = modem
+                            .read_sms_async_insert(SmsType::All, sse.clone(), None)
+                            .await
+                        {
+                            error!(
+                                "[URC {}] Failed to process +CDSI fallback read: {}",
+                                sim_id, e
+                            );
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
+                            "[URC {}] Failed to process +CDSI indexed read: {}",
+                            sim_id, e
+                        );
+                        if let Err(e2) = modem
+                            .read_sms_async_insert(SmsType::All, sse.clone(), None)
+                            .await
+                        {
+                            error!(
+                                "[URC {}] Failed to process +CDSI fallback read after indexed error: {}",
+                                sim_id, e2
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(cds_header) = pending_cds_header.take() {
+                if line.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let cds_payload = format!("{}\n{}", cds_header, line);
+                    let reports = parse_status_report_pdus(&cds_payload);
+                    Self::apply_status_reports_from_payload(&sim_id, &sse, reports, "+CDS")
+                        .await;
+                    continue;
+                }
+            }
+
+            if line.starts_with("+CDS:") {
+                if let Some((submit_ref, tp_status)) = Self::parse_cds_text_urc(&line) {
+                    match Sms::apply_status_report_by_submit_ref(&sim_id, submit_ref, tp_status, &line)
+                        .await
+                    {
+                        Ok(affected) if affected > 0 => {
+                            info!(
+                                "[URC {}] Applied text +CDS status report: MR={}, TP-ST=0x{:02X}, rows={}",
+                                sim_id, submit_ref, tp_status, affected
+                            );
+                            match crate::db::Conversation::query_all().await {
+                                Ok(conversations) => sse.send(conversations),
+                                Err(e) => error!(
+                                    "[URC {}] Failed to refresh conversations after text +CDS: {}",
+                                    sim_id, e
+                                ),
+                            }
+                        }
+                        Ok(_) => {
+                            info!(
+                                "[URC {}] Ignored text +CDS status report (no pending row): MR={}, TP-ST=0x{:02X}",
+                                sim_id, submit_ref, tp_status
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "[URC {}] Failed to apply text +CDS status report MR={}: {}",
+                                sim_id, submit_ref, e
+                            );
+                        }
+                    }
+                    continue;
+                }
+                pending_cds_header = Some(line);
                 continue;
             }
 

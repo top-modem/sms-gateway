@@ -82,8 +82,22 @@ class ApiClient {
      * @param {boolean} new_message - Whether to send a new message
      * @param {'pdu'|'text'} [smsFormat='pdu'] - SMS modem send format
      */
-    async sendSms(simId, contact, message, new_message, smsFormat = 'pdu') {
-        const payload = { sim_id: simId, contact, message, new: new_message, sms_format: smsFormat };
+    async sendSms(
+        simId,
+        contact,
+        message,
+        new_message,
+        smsFormat = 'pdu',
+        statusReportEnabled = false
+    ) {
+        const payload = {
+            sim_id: simId,
+            contact,
+            message,
+            new: new_message,
+            sms_format: smsFormat,
+            status_report_enabled: statusReportEnabled,
+        };
         return FetchApi.post('/api/sms', payload)
     }
 

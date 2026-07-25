@@ -10,6 +10,7 @@ use crate::config::{AppConfig, SmsStorage};
 use crate::db::{Contact, SimCard, Sms, SmsStatus};
 use crate::webhook;
 
+use super::core::SmsSendOutcome;
 use super::types::{
     ModemInfo, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsSendMode, SmsType,
 };
@@ -176,6 +177,11 @@ impl ModemManager {
                     platform_item_id: None,
                     platform_uploaded_at: None,
                     platform_response: None,
+                    status_report_requested: false,
+                    submit_ref: None,
+                    delivery_status: None,
+                    delivered_at: None,
+                    delivery_report_raw: None,
                 };
                 let _ = sms.insert().await?;
             }
@@ -198,7 +204,8 @@ impl ModemManager {
         contact: &Contact,
         message: &str,
         _mode: SmsSendMode,
-    ) -> anyhow::Result<(i64, String)> {
+        _status_report_enabled: bool,
+    ) -> anyhow::Result<SmsSendOutcome> {
         let sms = Sms {
             id: 0,
             contact_id: contact.id.clone(),
@@ -211,10 +218,19 @@ impl ModemManager {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
+            status_report_requested: false,
+            submit_ref: None,
+            delivery_status: None,
+            delivered_at: None,
+            delivery_report_raw: None,
         };
 
         let sms_id = sms.insert().await?;
-        Ok((sms_id, contact.id.clone()))
+        Ok(SmsSendOutcome {
+            sms_id,
+            contact_id: contact.id.clone(),
+            message_refs: Vec::new(),
+        })
     }
 
     pub async fn read_sms(

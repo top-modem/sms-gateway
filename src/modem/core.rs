@@ -11,7 +11,7 @@ use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use crate::api::SseManager;
 use crate::config::SmsStorage;
 use crate::db::{Contact, ModemSMS, SimCard, Sms};
-use crate::decode::parse_pdu_sms;
+use crate::decode::{parse_pdu_sms, parse_status_report_pdus};
 use crate::webhook;
 
 use super::pdu::{build_pdus, string_to_ucs2_pub};
@@ -22,6 +22,13 @@ pub enum ApreadyProbeResult {
     Valid,
     Invalid,
     Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct SmsSendOutcome {
+    pub sms_id: i64,
+    pub contact_id: String,
+    pub message_refs: Vec<u8>,
 }
 
 /// All SMS timestamps (incoming and outgoing) are normalized to GMT+8 so they
@@ -725,6 +732,11 @@ impl Modem {
             ("ATE0\r\n", "Disable echo"),
             ("AT+CMEE=1\r\n", "Enable error messages"),
             ("AT+CMGF=0\r\n", "Set PDU mode"),
+            ("AT+CSMS=1\r\n", "Enable SMS service profile"),
+            (
+                "AT+CNMI=2,0,0,2,0\r\n",
+                "Enable delivery report URCs (+CDS)",
+            ),
             ("AT+CSCS=\"UCS2\"\r\n", "Set character encoding"),
             ("AT+CLIP=1\r\n", "Enable caller ID (CLIP)"),
         ];
@@ -996,7 +1008,7 @@ impl Modem {
     /// Send a PDU SMS atomically: holds the write mutex across both the AT+CMGS prompt step
     /// and the PDU data step, preventing other AT commands from slipping in between and
     /// corrupting the modem's PDU input state.
-    async fn send_pdu_atomic(&self, tpdu_len: usize, pdu_hex: &str) -> anyhow::Result<()> {
+    async fn send_pdu_atomic(&self, tpdu_len: usize, pdu_hex: &str) -> anyhow::Result<Option<u8>> {
         let setup_cmd = format!("AT+CMGS={}\r", tpdu_len);
         let full_pdu = format!("{}\x1A", pdu_hex);
 
@@ -1044,7 +1056,7 @@ impl Modem {
         };
 
         if final_response.contains("OK\r\n") && final_response.contains("+CMGS:") {
-            Ok(())
+            Ok(Self::extract_cmgs_mr(&final_response))
         } else {
             error!(
                 "Incomplete SMS response: {}",
@@ -1085,11 +1097,37 @@ impl Modem {
         }
     }
 
+    fn extract_cmgs_mr(response: &str) -> Option<u8> {
+        for line in response.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("+CMGS:") {
+                if let Ok(v) = rest.trim().parse::<u16>() {
+                    return Some((v & 0xFF) as u8);
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_qcmgs_mr(response: &str) -> Option<u8> {
+        for line in response.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("+QCMGS:") {
+                let first = rest.split(',').next().unwrap_or("").trim();
+                if let Ok(v) = first.parse::<u16>() {
+                    return Some((v & 0xFF) as u8);
+                }
+            }
+        }
+        None
+    }
+
     pub async fn send_sms_pdu(
         &self,
         contact: &Contact,
         message: &str,
-    ) -> anyhow::Result<(i64, String)> {
+        status_report_enabled: bool,
+    ) -> anyhow::Result<SmsSendOutcome> {
         // Use contact.id if it looks like a phone number (starts with + or is all digits),
         // otherwise fall back to contact.name (contacts auto-created from received SMS
         // store the phone number in the name field with a UUID as the id).
@@ -1115,14 +1153,30 @@ impl Modem {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
+            status_report_requested: false,
+            submit_ref: None,
+            delivery_status: None,
+            delivered_at: None,
+            delivery_report_raw: None,
         };
 
         let sms_id = sms.insert().await?;
 
-        match self.send_pdu_message(&phone, message).await {
-            Ok(_) => {
-                Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
-                Ok((sms_id, contact.id.clone()))
+        match self
+            .send_pdu_message(&phone, message, status_report_enabled)
+            .await
+        {
+            Ok(message_refs) => {
+                if !status_report_enabled {
+                    Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
+                } else {
+                    Sms::mark_status_report_requested(sms_id, message_refs.first().copied()).await?;
+                }
+                Ok(SmsSendOutcome {
+                    sms_id,
+                    contact_id: contact.id.clone(),
+                    message_refs,
+                })
             }
             Err(e) => {
                 Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Failed).await?;
@@ -1131,14 +1185,22 @@ impl Modem {
         }
     }
 
-    async fn send_pdu_message(&self, phone: &str, message: &str) -> anyhow::Result<()> {
-        let pdus = build_pdus(phone, message)?;
+    async fn send_pdu_message(
+        &self,
+        phone: &str,
+        message: &str,
+        status_report_enabled: bool,
+    ) -> anyhow::Result<Vec<u8>> {
+        let pdus = build_pdus(phone, message, status_report_enabled)?;
+        let mut refs = Vec::new();
 
         for (pdu_data, tpdu_length) in pdus {
-            self.send_pdu_atomic(tpdu_length, &pdu_data).await?;
+            if let Some(mr) = self.send_pdu_atomic(tpdu_length, &pdu_data).await? {
+                refs.push(mr);
+            }
         }
 
-        Ok(())
+        Ok(refs)
     }
 
     pub async fn read_sms_async_insert(
@@ -1162,6 +1224,11 @@ impl Modem {
         }
 
         if sms_list.is_empty() {
+            if mms_found {
+                if let Ok(conversations) = crate::db::Conversation::query_all().await {
+                    sse_manager.send(conversations);
+                }
+            }
             return Ok(());
         }
 
@@ -1527,8 +1594,48 @@ impl Modem {
         if trimmed != "OK" && !trimmed.is_empty() {
             log::info!("[{}] AT+CMGL raw response: {}", sim_id, trimmed);
         }
+
+        let status_reports = parse_status_report_pdus(&response);
+        for report in &status_reports {
+            match Sms::apply_status_report_by_submit_ref(
+                &sim_id,
+                report.submit_ref,
+                report.tp_status,
+                &report.raw_pdu_hex,
+            )
+            .await
+            {
+                Ok(affected) if affected > 0 => {
+                    log::info!(
+                        "[{}] Applied SMS status report: MR={}, TP-ST=0x{:02X}, rows={}",
+                        sim_id,
+                        report.submit_ref,
+                        report.tp_status,
+                        affected
+                    );
+                }
+                Ok(_) => {
+                    log::debug!(
+                        "[{}] Ignored SMS status report (no pending row): MR={}, TP-ST=0x{:02X}",
+                        sim_id,
+                        report.submit_ref,
+                        report.tp_status
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Failed to apply SMS status report MR={}: {}",
+                        sim_id,
+                        report.submit_ref,
+                        e
+                    );
+                }
+            }
+        }
+
         let (sms_list, mms_candidates) = parse_pdu_sms(&response, &sim_id);
         let mms_found = !mms_candidates.is_empty();
+        let status_report_found = !status_reports.is_empty();
         // Capture MMS WAP-push notifications *before* the caller deletes SMS from
         // the modem (this is our only chance -- there is no "leave undeleted for
         // retry" option like a ModemManager-based stack would have).
@@ -1542,7 +1649,7 @@ impl Modem {
                 );
             }
         }
-        Ok((sms_list, mms_found))
+        Ok((sms_list, mms_found || status_report_found))
     }
 
     /// Delete all SMS messages from modem storage (AT+CMGD=1,4)
@@ -1731,7 +1838,8 @@ impl Modem {
         &self,
         contact: &Contact,
         message: &str,
-    ) -> anyhow::Result<(i64, String)> {
+        status_report_enabled: bool,
+    ) -> anyhow::Result<SmsSendOutcome> {
         let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit())
         {
             contact.id.clone()
@@ -1754,14 +1862,30 @@ impl Modem {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
+            status_report_requested: false,
+            submit_ref: None,
+            delivery_status: None,
+            delivered_at: None,
+            delivery_report_raw: None,
         };
 
         let sms_id = sms.insert().await?;
 
-        match self.send_text_message(&phone, message).await {
-            Ok(_) => {
-                Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
-                Ok((sms_id, contact.id.clone()))
+        match self
+            .send_text_message(&phone, message, status_report_enabled)
+            .await
+        {
+            Ok(message_refs) => {
+                if !status_report_enabled {
+                    Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
+                } else {
+                    Sms::mark_status_report_requested(sms_id, message_refs.first().copied()).await?;
+                }
+                Ok(SmsSendOutcome {
+                    sms_id,
+                    contact_id: contact.id.clone(),
+                    message_refs,
+                })
             }
             Err(e) => {
                 Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Failed).await?;
@@ -1770,12 +1894,18 @@ impl Modem {
         }
     }
 
-    async fn send_text_message(&self, phone: &str, message: &str) -> anyhow::Result<()> {
+    async fn send_text_message(
+        &self,
+        phone: &str,
+        message: &str,
+        status_report_enabled: bool,
+    ) -> anyhow::Result<Vec<u8>> {
         // Keep receive-side PDU parsing intact: enter text mode only for the
         // send operation, then always restore CMGF=0.
         self.send_command_with_ok("AT+CMGF=1\r\n").await?;
         self.send_command_with_ok("AT+CSCS=\"UCS2\"\r\n").await?;
-        self.send_command_with_ok("AT+CSMP=17,167,0,8\r\n").await?;
+        let fo = if status_report_enabled { 49 } else { 17 };
+        self.send_command_with_ok(&format!("AT+CSMP={},167,0,8\r\n", fo)).await?;
 
         // Modem init keeps CSCS=UCS2. In text mode under UCS2 charset,
         // destination number passed to AT+CMGS must also be UCS2 encoded
@@ -1788,7 +1918,7 @@ impl Modem {
                 string_to_ucs2_pub(msg)
             })
             .await
-            .map(|_| ())
+            .map(|resp| Self::extract_cmgs_mr(&resp).into_iter().collect::<Vec<u8>>())
         } else {
             self.send_text_message_long_qcmgs(&phone_ucs2, &segments).await
         };
@@ -1796,7 +1926,7 @@ impl Modem {
         let restore_result = self.send_command_with_ok("AT+CMGF=0\r\n").await;
 
         match (send_result, restore_result) {
-            (Ok(_), Ok(_)) => Ok(()),
+            (Ok(refs), Ok(_)) => Ok(refs),
             (Err(e), Ok(_)) => Err(e),
             (Ok(_), Err(e)) => Err(anyhow::anyhow!(
                 "SMS sent in text mode but failed to restore PDU mode: {}",
@@ -1846,7 +1976,7 @@ impl Modem {
         &self,
         phone_ucs2: &str,
         segments: &[String],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<u8>> {
         let total = segments.len();
         anyhow::ensure!(
             total <= u8::MAX as usize,
@@ -1854,6 +1984,7 @@ impl Modem {
             total
         );
 
+        let mut refs = Vec::new();
         for (idx, segment) in segments.iter().enumerate() {
             let setup_cmd = format!(
                 "AT+QCMGS=\"{}\",10,{},{}\r",
@@ -1881,9 +2012,12 @@ impl Modem {
                     Self::format_log(&final_response)
                 ));
             }
+            if let Some(mr) = Self::extract_qcmgs_mr(&final_response) {
+                refs.push(mr);
+            }
         }
 
-        Ok(())
+        Ok(refs)
     }
 
     pub async fn read_sms_sync_insert(&self, _sms_type: SmsType) -> anyhow::Result<()> {

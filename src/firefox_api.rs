@@ -224,6 +224,7 @@ pub fn is_unretryable_platform_rejection(resp: &ApiResponse) -> bool {
 
     reason.contains("未匹配到关键字")
         || reason.contains("丢弃纯数字")
+        || reason.contains("已回码或释放")
         || reason.to_ascii_lowercase().contains("keyword")
 }
 

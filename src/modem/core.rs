@@ -1282,12 +1282,36 @@ impl Modem {
                                                 if sms.send {
                                                     continue;
                                                 }
+                                                let upload_content = match crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
+                                                    Ok(Some(item_id)) => crate::db::build_upload_sms_content(&item_id, &sms.message)
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            log::error!(
+                                                                "[{}] Failed to build upload SMS content for phone={} item_id={}: {}. Using raw message.",
+                                                                sim_id,
+                                                                phone_num,
+                                                                item_id,
+                                                                e
+                                                            );
+                                                            sms.message.clone()
+                                                        }),
+                                                    Ok(None) => sms.message.clone(),
+                                                    Err(e) => {
+                                                        log::error!(
+                                                            "[{}] Failed to resolve latest item_id for phone={} before upload: {}",
+                                                            sim_id,
+                                                            phone_num,
+                                                            e
+                                                        );
+                                                        sms.message.clone()
+                                                    }
+                                                };
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,
                                                     country_id,
                                                     phone_num,
-                                                    &sms.message,
+                                                    &upload_content,
                                                 )
                                                 .await
                                                 {

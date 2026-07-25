@@ -1638,33 +1638,118 @@ impl FirefoxPlatformItem {
         .await?;
         Ok(stats)
     }
+
+    pub async fn upsert_item_name(item_id: &str, item_name: &str) -> Result<()> {
+        let normalized = item_name.trim();
+        if normalized.is_empty() {
+            return Ok(());
+        }
+
+        let pool = get_pool()?;
+        sqlx::query(
+            "INSERT INTO firefox_item_names (item_id, item_name) \
+             VALUES (?, ?) \
+             ON CONFLICT(item_id) DO UPDATE SET item_name = excluded.item_name",
+        )
+        .bind(item_id)
+        .bind(normalized)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+}
+
+fn extract_primary_item_keyword(item_name: &str) -> Option<String> {
+    // Keep only the first concise keyword segment, e.g. "Facebook(脸书)" -> "Facebook".
+    let primary = item_name
+        .split(['/', '(', '（', '|', ',', ';'])
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    if primary.is_empty() {
+        return None;
+    }
+
+    let cleaned = primary
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .trim();
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
 }
 
 /// Build the SMS content to upload to the platform.
 /// If the raw message does not already contain the item name keyword,
 /// prefix it with `[Item_Name] ` so the platform accepts it.
 pub async fn build_upload_sms_content(item_id: &str, raw_content: &str) -> Result<String> {
-    let pool = get_pool()?;
-    let item_name: Option<String> =
-        sqlx::query_scalar("SELECT item_name FROM firefox_item_names WHERE item_id = ?")
+    let item_name: Option<String> = match get_pool() {
+        Ok(pool) => {
+            match sqlx::query_scalar::<_, Option<String>>(
+                "SELECT item_name FROM firefox_item_names WHERE item_id = ?",
+            )
             .bind(item_id)
             .fetch_optional(pool)
-            .await?;
-
-    let Some(item_name) = item_name else {
-        return Ok(raw_content.to_string());
+            .await
+            {
+                Ok(value) => value.flatten(),
+                Err(e) => {
+                    log::warn!(
+                        "[Upload SMS] Failed to query item_name for item_id={}: {}",
+                        item_id,
+                        e
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "[Upload SMS] Failed to get DB pool when resolving item_name for item_id={}: {}",
+                item_id,
+                e
+            );
+            None
+        }
     };
 
     let raw_lower = raw_content.to_ascii_lowercase();
-    let name_lower = item_name.to_ascii_lowercase();
-    if raw_lower.contains(&name_lower) {
+    let item_id_lower = item_id.to_ascii_lowercase();
+    if raw_lower.contains(&item_id_lower) {
         return Ok(raw_content.to_string());
     }
 
-    let prefixed = format!("[{}] {}", item_name, raw_content);
+    let mut keyword: Option<String> = None;
+    if let Some(name) = item_name.as_deref() {
+        let name_lower = name.to_ascii_lowercase();
+        if raw_lower.contains(&name_lower) {
+            return Ok(raw_content.to_string());
+        }
+
+        if let Some(primary) = extract_primary_item_keyword(name) {
+            if raw_lower.contains(&primary.to_ascii_lowercase()) {
+                return Ok(raw_content.to_string());
+            }
+            keyword = Some(primary);
+        } else {
+            keyword = Some(name.to_string());
+        }
+    }
+
+    let prefix = match keyword {
+        Some(k) => format!("{} {}", item_id, k),
+        None => item_id.to_string(),
+    };
+    let prefixed = format!("{} {}", prefix, raw_content);
     log::info!(
-        "[Upload SMS] Prefixed item name to SMS content: item_id={}, item_name={}, original={:?}, prefixed={:?}",
-        item_id, item_name, raw_content, prefixed
+        "[Upload SMS] Prefixed metadata to SMS content: item_id={}, item_name={:?}, original={:?}, prefixed={:?}",
+        item_id,
+        item_name,
+        raw_content,
+        prefixed
     );
     Ok(prefixed)
 }

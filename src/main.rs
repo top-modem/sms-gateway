@@ -530,6 +530,12 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             let phone_num = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("?");
                             let country_id = item.get("Country_ID").and_then(|v| v.as_str()).unwrap_or("?");
                             let item_id = item.get("Item_ID").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+                            let item_name = item
+                                .get("Item_Name")
+                                .or_else(|| item.get("item_name"))
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty());
 
                             if phone_num == "?" || item_id == "?" || country_id == "?" {
                                 continue;
@@ -542,6 +548,17 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                     item_id,
                                     e
                                 );
+                            }
+
+                            if let Some(name) = item_name {
+                                if let Err(e) = db::FirefoxPlatformItem::upsert_item_name(&item_id, name).await {
+                                    log::error!(
+                                        "[火狐狸轮询] 刷新平台项目名称失败 - Item_ID: {}, Item_Name: {}, 错误: {}",
+                                        item_id,
+                                        name,
+                                        e
+                                    );
+                                }
                             }
 
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
@@ -724,6 +741,156 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 Ok(None) => {
                                     mark_task_processed = false;
                                     log::warn!("[火狐狸轮询] 读取 SMS 后未找到短信 (SIM: {}, 号码: {})", sim_id, phone_num);
+                                    let fallback_sms = match db::Sms::find_recent_received_sms(&sim_id, 20).await {
+                                        Ok(candidates) => {
+                                            let cutoff = Local::now().naive_local() - chrono::Duration::minutes(30);
+                                            candidates.into_iter().find(|s| {
+                                                s.id > 0
+                                                    && s.timestamp >= cutoff
+                                                    && !s.message.trim().is_empty()
+                                                    && s.platform_item_id
+                                                        .as_deref()
+                                                        .is_none_or(|v| v == item_id.as_str())
+                                            })
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "[火狐狸轮询] 查询近期未上传短信失败 (SIM: {}, Item_ID: {}): {}",
+                                                sim_id,
+                                                item_id,
+                                                e
+                                            );
+                                            None
+                                        }
+                                    };
+
+                                    if let Some(sms) = fallback_sms {
+                                        mark_task_processed = true;
+                                        log::info!(
+                                            "[火狐狸轮询] 使用DB近期短信兜底上传 (SMS ID: {}, Item_ID: {}, 号码: {})",
+                                            sms.id,
+                                            item_id,
+                                            phone_num
+                                        );
+                                        let upload_content = db::build_upload_sms_content(&item_id, &sms.message)
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                log::error!(
+                                                    "[火狐狸轮询] 构建兜底上传短信内容失败 (SMS ID: {}, Item_ID: {}): {}，使用原始短信内容",
+                                                    sms.id,
+                                                    item_id,
+                                                    e
+                                                );
+                                                sms.message.clone()
+                                            });
+
+                                        match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &upload_content).await {
+                                            Ok(upload_resp) if upload_resp.code == "1" => {
+                                                let response_json = serde_json::to_string(&upload_resp).ok();
+                                                if let Err(e) = db::Sms::mark_platform_attempt(
+                                                    sms.id,
+                                                    &item_id,
+                                                    true,
+                                                    response_json.as_deref(),
+                                                )
+                                                .await
+                                                {
+                                                    log::error!(
+                                                        "[火狐狸轮询] 标记兜底短信上传成功失败 (SMS ID: {}, Item_ID: {}): {}",
+                                                        sms.id,
+                                                        item_id,
+                                                        e
+                                                    );
+                                                }
+                                                log::info!("[火狐狸轮询] 兜底短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp);
+                                            }
+                                            Ok(upload_resp) => {
+                                                let response_json = serde_json::to_string(&upload_resp).ok();
+                                                if let Err(e) = db::Sms::mark_platform_attempt(
+                                                    sms.id,
+                                                    &item_id,
+                                                    false,
+                                                    response_json.as_deref(),
+                                                )
+                                                .await
+                                                {
+                                                    log::error!(
+                                                        "[火狐狸轮询] 标记兜底短信上传失败失败 (SMS ID: {}, Item_ID: {}): {}",
+                                                        sms.id,
+                                                        item_id,
+                                                        e
+                                                    );
+                                                }
+
+                                                if firefox_api::is_unretryable_platform_rejection(&upload_resp) {
+                                                    log::warn!(
+                                                        "[火狐狸轮询] 兜底短信上传失败（不可重试），不进入重试队列 - 号码: {}, Item_ID: {}, code: {}, data: {:?}",
+                                                        phone_num,
+                                                        item_id,
+                                                        upload_resp.code,
+                                                        upload_resp.data
+                                                    );
+                                                } else {
+                                                    let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                        sms.id,
+                                                        phone_num.to_string(),
+                                                        country_id.to_string(),
+                                                        sms.message.clone(),
+                                                        format!("Upload failed with code: {}", upload_resp.code),
+                                                        Some(upload_resp.code.clone()),
+                                                    );
+
+                                                    match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                        &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                        &retry_item
+                                                    ).await {
+                                                        Ok(_) => log::info!("[火狐狸轮询] 兜底短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, code: {}", phone_num, item_id, retry_item.id, upload_resp.code),
+                                                        Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let error_message = format!("Upload failed: {}", e);
+                                                if let Err(mark_err) = db::Sms::mark_platform_attempt(
+                                                    sms.id,
+                                                    &item_id,
+                                                    false,
+                                                    Some(&error_message),
+                                                )
+                                                .await
+                                                {
+                                                    log::error!(
+                                                        "[火狐狸轮询] 标记兜底短信上传错误失败 (SMS ID: {}, Item_ID: {}): {}",
+                                                        sms.id,
+                                                        item_id,
+                                                        mark_err
+                                                    );
+                                                }
+
+                                                let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
+                                                    sms.id,
+                                                    phone_num.to_string(),
+                                                    country_id.to_string(),
+                                                    sms.message.clone(),
+                                                    format!("Upload failed: {}", e),
+                                                    None,
+                                                );
+
+                                                match firefox_upload_retry::FirefoxUploadRetryItem::insert(
+                                                    &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
+                                                    &retry_item
+                                                ).await {
+                                                    Ok(_) => log::info!("[火狐狸轮询] 兜底短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, 错误: {}", phone_num, item_id, retry_item.id, e),
+                                                    Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if mark_task_processed {
+                                        continue;
+                                    }
+
                                     // Check the result list in case platform already has content
                                     if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
                                         if let Some(data) = result_resp.data {

@@ -3,6 +3,7 @@
   import SimSelector from "./SimSelector.svelte";
   import Modal from "../common/Modal.svelte";
   import { t } from "../../js/i18n.js";
+  import { currentContact } from "../../stores/conversation";
 
   let {
     sendMessageContent = $bindable(""),
@@ -17,6 +18,7 @@
   let smsFormat = $state('pdu');
   let showConfirmDialog = $state(false);
   let messageInputRef = $state(null);
+  let preferredSimId = $derived($currentContact?.sim_id ?? null);
 
   // UCS2 encoding limits: 70 chars for single SMS, 67 per segment for multipart
   const UCS2_SINGLE_MAX = 70;
@@ -119,7 +121,7 @@
 
     <div class="flex flex-row items-stretch sm:items-center gap-3 w-full sm:w-auto">
       <div class="w-full flex-1 sm:flex-none sm:w-auto sm:min-w-[200px] sm:max-w-[320px]">
-        <SimSelector bind:selectedSim {initialSimId} />
+        <SimSelector bind:selectedSim {initialSimId} {preferredSimId} />
       </div>
 
       <div class="inline-flex h-12 items-center rounded-lg border border-gray-300 bg-white p-1 dark:border-zinc-600 dark:bg-zinc-800">

@@ -119,7 +119,11 @@
 
   // 鈹€鈹€ Open conversation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   function openMessage(msg) {
-    changeCurrentConversation(msg._contact ?? { id: msg.contact_id, name: msg.contact_name });
+    const baseContact = msg._contact ?? { id: msg.contact_id, name: msg.contact_name };
+    changeCurrentConversation({
+      ...baseContact,
+      sim_id: msg.sim_id ?? baseContact.sim_id ?? null,
+    });
     onConversationSelect();
   }
 

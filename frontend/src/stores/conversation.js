@@ -175,7 +175,11 @@ export const initConversation = () => {
 }
 
 export const changeCurrentConversation = (/** @type {any} */ contact) => {
-    if (contact.id === get(currentContact)?.id) {
+    const current = get(currentContact);
+    if (
+        contact.id === current?.id &&
+        (contact.sim_id ?? null) === (current?.sim_id ?? null)
+    ) {
         return;
     }
     updateStorageValue("currentConversation", contact);

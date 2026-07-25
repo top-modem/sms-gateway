@@ -59,30 +59,36 @@
   });
 
   // 鈹€鈹€ Filtered list 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-  const inboxItems = $derived(
-    $conversations.map((conv) => ({
-      id: conv.contact.id,
-      contact_id: conv.contact.id,
-      contact_name: conv.contact.name,
-      message: conv.sms_preview?.message ?? "",
-      sim_id: conv.sms_preview?.sim_id ?? "",
-      status: conv.sms_preview?.status ?? 1,
-      timestamp: conv.sms_preview?.timestamp,
-      _contact: conv.contact,
-    }))
-  );
+  const inboxItems = $derived((() => {
+    // Build inbox list from received SMS rows only, so sent messages never appear in Inbox.
+    const latestByContact = new Map();
+    for (const row of inboxMessages) {
+      if (!row?.contact_id) continue;
+      if (!latestByContact.has(row.contact_id)) {
+        latestByContact.set(row.contact_id, row);
+      }
+    }
+
+    return Array.from(latestByContact.values()).map((row) => {
+      const conv = $conversations.find((c) => c.contact.id === row.contact_id);
+      const contactName = row.contact_name ?? conv?.contact?.name ?? row.contact_id;
+      return {
+        id: row.id ?? row.contact_id,
+        contact_id: row.contact_id,
+        contact_name: contactName,
+        message: row.message ?? "",
+        sim_id: row.sim_id ?? "",
+        status: row.status ?? 1,
+        timestamp: row.timestamp,
+        _contact: conv?.contact ?? { id: row.contact_id, name: contactName },
+      };
+    });
+  })());
 
   let filtered = $derived(
     (activeTab === "inbox"
       ? inboxItems
-          .filter(m => {
-            if (!filterSimId) return true;
-            const hasMatchingInboxMessage = inboxMessages.some(
-              row => row.contact_id === m.contact_id && row.sim_id === filterSimId
-            );
-            // Keep legacy behavior too: allow direct preview sim_id match.
-            return hasMatchingInboxMessage || m.sim_id === filterSimId;
-          })
+          .filter(m => !filterSimId || m.sim_id === filterSimId)
       : sentMessages.filter(m => !filterSimId || m.sim_id === filterSimId)
     )
       .filter(m =>

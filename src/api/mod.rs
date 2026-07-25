@@ -2120,6 +2120,13 @@ async fn firefox_upload(
             .into_response();
     }
 
+    log::info!(
+        "[火狐狸批量上传] 请求开始: country_id={}, selected_sims={}, valid_numbers={}",
+        country_id,
+        request.sim_ids.len(),
+        phone_numbers.len()
+    );
+
     // Persist the selected country code on each uploaded SIM.
     for sim_id in &sim_ids_to_update {
         if let Some(mut card) = sim_cards.iter().find(|c| &c.id == sim_id).cloned() {
@@ -2136,6 +2143,13 @@ async fn firefox_upload(
                 .iter()
                 .map(|r| r.batch_id.clone())
                 .collect();
+            log::info!(
+                "[火狐狸批量上传] 上传完成: country_id={}, valid_numbers={}, batch_count={}, batch_ids={:?}",
+                country_id,
+                phone_numbers.len(),
+                batch_ids.len(),
+                batch_ids
+            );
             let api_responses: Vec<firefox_api::ApiResponse> = results
                 .iter()
                 .map(|r| r.response.clone())

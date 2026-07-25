@@ -262,8 +262,24 @@ pub async fn upload_phone_batch(
 ) -> Result<Vec<BatchUploadResult>> {
     const BATCH_SIZE: usize = 50;
     let mut results = Vec::new();
+    let total_chunks = phone_numbers.len().div_ceil(BATCH_SIZE);
 
-    for chunk in phone_numbers.chunks(BATCH_SIZE) {
+    log::info!(
+        "[火狐狸批量上传] 分片开始: country_id={}, total_numbers={}, chunk_size={}, total_chunks={}",
+        country_id,
+        phone_numbers.len(),
+        BATCH_SIZE,
+        total_chunks
+    );
+
+    for (idx, chunk) in phone_numbers.chunks(BATCH_SIZE).enumerate() {
+        log::info!(
+            "[火狐狸批量上传] 提交分片: chunk={}/{}, size={}, first_phone={}",
+            idx + 1,
+            total_chunks,
+            chunk.len(),
+            chunk.first().cloned().unwrap_or_default()
+        );
         let phone_list: Vec<PhoneAddEntry> = chunk
             .iter()
             .map(|num| PhoneAddEntry {
@@ -281,6 +297,14 @@ pub async fn upload_phone_batch(
         };
         let resp: ApiResponse = do_post(client, api_key, &payload).await?;
         let batch_id = resp.data.clone().unwrap_or_default();
+        log::info!(
+            "[火狐狸批量上传] 分片响应: chunk={}/{}, size={}, code={}, batch_id={}",
+            idx + 1,
+            total_chunks,
+            chunk.len(),
+            resp.code,
+            batch_id
+        );
         results.push(BatchUploadResult {
             batch_id,
             phone_numbers: chunk.iter().cloned().collect(),

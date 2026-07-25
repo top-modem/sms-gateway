@@ -18,6 +18,7 @@
   // 鈹€鈹€ Tab state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   let activeTab = $state("inbox");   // "inbox" | "sent"
   let sentMessages = $state([]);
+  let inboxMessages = $state([]);
   let loading = $state(true);
   let searchValue = $state("");
   let searchFocused = $state(false);
@@ -29,18 +30,22 @@
 
   // 鈹€鈹€ Fetch on tab change or SSE push 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   async function fetchMessages(tab) {
-    if (tab === "inbox") {
-      loading = false;
-      return;
-    }
-
     loading = true;
     try {
-      const res = await apiClient.getSmsByDirection(tab);
-      sentMessages = res.data?.data ?? [];
+      if (tab === "inbox") {
+        const inboxRes = await apiClient.getSmsByDirection("inbox", 1, 500);
+        inboxMessages = inboxRes.data?.data ?? [];
+      } else {
+        const sentRes = await apiClient.getSmsByDirection("sent", 1, 500);
+        sentMessages = sentRes.data?.data ?? [];
+      }
     } catch (e) {
       console.error("Failed to load messages:", e);
-      sentMessages = [];
+      if (tab === "inbox") {
+        inboxMessages = [];
+      } else {
+        sentMessages = [];
+      }
     } finally {
       loading = false;
     }
@@ -68,8 +73,18 @@
   );
 
   let filtered = $derived(
-    (activeTab === "inbox" ? inboxItems : sentMessages)
-      .filter(m => !filterSimId || m.sim_id === filterSimId)
+    (activeTab === "inbox"
+      ? inboxItems
+          .filter(m => {
+            if (!filterSimId) return true;
+            const hasMatchingInboxMessage = inboxMessages.some(
+              row => row.contact_id === m.contact_id && row.sim_id === filterSimId
+            );
+            // Keep legacy behavior too: allow direct preview sim_id match.
+            return hasMatchingInboxMessage || m.sim_id === filterSimId;
+          })
+      : sentMessages.filter(m => !filterSimId || m.sim_id === filterSimId)
+    )
       .filter(m =>
         searchValue.trim() === "" ||
         (m.contact_name ?? "").toLowerCase().includes(searchValue.toLowerCase()) ||

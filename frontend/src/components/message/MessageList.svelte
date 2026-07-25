@@ -27,6 +27,7 @@
   let sendMessageContent = $state("");
   let page = $state(1);
   let pageSize = $state(9999999);
+  let loadSeq = 0;
   let showLoading = $state(true);
   let loadingTimer = null;
   let messageInputComponent = $state(null);
@@ -56,19 +57,48 @@
 
     if ($currentContact.id === prevConversationId) return;
 
-    prevConversationId = $currentContact.id;
+    const contactSnapshot = { ...$currentContact };
+    const thisLoadSeq = ++loadSeq;
+
+    prevConversationId = contactSnapshot.id;
     loading = true;
 
-    if (!$currentContact.new) {
+    if (!contactSnapshot.new) {
       apiClient
-        .getSmsPaginated(page, pageSize, $currentContact.id)
-        .then((res) => {
+        .getSmsPaginated(page, pageSize, contactSnapshot.id)
+        .then(async (res) => {
+          if (thisLoadSeq !== loadSeq) return;
+
           isNewMessage = false;
-          messages = res.data.data;
-          loading = false;
-          if (page === 1) {
-            markConversationAsRead($currentContact.id);
+          let rows = Array.isArray(res?.data?.data) ? res.data.data : [];
+
+          // Fallback: if contact-id lookup is empty, try inbox rows filtered by contact name.
+          // This covers stale/merged contact-id edge cases while preserving normal behavior.
+          if (rows.length === 0 && contactSnapshot.name) {
+            try {
+              const inboxRes = await apiClient.getSmsByDirection("inbox", 1, 500);
+              const inboxRows = Array.isArray(inboxRes?.data?.data) ? inboxRes.data.data : [];
+              rows = inboxRows.filter(
+                (row) => (row?.contact_name ?? "") === contactSnapshot.name
+              );
+            } catch (fallbackErr) {
+              console.error("Fallback inbox query failed:", fallbackErr);
+            }
           }
+
+          messages = rows;
+          if (page === 1) {
+            markConversationAsRead(contactSnapshot.id);
+          }
+        })
+        .catch((err) => {
+          if (thisLoadSeq !== loadSeq) return;
+          console.error("Failed to load conversation messages:", err);
+          messages = [];
+        })
+        .finally(() => {
+          if (thisLoadSeq !== loadSeq) return;
+          loading = false;
         });
     } else {
       isNewMessage = false;

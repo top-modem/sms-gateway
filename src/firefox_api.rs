@@ -293,6 +293,20 @@ pub fn is_unretryable_platform_rejection(resp: &ApiResponse) -> bool {
         || reason.to_ascii_lowercase().contains("keyword")
 }
 
+fn is_pure_digit_rejection(resp: &ApiResponse) -> bool {
+    resp.code == "0"
+        && resp
+            .data
+            .as_deref()
+            .map(|r| r.contains("丢弃纯数字"))
+            .unwrap_or(false)
+}
+
+fn is_digits_only_sms(s: &str) -> bool {
+    let trimmed = s.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit())
+}
+
 // ─── 1. PhoneAddBatch ───────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -584,8 +598,8 @@ pub async fn upload_sms(
         country_id,
         payload.Phone_SmsContent
     );
-    let resp: anyhow::Result<ApiResponse> = do_post(client, api_key, &payload).await;
-    match &resp {
+    let first_resp: anyhow::Result<ApiResponse> = do_post(client, api_key, &payload).await;
+    match &first_resp {
         Ok(r) => log::info!(
             "[火狐狸平台] UploadSms response: phone={}, code={}, data={:?}",
             phone_num,
@@ -598,5 +612,44 @@ pub async fn upload_sms(
             e
         ),
     }
-    resp
+
+    let Ok(first_ok) = first_resp else {
+        return first_resp;
+    };
+
+    if is_pure_digit_rejection(&first_ok) && is_digits_only_sms(sms_content) {
+        let fallback_content = format!("OTP {}", sms_content.trim());
+        let fallback_payload = UploadSmsRequest {
+            act: "UploadSms",
+            Country_ID: country_id.to_string(),
+            Phone_Num: phone_num.to_string(),
+            Phone_SmsContent: fallback_content.clone(),
+        };
+
+        log::info!(
+            "[火狐狸平台] UploadSms pure-digit fallback retry: phone={}, original={:?}, fallback={:?}",
+            phone_num,
+            sms_content,
+            fallback_content
+        );
+
+        let retry_resp: anyhow::Result<ApiResponse> = do_post(client, api_key, &fallback_payload).await;
+        match &retry_resp {
+            Ok(r) => log::info!(
+                "[火狐狸平台] UploadSms fallback response: phone={}, code={}, data={:?}",
+                phone_num,
+                r.code,
+                r.data
+            ),
+            Err(e) => log::warn!(
+                "[火狐狸平台] UploadSms fallback failed: phone={}, error={}",
+                phone_num,
+                e
+            ),
+        }
+
+        return retry_resp;
+    }
+
+    Ok(first_ok)
 }

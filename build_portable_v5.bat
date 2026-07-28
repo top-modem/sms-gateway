@@ -2,14 +2,42 @@
 setlocal EnableExtensions
 chcp 65001 >nul
 
-set "ROOT=D:\sourcecode\develop\sms-gateway"
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "FRONTEND=%ROOT%\frontend"
+set "DRY_RUN=0"
+if /I "%~1"=="--dry-run" set "DRY_RUN=1"
+
+where pnpm >nul 2>nul || (
+  echo pnpm not found in PATH.
+  exit /b 1
+)
+
+where cargo >nul 2>nul || (
+  echo cargo not found in PATH.
+  exit /b 1
+)
+
+where powershell >nul 2>nul || (
+  echo powershell not found in PATH.
+  exit /b 1
+)
 
 rem Build app name from Unicode code points to avoid mojibake in non-UTF8 editors.
 for /f "delims=" %%I in ('powershell -NoProfile -Command "[char]0x5C0F+[char]0x725B+[char]0x667A+[char]0x5361"') do set "APP_NAME=%%I"
 
 set "NEWDIR=%ROOT%\release\%APP_NAME%-windows-portable-v5"
 set "ZIPPATH=%ROOT%\release\%APP_NAME%-windows-portable-v5.zip"
+
+if "%DRY_RUN%"=="1" (
+  echo [DRY RUN]
+  echo ROOT=%ROOT%
+  echo FRONTEND=%FRONTEND%
+  echo APP_NAME=%APP_NAME%
+  echo NEWDIR=%NEWDIR%
+  echo ZIPPATH=%ZIPPATH%
+  exit /b 0
+)
 
 echo [1/6] Go to project root
 cd /d "%ROOT%" || (

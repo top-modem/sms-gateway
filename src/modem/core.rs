@@ -1128,6 +1128,68 @@ impl Modem {
                                         .build()
                                     {
                                         Ok(client) => {
+                                            let normalized_phone = phone_num
+                                                .chars()
+                                                .filter(|c| c.is_ascii_digit())
+                                                .collect::<String>()
+                                                .trim_start_matches('0')
+                                                .to_string();
+
+                                            let wait_list_item_id = match crate::firefox_api::get_wait_phone_list(&client, &api_key).await {
+                                                Ok(wait_resp) => {
+                                                    wait_resp
+                                                        .data
+                                                        .and_then(|d| d.as_array().cloned())
+                                                        .and_then(|items| {
+                                                            items.into_iter().find_map(|item| {
+                                                                let phone_match = item
+                                                                    .get("Phone_Num")
+                                                                    .and_then(|v| v.as_str())
+                                                                    .map(|p| {
+                                                                        let np = p
+                                                                            .chars()
+                                                                            .filter(|c| c.is_ascii_digit())
+                                                                            .collect::<String>()
+                                                                            .trim_start_matches('0')
+                                                                            .to_string();
+                                                                        !np.is_empty() && np == normalized_phone
+                                                                    })
+                                                                    .unwrap_or(false);
+
+                                                                if !phone_match {
+                                                                    return None;
+                                                                }
+
+                                                                item.get("Item_ID").and_then(|v| {
+                                                                    if let Some(s) = v.as_str() {
+                                                                        let trimmed = s.trim();
+                                                                        if trimmed.is_empty() {
+                                                                            None
+                                                                        } else {
+                                                                            Some(trimmed.to_string())
+                                                                        }
+                                                                    } else if let Some(n) = v.as_i64() {
+                                                                        Some(n.to_string())
+                                                                    } else if let Some(n) = v.as_u64() {
+                                                                        Some(n.to_string())
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                })
+                                                            })
+                                                        })
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "[{}] Failed to read wait-list for phone {}: {}",
+                                                        sim_id,
+                                                        phone_num,
+                                                        e
+                                                    );
+                                                    None
+                                                }
+                                            };
+
                                             let latest_item_id = match crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
                                                 Ok(v) => v,
                                                 Err(e) => {
@@ -1141,12 +1203,30 @@ impl Modem {
                                                 }
                                             };
 
+                                            let preferred_item_id = if wait_list_item_id.is_some() {
+                                                log::info!(
+                                                    "[{}] Upload item source=wait-list for phone {}: {:?}",
+                                                    sim_id,
+                                                    phone_num,
+                                                    wait_list_item_id
+                                                );
+                                                wait_list_item_id
+                                            } else {
+                                                log::info!(
+                                                    "[{}] Upload item source=db-latest for phone {}: {:?}",
+                                                    sim_id,
+                                                    phone_num,
+                                                    latest_item_id
+                                                );
+                                                latest_item_id
+                                            };
+
                                             for sms in &sms_list {
                                                 if sms.send {
                                                     continue;
                                                 }
 
-                                                let upload_content = if let Some(item_id) = latest_item_id.as_deref() {
+                                                let upload_content = if let Some(item_id) = preferred_item_id.as_deref() {
                                                     crate::db::build_upload_sms_content(item_id, &sms.message)
                                                         .await
                                                         .unwrap_or_else(|e| {

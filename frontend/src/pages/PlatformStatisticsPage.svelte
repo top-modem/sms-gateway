@@ -21,16 +21,36 @@
     loading = true;
     error = '';
     try {
-      const [itemsRes, statsRes, waitListRes, reasonsRes] = await Promise.all([
+      const [itemsRes, statsRes, waitListRes, reasonsRes] = await Promise.allSettled([
         apiClient.getFirefoxPlatformItems(),
         apiClient.getFirefoxPlatformStatistics(),
         apiClient.getFirefoxWaitList(),
         apiClient.getFirefoxPlatformRejectionReasons(),
       ]);
-      items = Array.isArray(itemsRes) ? itemsRes : (itemsRes?.data ?? []);
-      statistics = Array.isArray(statsRes) ? statsRes : (statsRes?.data ?? []);
-      waitList = Array.isArray(waitListRes?.data?.data) ? waitListRes.data.data : [];
-      rejectionReasons = Array.isArray(reasonsRes) ? reasonsRes : (reasonsRes?.data ?? []);
+
+      if (itemsRes.status === 'rejected' || statsRes.status === 'rejected') {
+        throw (itemsRes.status === 'rejected' ? itemsRes.reason : statsRes.reason);
+      }
+
+      const itemsData = itemsRes.value;
+      const statsData = statsRes.value;
+      items = Array.isArray(itemsData) ? itemsData : (itemsData?.data ?? []);
+      statistics = Array.isArray(statsData) ? statsData : (statsData?.data ?? []);
+
+      if (waitListRes.status === 'fulfilled') {
+        waitList = Array.isArray(waitListRes.value?.data?.data) ? waitListRes.value.data.data : [];
+      } else {
+        waitList = [];
+        console.warn('Failed to load wait-list, fallback to empty current items:', waitListRes.reason);
+      }
+
+      if (reasonsRes.status === 'fulfilled') {
+        const reasonsData = reasonsRes.value;
+        rejectionReasons = Array.isArray(reasonsData) ? reasonsData : (reasonsData?.data ?? []);
+      } else {
+        rejectionReasons = [];
+        console.warn('Failed to load rejection summary, fallback to empty list:', reasonsRes.reason);
+      }
     } catch (e) {
       error = e?.message ?? $t('err_load_platform_stats');
     } finally {

@@ -10,6 +10,7 @@ pub enum SmsType {
     All,
 }
 
+#[cfg(feature = "mock-data")]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SmsSendMode {

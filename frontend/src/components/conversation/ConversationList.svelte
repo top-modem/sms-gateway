@@ -17,8 +17,7 @@
 
   // 鈹€鈹€ Tab state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   let activeTab = $state("inbox");   // "inbox" | "sent"
-  let sentMessages = $state([]);
-  let inboxMessages = $state([]);
+  let messages = $state([]);
   let loading = $state(true);
   let searchValue = $state("");
   let searchFocused = $state(false);
@@ -32,20 +31,11 @@
   async function fetchMessages(tab) {
     loading = true;
     try {
-      if (tab === "inbox") {
-        const inboxRes = await apiClient.getSmsByDirection("inbox", 1, 500);
-        inboxMessages = inboxRes.data?.data ?? [];
-      } else {
-        const sentRes = await apiClient.getSmsByDirection("sent", 1, 500);
-        sentMessages = sentRes.data?.data ?? [];
-      }
+      const res = await apiClient.getSmsByDirection(tab);
+      messages = res.data?.data ?? [];
     } catch (e) {
       console.error("Failed to load messages:", e);
-      if (tab === "inbox") {
-        inboxMessages = [];
-      } else {
-        sentMessages = [];
-      }
+      messages = [];
     } finally {
       loading = false;
     }
@@ -59,42 +49,13 @@
   });
 
   // 鈹€鈹€ Filtered list 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-  const inboxItems = $derived((() => {
-    // Build inbox list from received SMS rows only, so sent messages never appear in Inbox.
-    const latestByContact = new Map();
-    for (const row of inboxMessages) {
-      if (!row?.contact_id) continue;
-      if (!latestByContact.has(row.contact_id)) {
-        latestByContact.set(row.contact_id, row);
-      }
-    }
-
-    return Array.from(latestByContact.values()).map((row) => {
-      const conv = $conversations.find((c) => c.contact.id === row.contact_id);
-      const contactName = row.contact_name ?? conv?.contact?.name ?? row.contact_id;
-      return {
-        id: row.id ?? row.contact_id,
-        contact_id: row.contact_id,
-        contact_name: contactName,
-        message: row.message ?? "",
-        sim_id: row.sim_id ?? "",
-        status: row.status ?? 1,
-        timestamp: row.timestamp,
-        _contact: conv?.contact ?? { id: row.contact_id, name: contactName },
-      };
-    });
-  })());
-
   let filtered = $derived(
-    (activeTab === "inbox"
-      ? inboxItems
-          .filter(m => !filterSimId || m.sim_id === filterSimId)
-      : sentMessages.filter(m => !filterSimId || m.sim_id === filterSimId)
-    )
+    messages
+      .filter(m => !filterSimId || m.sim_id === filterSimId)
       .filter(m =>
         searchValue.trim() === "" ||
-        (m.contact_name ?? "").toLowerCase().includes(searchValue.toLowerCase()) ||
-        (m.message ?? "").toLowerCase().includes(searchValue.toLowerCase())
+        m.contact_name.toLowerCase().includes(searchValue.toLowerCase()) ||
+        m.message.toLowerCase().includes(searchValue.toLowerCase())
       )
   );
 
@@ -125,11 +86,7 @@
 
   // 鈹€鈹€ Open conversation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   function openMessage(msg) {
-    const baseContact = msg._contact ?? { id: msg.contact_id, name: msg.contact_name };
-    changeCurrentConversation({
-      ...baseContact,
-      sim_id: msg.sim_id ?? baseContact.sim_id ?? null,
-    });
+    changeCurrentConversation({ id: msg.contact_id, name: msg.contact_name });
     onConversationSelect();
   }
 

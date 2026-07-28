@@ -367,7 +367,7 @@
       <Icon icon="carbon:arrow-left" class="w-4 h-4" />
       <span class="text-xs font-semibold">{$t('btn_back')}</span>
     </button>
-    <Icon icon="carbon:notebook-reference" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+    <Icon icon="carbon:phone-voice" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
     <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('phone_number_title')}</h1>
   </header>
 

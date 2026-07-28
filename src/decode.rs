@@ -18,13 +18,6 @@ pub struct MmsNotificationCandidate {
     pub raw: Vec<u8>,
 }
 
-/// Parsed SMS-STATUS-REPORT (TP-MTI=0x02) information.
-pub struct SmsStatusReport {
-    pub submit_ref: u8,
-    pub tp_status: u8,
-    pub raw_pdu_hex: String,
-}
-
 // --------- Multipart SMS Handler ----------
 struct MultipartHandler {
     // (reference number, total parts) -> (timestamp, sender, message parts, original indices)
@@ -252,77 +245,6 @@ pub fn parse_pdu_sms(
         mms_candidates.len()
     );
     (messages, mms_candidates)
-}
-
-/// Parse SMS status-report PDUs from modem response content.
-/// Supports storage listings (`+CMGL`), single-index reads (`+CMGR`),
-/// and direct report URCs (`+CDS`).
-pub fn parse_status_report_pdus(response: &str) -> Vec<SmsStatusReport> {
-    let mut reports = Vec::new();
-    let entry_re = Regex::new(r"(?i)\+(CMGL|CMGR|CDS):[^\n]*\n([0-9A-Fa-f]+)").unwrap();
-
-    for cap in entry_re.captures_iter(response).flatten() {
-        let pdu_hex = cap[2].to_uppercase();
-        let pdu = match hex::decode(&pdu_hex) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if pdu.is_empty() {
-            continue;
-        }
-
-        let smsc_len = pdu[0] as usize;
-        let mut pos = 1 + smsc_len;
-        if pos >= pdu.len() {
-            continue;
-        }
-
-        let pdu_type = pdu[pos];
-        let mti = pdu_type & 0x03;
-        if mti != 0x02 {
-            continue;
-        }
-        pos += 1;
-
-        if pos >= pdu.len() {
-            continue;
-        }
-        let submit_ref = pdu[pos];
-        pos += 1;
-
-        // TP-RA (recipient address): len (digits), TOA, semi-octets.
-        if pos + 1 >= pdu.len() {
-            continue;
-        }
-        let ra_digits = pdu[pos] as usize;
-        pos += 1;
-        pos += 1; // TP-RA type-of-address
-        let ra_octets = (ra_digits + 1) / 2;
-        if pos + ra_octets > pdu.len() {
-            continue;
-        }
-        pos += ra_octets;
-
-        // TP-SCTS (7 octets) + TP-DT (7 octets).
-        if pos + 14 > pdu.len() {
-            continue;
-        }
-        pos += 14;
-
-        if pos >= pdu.len() {
-            continue;
-        }
-        let tp_status = pdu[pos];
-
-        reports.push(SmsStatusReport {
-            submit_ref,
-            tp_status,
-            raw_pdu_hex: pdu_hex,
-        });
-    }
-
-    reports
 }
 
 // ---------- Message Content Parsing ----------

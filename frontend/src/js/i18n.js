@@ -711,7 +711,7 @@ const translations = {
     select_row_hint:                 '选择当前项目或历史记录以查看其 SMS 尝试。',
 
     // Money page
-    money_page_title:                '钱数看板',
+    money_page_title:                '收款统计',
     err_load_money_stats:            '加载钱数统计失败',
     money_col_port:                  '端口',
     money_col_phone:                 '手机号',

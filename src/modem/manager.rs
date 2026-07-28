@@ -11,11 +11,10 @@ use tokio::task::JoinHandle;
 use crate::api::sse_manager::CallEvent;
 use crate::api::SseManager;
 use crate::config::{Settings, SmsStorage};
-use crate::decode::parse_status_report_pdus;
 use crate::db::{Call, Contact, ModemSMS, SimCard, Sms, SmsStatus};
 use crate::webhook;
 
-use super::core::{ApreadyProbeResult, Modem, SmsSendOutcome};
+use super::core::Modem;
 use super::types::*;
 
 /// Configuration for local whisper.cpp speech-to-text transcription.
@@ -62,8 +61,6 @@ pub struct ModemManager {
     urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
-    /// COM ports that responded to APREADY but are not valid modules.
-    invalid_ports: RwLock<HashSet<String>>,
     /// Background tasks that periodically quick-probe unavailable ports.
     unavailable_port_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// Original device list so unavailable ports can be retried later.
@@ -87,168 +84,6 @@ pub struct ModemManager {
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
 
 impl ModemManager {
-    fn parse_cds_text_urc(line: &str) -> Option<(u8, u8)> {
-        let payload = line.strip_prefix("+CDS:")?.trim();
-        let parts: Vec<&str> = payload.split(',').map(|p| p.trim()).collect();
-        if parts.len() < 2 {
-            return None;
-        }
-
-        // Text-mode +CDS commonly has MR as the second field and TP-ST as the last field.
-        let mr = parts.get(1)?.trim_matches('"').parse::<u16>().ok()? as u8;
-        let st = parts
-            .last()?
-            .trim_matches('"')
-            .parse::<u16>()
-            .ok()? as u8;
-        Some((mr, st))
-    }
-
-    fn parse_cdsi_urc(line: &str) -> Option<(String, u32)> {
-        let payload = line.strip_prefix("+CDSI:")?.trim();
-        let mut parts = payload.split(',').map(|p| p.trim());
-        let storage = parts.next()?.trim_matches('"').to_string();
-        let index = parts.next()?.parse::<u32>().ok()?;
-        if storage.is_empty() {
-            return None;
-        }
-        Some((storage, index))
-    }
-
-    fn parse_cpms_current_storage(response: &str) -> Option<String> {
-        let cpms_line = response
-            .lines()
-            .find(|line| line.trim_start().starts_with("+CPMS:"))?;
-        let first_quote = cpms_line.find('"')?;
-        let rest = &cpms_line[first_quote + 1..];
-        let end_quote = rest.find('"')?;
-        let storage = rest[..end_quote].trim();
-        if storage.is_empty() {
-            return None;
-        }
-        Some(storage.to_string())
-    }
-
-    async fn apply_status_reports_from_payload(
-        sim_id: &str,
-        sse: &Arc<SseManager>,
-        reports: Vec<crate::decode::SmsStatusReport>,
-        source: &str,
-    ) {
-        let mut applied_any = false;
-
-        for report in reports {
-            match Sms::apply_status_report_by_submit_ref(
-                sim_id,
-                report.submit_ref,
-                report.tp_status,
-                &report.raw_pdu_hex,
-            )
-            .await
-            {
-                Ok(affected) if affected > 0 => {
-                    applied_any = true;
-                    info!(
-                        "[URC {}] Applied {} status report: MR={}, TP-ST=0x{:02X}, rows={}",
-                        sim_id, source, report.submit_ref, report.tp_status, affected
-                    );
-                }
-                Ok(_) => {
-                    info!(
-                        "[URC {}] Ignored {} status report (no pending row): MR={}, TP-ST=0x{:02X}",
-                        sim_id, source, report.submit_ref, report.tp_status
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "[URC {}] Failed to apply {} status report MR={}: {}",
-                        sim_id, source, report.submit_ref, e
-                    );
-                }
-            }
-        }
-
-        if applied_any {
-            match crate::db::Conversation::query_all().await {
-                Ok(conversations) => sse.send(conversations),
-                Err(e) => error!(
-                    "[URC {}] Failed to refresh conversations after {}: {}",
-                    sim_id, source, e
-                ),
-            }
-        }
-    }
-
-    async fn handle_cdsi_notification(
-        sim_id: &str,
-        modem: &Arc<Modem>,
-        sse: &Arc<SseManager>,
-        line: &str,
-    ) -> anyhow::Result<bool> {
-        let Some((storage, index)) = Self::parse_cdsi_urc(line) else {
-            return Ok(false);
-        };
-
-        let previous_storage = match modem.send_command("AT+CPMS?\r\n").await {
-            Ok(resp) => Self::parse_cpms_current_storage(&resp),
-            Err(_) => None,
-        };
-
-        let set_storage_cmd = format!("AT+CPMS=\"{0}\",\"{0}\",\"{0}\"\r\n", storage);
-        let set_storage_resp = modem.send_command(&set_storage_cmd).await?;
-        if !set_storage_resp.contains("OK") {
-            info!(
-                "[URC {}] +CDSI storage switch failed for {}: {}",
-                sim_id,
-                storage,
-                set_storage_resp.trim()
-            );
-            return Ok(false);
-        }
-
-        let _ = modem.send_command("AT+CMGF=0\r\n").await;
-        let cmgr_cmd = format!("AT+CMGR={}\r\n", index);
-        let cmgr_resp = modem.send_command(&cmgr_cmd).await?;
-        let reports = parse_status_report_pdus(&cmgr_resp);
-        if reports.is_empty() {
-            info!(
-                "[URC {}] +CDSI slot {} in {} did not parse as status report; falling back to full read",
-                sim_id, index, storage
-            );
-            if let Some(prev) = previous_storage {
-                if prev != storage {
-                    let restore_cmd = format!("AT+CPMS=\"{0}\",\"{0}\",\"{0}\"\r\n", prev);
-                    let _ = modem.send_command(&restore_cmd).await;
-                }
-            }
-            return Ok(false);
-        }
-
-        Self::apply_status_reports_from_payload(sim_id, sse, reports, "+CDSI/CMGR").await;
-
-        let delete_cmd = format!("AT+CMGD={}\r\n", index);
-        if let Ok(resp) = modem.send_command(&delete_cmd).await {
-            if !resp.contains("OK") {
-                info!(
-                    "[URC {}] +CDSI slot delete failed ({}:{}): {}",
-                    sim_id,
-                    storage,
-                    index,
-                    resp.trim()
-                );
-            }
-        }
-
-        if let Some(prev) = previous_storage {
-            if prev != storage {
-                let restore_cmd = format!("AT+CPMS=\"{0}\",\"{0}\",\"{0}\"\r\n", prev);
-                let _ = modem.send_command(&restore_cmd).await;
-            }
-        }
-
-        Ok(true)
-    }
-
     pub async fn is_initialization_complete(&self) -> bool {
         *self.initialization_complete.read().await
     }
@@ -329,25 +164,13 @@ impl ModemManager {
 
             // Quick probe: empty ports fail fast. Acquire the shared probe semaphore
             // so a large number of unavailable ports cannot overwhelm the USB hub.
-            let (present, apready_probe) = {
+            let present = {
                 let _permit = self.probe_semaphore.acquire().await;
-                let present = Modem::quick_probe_port(&com_port, baud_rate).await;
-                let apready_probe = if present {
-                    Modem::quick_probe_apready_port(&com_port, baud_rate).await
-                } else {
-                    ApreadyProbeResult::Unavailable
-                };
-                (present, apready_probe)
+                Modem::quick_probe_port(&com_port, baud_rate).await
             };
             if !present {
                 continue;
             }
-
-            if matches!(apready_probe, ApreadyProbeResult::Invalid) {
-                self.invalid_ports.write().await.insert(com_port.clone());
-                continue;
-            }
-            self.invalid_ports.write().await.remove(&com_port);
 
             // Full init for ports that look like they have a modem/SIM.
             match Self::initialize_single_modem_safe(
@@ -509,7 +332,6 @@ impl ModemManager {
             )),
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
-            invalid_ports: RwLock::new(HashSet::new()),
             unavailable_port_tasks: RwLock::new(HashMap::new()),
             devices: config.devices.clone(),
             force_uk_mcc_to_46001: config.settings.force_uk_mcc_to_46001.unwrap_or(true),
@@ -711,45 +533,24 @@ impl ModemManager {
             probe_futs.push(async move {
                 let _permit = sem.acquire().await;
                 let present = Modem::quick_probe_port(&port, baud_rate).await;
-                let apready_probe = if present {
-                    Modem::quick_probe_apready_port(&port, baud_rate).await
-                } else {
-                    ApreadyProbeResult::Unavailable
-                };
-                (index, port, baud_rate, present, apready_probe)
+                (index, port, baud_rate, present)
             });
         }
 
         let mut probe_results = Vec::new();
-        while let Some((index, port, baud_rate, present, apready_probe)) = probe_futs.next().await {
-            probe_results.push((index, port, baud_rate, present, apready_probe));
-        }
-
-        let invalid_ports_set: HashSet<String> = probe_results
-            .iter()
-            .filter_map(|(_, port, _, present, apready_probe)| match (*present, apready_probe) {
-                (true, ApreadyProbeResult::Invalid) => Some(port.clone()),
-                _ => None,
-            })
-            .collect();
-        {
-            let mut invalid = self.invalid_ports.write().await;
-            *invalid = invalid_ports_set;
+        while let Some((index, port, baud_rate, present)) = probe_futs.next().await {
+            probe_results.push((index, port, baud_rate, present));
         }
 
         let probed_present: Vec<usize> = probe_results
             .iter()
-            .filter(|(_, _, _, present, apready_probe)| {
-                *present && !matches!(apready_probe, ApreadyProbeResult::Invalid)
-            })
-            .map(|(index, _, _, _, _)| *index)
+            .filter(|(_, _, _, present)| *present)
+            .map(|(index, _, _, _)| *index)
             .collect();
         let probed_absent: Vec<usize> = probe_results
             .iter()
-            .filter(|(_, _, _, present, apready_probe)| {
-                !(*present && !matches!(apready_probe, ApreadyProbeResult::Invalid))
-            })
-            .map(|(index, _, _, _, _)| *index)
+            .filter(|(_, _, _, present)| !present)
+            .map(|(index, _, _, _)| *index)
             .collect();
 
         info!(
@@ -1090,22 +891,13 @@ impl ModemManager {
         sim_id: &str,
         contact: &Contact,
         message: &str,
-        mode: SmsSendMode,
-        status_report_enabled: bool,
-    ) -> anyhow::Result<SmsSendOutcome> {
+    ) -> anyhow::Result<(i64, String)> {
         let modem = self
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        match mode {
-            SmsSendMode::Pdu => modem
-                .send_sms_pdu(contact, message, status_report_enabled)
-                .await,
-            SmsSendMode::Text => modem
-                .send_sms_text(contact, message, status_report_enabled)
-                .await,
-        }
+        modem.send_sms_pdu(contact, message).await
     }
 
     pub async fn read_sms(&self, sim_id: &str, sms_type: SmsType) -> anyhow::Result<Vec<ModemSMS>> {
@@ -1215,11 +1007,6 @@ impl ModemManager {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
-            status_report_requested: false,
-            submit_ref: None,
-            delivery_status: None,
-            delivered_at: None,
-            delivery_report_raw: None,
         }))
     }
 
@@ -1887,10 +1674,6 @@ impl ModemManager {
         self.get_sim_card_cached(&sim_id).await
     }
 
-    pub async fn is_invalid_port(&self, com_port: &str) -> bool {
-        self.invalid_ports.read().await.contains(com_port)
-    }
-
     pub async fn update_sim_cache(&self, sim_card: SimCard) {
         let mut cache = self.sim_cards_cache.write().await;
         cache.insert(sim_card.id.clone(), sim_card);
@@ -2177,8 +1960,6 @@ impl ModemManager {
         let mut call_answered = false;
         // Oneshot sender to cancel the 30-second recording timer. Some = recording active.
         let mut recording_cancel_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
-        // +CDS URC in PDU mode comes as two lines: header then PDU hex payload.
-        let mut pending_cds_header: Option<String> = None;
 
         info!("[URC {}] handler started", sim_id);
 
@@ -2193,91 +1974,6 @@ impl ModemManager {
 
             let line = line.trim().to_string();
             if line.is_empty() {
-                continue;
-            }
-
-            if line.starts_with("+CDSI:") {
-                info!(
-                    "[URC {}] Received +CDSI notification, reading indexed status slot: {}",
-                    sim_id, line
-                );
-                match Self::handle_cdsi_notification(&sim_id, &modem, &sse, &line).await {
-                    Ok(true) => continue,
-                    Ok(false) => {
-                        if let Err(e) = modem
-                            .read_sms_async_insert(SmsType::All, sse.clone(), None)
-                            .await
-                        {
-                            error!(
-                                "[URC {}] Failed to process +CDSI fallback read: {}",
-                                sim_id, e
-                            );
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        error!(
-                            "[URC {}] Failed to process +CDSI indexed read: {}",
-                            sim_id, e
-                        );
-                        if let Err(e2) = modem
-                            .read_sms_async_insert(SmsType::All, sse.clone(), None)
-                            .await
-                        {
-                            error!(
-                                "[URC {}] Failed to process +CDSI fallback read after indexed error: {}",
-                                sim_id, e2
-                            );
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if let Some(cds_header) = pending_cds_header.take() {
-                if line.chars().all(|c| c.is_ascii_hexdigit()) {
-                    let cds_payload = format!("{}\n{}", cds_header, line);
-                    let reports = parse_status_report_pdus(&cds_payload);
-                    Self::apply_status_reports_from_payload(&sim_id, &sse, reports, "+CDS")
-                        .await;
-                    continue;
-                }
-            }
-
-            if line.starts_with("+CDS:") {
-                if let Some((submit_ref, tp_status)) = Self::parse_cds_text_urc(&line) {
-                    match Sms::apply_status_report_by_submit_ref(&sim_id, submit_ref, tp_status, &line)
-                        .await
-                    {
-                        Ok(affected) if affected > 0 => {
-                            info!(
-                                "[URC {}] Applied text +CDS status report: MR={}, TP-ST=0x{:02X}, rows={}",
-                                sim_id, submit_ref, tp_status, affected
-                            );
-                            match crate::db::Conversation::query_all().await {
-                                Ok(conversations) => sse.send(conversations),
-                                Err(e) => error!(
-                                    "[URC {}] Failed to refresh conversations after text +CDS: {}",
-                                    sim_id, e
-                                ),
-                            }
-                        }
-                        Ok(_) => {
-                            info!(
-                                "[URC {}] Ignored text +CDS status report (no pending row): MR={}, TP-ST=0x{:02X}",
-                                sim_id, submit_ref, tp_status
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                "[URC {}] Failed to apply text +CDS status report MR={}: {}",
-                                sim_id, submit_ref, e
-                            );
-                        }
-                    }
-                    continue;
-                }
-                pending_cds_header = Some(line);
                 continue;
             }
 

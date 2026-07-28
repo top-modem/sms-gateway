@@ -2537,6 +2537,13 @@ fn normalize_phone_for_match(raw: &str) -> String {
         .to_string()
 }
 
+fn phone_match_loose(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.ends_with(b) || b.ends_with(a)
+}
+
 fn com_port_sort_key(port: &str) -> u32 {
     port.trim_start_matches(|c: char| !c.is_ascii_digit())
         .parse::<u32>()
@@ -2561,6 +2568,7 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
     }
 
     let mut wait_count_by_phone: HashMap<String, i64> = HashMap::new();
+    let mut wait_count_by_sim: HashMap<String, i64> = HashMap::new();
     if let Ok(Some(api_key)) = AppSetting::get("firefox_api_key").await {
         if !api_key.trim().is_empty() {
             if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
@@ -2580,6 +2588,10 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
                                 continue;
                             }
                             *wait_count_by_phone.entry(key).or_insert(0) += 1;
+
+                            if let Some(sim_id) = modem_manager.find_sim_id_by_phone_number(phone).await {
+                                *wait_count_by_sim.entry(sim_id).or_insert(0) += 1;
+                            }
                         }
                     }
                 }
@@ -2641,11 +2653,23 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
             .and_then(|id| aggregate_by_sim.get(id));
 
         let normalized_phone = normalize_phone_for_match(&phone_number);
-        let waiting_sms_count = if normalized_phone.is_empty() {
+        let waiting_by_sim = sim_id
+            .as_ref()
+            .and_then(|id| wait_count_by_sim.get(id))
+            .copied()
+            .unwrap_or(0);
+
+        let waiting_by_phone = if normalized_phone.is_empty() {
             0
         } else {
-            *wait_count_by_phone.get(&normalized_phone).unwrap_or(&0)
+            wait_count_by_phone
+                .iter()
+                .filter(|(k, _)| phone_match_loose(k, &normalized_phone))
+                .map(|(_, v)| *v)
+                .sum::<i64>()
         };
+
+        let waiting_sms_count = waiting_by_sim.max(waiting_by_phone);
 
         let earning_item_names = agg
             .and_then(|a| a.earning_item_names.clone())

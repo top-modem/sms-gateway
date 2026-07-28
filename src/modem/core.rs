@@ -1117,10 +1117,43 @@ impl Modem {
         } else {
             match SimCard::query_all().await {
                 Ok(cards) => {
-                    if let Some(card) = cards.iter().find(|c| c.id == sim_id) {
-                        if let (Some(country_id), Some(phone_num)) =
-                            (&card.country_code, &card.phone_number)
-                        {
+                    if let Some(mut card) = cards.into_iter().find(|c| c.id == sim_id) {
+                        if let Some(phone_num) = card.phone_number.clone().filter(|p| !p.trim().is_empty()) {
+                            let mut country_id = card.country_code.clone().filter(|c| !c.trim().is_empty());
+
+                            if country_id.is_none() {
+                                match crate::db::FirefoxPlatformItem::find_latest_country_for_phone(&phone_num).await {
+                                    Ok(resolved_country_id) => {
+                                        if let Some(resolved_country_id) = resolved_country_id.filter(|c| !c.trim().is_empty()) {
+                                            log::info!(
+                                                "[{}] Backfilled SIM country_code from latest platform item for phone {}: {}",
+                                                sim_id,
+                                                phone_num,
+                                                resolved_country_id
+                                            );
+                                            if let Err(e) = card.update_country_code(Some(resolved_country_id.clone())).await {
+                                                log::warn!(
+                                                    "[{}] Failed to persist backfilled country_code for phone {}: {}",
+                                                    sim_id,
+                                                    phone_num,
+                                                    e
+                                                );
+                                            }
+                                            country_id = Some(resolved_country_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[{}] Failed to resolve latest country_id for phone {}: {}",
+                                            sim_id,
+                                            phone_num,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            if let Some(country_id) = country_id {
                             match crate::db::AppSetting::get("firefox_api_key").await {
                                 Ok(Some(api_key)) => {
                                     match reqwest::Client::builder()
@@ -1190,7 +1223,7 @@ impl Modem {
                                                 }
                                             };
 
-                                            let latest_item_id = match crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
+                                            let latest_item_id = match crate::db::FirefoxPlatformItem::find_latest_item_for_phone(&phone_num).await {
                                                 Ok(v) => v,
                                                 Err(e) => {
                                                     log::warn!(
@@ -1245,8 +1278,8 @@ impl Modem {
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,
-                                                    country_id,
-                                                    phone_num,
+                                                    &country_id,
+                                                    &phone_num,
                                                     &upload_content,
                                                 )
                                                 .await
@@ -1263,7 +1296,7 @@ impl Modem {
                                                         let response_json =
                                                             serde_json::to_string(&resp).ok();
                                                         if let Err(e) = crate::db::Sms::mark_uploaded_by_phone_message(
-                                                            phone_num,
+                                                            &phone_num,
                                                             &sim_id,
                                                             &[sms.message.clone()],
                                                             response_json,
@@ -1290,7 +1323,7 @@ impl Modem {
                                                         let response_json =
                                                             serde_json::to_string(&resp).ok();
                                                         if let Err(e) = crate::db::Sms::mark_platform_attempt_by_phone_message(
-                                                            phone_num,
+                                                            &phone_num,
                                                             &sim_id,
                                                             &[sms.message.clone()],
                                                             None,
@@ -1372,7 +1405,7 @@ impl Modem {
                                                         let error_message =
                                                             format!("Auto-upload failed: {}", e);
                                                         if let Err(mark_err) = crate::db::Sms::mark_platform_attempt_by_phone_message(
-                                                            phone_num,
+                                                            &phone_num,
                                                             &sim_id,
                                                             &[sms.message.clone()],
                                                             None,
@@ -1510,6 +1543,12 @@ impl Modem {
                                         e
                                     );
                                 }
+                            }
+                            } else {
+                                log::warn!(
+                                    "[{}] Skipping 火狐狸 SMS upload: SIM card missing country_code and no latest platform country mapping found",
+                                    sim_id
+                                );
                             }
                         } else {
                             log::warn!(

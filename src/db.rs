@@ -1313,6 +1313,19 @@ impl FirefoxPlatformItem {
         Ok(result.map(|r| r.0))
     }
 
+    pub async fn find_latest_country_for_phone(phone_num: &str) -> Result<Option<String>> {
+        let pool = get_pool()?;
+        let result: Option<(String,)> = sqlx::query_as(
+            "SELECT country_id FROM firefox_platform_items \
+             WHERE phone_num = ? AND TRIM(country_id) <> '' \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(phone_num)
+        .fetch_optional(pool)
+        .await?;
+        Ok(result.map(|r| r.0))
+    }
+
     pub async fn query_statistics() -> Result<Vec<PlatformItemStat>> {
         let pool = get_pool()?;
         let stats = sqlx::query_as::<_, PlatformItemStat>(

@@ -14,31 +14,6 @@ use uuid::Uuid;
 const MAX_BATCH_SIZE: usize = 500;
 
 static POOL: OnceLock<SqlitePool> = OnceLock::new();
-static CACHED_STATUS_REPORTS: OnceLock<std::sync::Mutex<HashMap<(String, u8), (u8, String)>>> =
-    OnceLock::new();
-
-fn cached_status_reports() -> &'static std::sync::Mutex<HashMap<(String, u8), (u8, String)>> {
-    CACHED_STATUS_REPORTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-fn cache_status_report(sim_id: &str, submit_ref: u8, tp_status: u8, raw_report: &str) {
-    if let Ok(mut map) = cached_status_reports().lock() {
-        if map.len() > 2048 {
-            map.clear();
-        }
-        map.insert(
-            (sim_id.to_string(), submit_ref),
-            (tp_status, raw_report.to_string()),
-        );
-    }
-}
-
-fn take_cached_status_report(sim_id: &str, submit_ref: u8) -> Option<(u8, String)> {
-    cached_status_reports()
-        .lock()
-        .ok()
-        .and_then(|mut map| map.remove(&(sim_id.to_string(), submit_ref)))
-}
 
 /// Represents a single SMS message
 #[derive(Debug, FromRow, Deserialize, Serialize, Default)]
@@ -54,11 +29,6 @@ pub struct Sms {
     pub platform_item_id: Option<String>,
     pub platform_uploaded_at: Option<NaiveDateTime>,
     pub platform_response: Option<String>,
-    pub status_report_requested: bool,
-    pub submit_ref: Option<i64>,
-    pub delivery_status: Option<i64>,
-    pub delivered_at: Option<NaiveDateTime>,
-    pub delivery_report_raw: Option<String>,
 }
 
 /// SMS row with contact name resolved — used for inbox/sent list view.
@@ -72,10 +42,6 @@ pub struct SmsRow {
     pub sim_id: String,
     pub send: bool,
     pub status: SmsStatus,
-    pub status_report_requested: bool,
-    pub submit_ref: Option<i64>,
-    pub delivery_status: Option<i64>,
-    pub delivered_at: Option<NaiveDateTime>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, sqlx::Type, Default)]
@@ -363,8 +329,7 @@ impl Sms {
         let sms_list = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
-                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
@@ -395,8 +360,7 @@ impl Sms {
         let sms_list = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
-                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
             WHERE contact_id = ?
             ORDER BY timestamp DESC, id DESC
@@ -447,8 +411,7 @@ impl Sms {
             r#"
             SELECT s.id, s.contact_id,
                    COALESCE(c.name, s.contact_id) AS contact_name,
-                     s.timestamp, s.message, s.sim_id, s.send, s.status,
-                     s.status_report_requested, s.submit_ref, s.delivery_status, s.delivered_at
+                   s.timestamp, s.message, s.sim_id, s.send, s.status
             FROM sms s
             LEFT JOIN contacts c ON s.contact_id = c.id
             WHERE s.send = ?
@@ -500,8 +463,7 @@ impl Sms {
         let sms_list = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
-                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
             WHERE contact_id = ? AND status = ?
             ORDER BY timestamp DESC
@@ -533,8 +495,7 @@ impl Sms {
         let sms = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
-                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms
             WHERE sim_id = ? AND send = 0
             ORDER BY timestamp DESC, id DESC
@@ -601,113 +562,6 @@ impl Sms {
         .await?;
 
         Ok(())
-    }
-
-    /// Mark an outgoing SMS row as requesting network status reports.
-    /// `submit_ref` is the TP-Message-Reference parsed from +CMGS/+QCMGS when available.
-    pub async fn mark_status_report_requested(id: i64, submit_ref: Option<u8>) -> Result<()> {
-        let pool = get_pool()?;
-        sqlx::query(
-            r#"
-            UPDATE sms
-            SET status_report_requested = 1,
-                submit_ref = ?,
-                delivery_status = 0,
-                status = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(submit_ref.map(|v| v as i64))
-        .bind(SmsStatus::Read as i32)
-        .bind(id)
-        .execute(pool)
-        .await?;
-
-        if let Some(submit_ref) = submit_ref {
-            if let Some((tp_status, raw_report)) = take_cached_status_report(
-                &sqlx::query_scalar::<_, String>("SELECT sim_id FROM sms WHERE id = ?")
-                    .bind(id)
-                    .fetch_one(pool)
-                    .await?,
-                submit_ref,
-            ) {
-                let delivery_status = if tp_status == 0x00 { 1_i32 } else { 2_i32 };
-                sqlx::query(
-                    r#"
-                    UPDATE sms
-                    SET delivery_status = ?,
-                        delivered_at = datetime('now'),
-                        delivery_report_raw = ?,
-                        status = ?
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(delivery_status)
-                .bind(raw_report)
-                .bind(if tp_status == 0x00 {
-                    SmsStatus::Read as i32
-                } else {
-                    SmsStatus::Failed as i32
-                })
-                .bind(id)
-                .execute(pool)
-                .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Apply an SMS-STATUS-REPORT (`+CDS`) by submit reference.
-    /// Delivery status convention:
-    /// 0 = pending, 1 = delivered (TP-ST=0x00), 2 = failed/other.
-    pub async fn apply_status_report_by_submit_ref(
-        sim_id: &str,
-        submit_ref: u8,
-        tp_status: u8,
-        raw_report: &str,
-    ) -> Result<u64> {
-        let pool = get_pool()?;
-        let delivery_status = if tp_status == 0x00 { 1_i32 } else { 2_i32 };
-
-        let result = sqlx::query(
-            r#"
-            UPDATE sms
-            SET delivery_status = ?,
-                delivered_at = datetime('now'),
-                delivery_report_raw = ?,
-                status = ?,
-                submit_ref = ?
-            WHERE id = (
-                SELECT id
-                FROM sms
-                WHERE sim_id = ?
-                  AND send = 1
-                  AND status_report_requested = 1
-                  AND submit_ref = ?
-                ORDER BY timestamp DESC, id DESC
-                LIMIT 1
-            )
-            "#,
-        )
-        .bind(delivery_status)
-        .bind(raw_report)
-        .bind(if tp_status == 0x00 {
-            SmsStatus::Read as i32
-        } else {
-            SmsStatus::Failed as i32
-        })
-        .bind(submit_ref as i64)
-        .bind(sim_id)
-        .bind(submit_ref as i64)
-        .execute(pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            cache_status_report(sim_id, submit_ref, tp_status, raw_report);
-        }
-
-        Ok(result.rows_affected())
     }
 
     fn resolve_platform_item_id(
@@ -803,8 +657,7 @@ impl Sms {
         let sms_records = sqlx::query_as(
             r#"
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
-                     uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response,
-                     status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw
+                   uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms
             WHERE sim_id = ? AND send = 0 AND uploaded_to_platform = 0
             ORDER BY timestamp DESC
@@ -876,143 +729,6 @@ impl Sms {
 }
 
 impl Contact {
-    fn normalized_phone_identity(raw: &str) -> Option<String> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        if !trimmed
-            .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'))
-        {
-            return None;
-        }
-
-        let digits = crate::phone_number::normalize_msisdn(trimmed);
-        if digits.len() < 7 {
-            return None;
-        }
-
-        if digits.len() == 13 && digits.starts_with("86") && digits[2..].starts_with('1') {
-            return Some(digits[2..].to_string());
-        }
-
-        Some(digits)
-    }
-
-    fn phone_identity_matches(name: &str, normalized: &str) -> bool {
-        Self::normalized_phone_identity(name)
-            .as_deref()
-            .is_some_and(|candidate| candidate == normalized)
-    }
-
-    fn canonical_contact_rank(name: &str) -> (u8, usize) {
-        let trimmed = name.trim();
-        let rank = if trimmed.starts_with('+') {
-            0
-        } else if trimmed.starts_with("86") {
-            1
-        } else {
-            2
-        };
-        (rank, usize::MAX - trimmed.len())
-    }
-
-    async fn merge_equivalent_phone_contacts_for_name(
-        transaction: &mut Transaction<'_, Sqlite>,
-        raw_name: &str,
-    ) -> Result<Option<String>> {
-        let normalized = match Self::normalized_phone_identity(raw_name) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        let contacts: Vec<Contact> = sqlx::query_as("SELECT id, name FROM contacts")
-            .fetch_all(&mut **transaction)
-            .await?;
-
-        let mut matching: Vec<Contact> = contacts
-            .into_iter()
-            .filter(|contact| Self::phone_identity_matches(&contact.name, &normalized))
-            .collect();
-
-        if matching.is_empty() {
-            return Ok(None);
-        }
-
-        matching.sort_by_key(|contact| Self::canonical_contact_rank(&contact.name));
-        let canonical = matching.remove(0);
-
-        for duplicate in matching {
-            sqlx::query("UPDATE sms SET contact_id = ? WHERE contact_id = ?")
-                .bind(&canonical.id)
-                .bind(&duplicate.id)
-                .execute(&mut **transaction)
-                .await?;
-
-            sqlx::query("DELETE FROM contacts WHERE id = ?")
-                .bind(&duplicate.id)
-                .execute(&mut **transaction)
-                .await?;
-        }
-
-        Ok(Some(canonical.id))
-    }
-
-    pub async fn merge_all_equivalent_phone_contacts() -> Result<()> {
-        let pool = get_pool()?;
-        let contacts: Vec<Contact> = sqlx::query_as("SELECT id, name FROM contacts")
-            .fetch_all(pool)
-            .await?;
-
-        let mut normalized_names = HashSet::new();
-        for contact in &contacts {
-            if let Some(normalized) = Self::normalized_phone_identity(&contact.name) {
-                normalized_names.insert(normalized);
-            }
-        }
-
-        if normalized_names.is_empty() {
-            return Ok(());
-        }
-
-        let mut transaction = pool.begin().await?;
-        for normalized in normalized_names {
-            let contacts: Vec<Contact> = sqlx::query_as("SELECT id, name FROM contacts")
-                .fetch_all(&mut *transaction)
-                .await?;
-
-            let mut matching: Vec<Contact> = contacts
-                .into_iter()
-                .filter(|contact| Self::phone_identity_matches(&contact.name, &normalized))
-                .collect();
-
-            if matching.len() <= 1 {
-                continue;
-            }
-
-            matching.sort_by_key(|contact| Self::canonical_contact_rank(&contact.name));
-            let canonical = matching.remove(0);
-
-            for duplicate in matching {
-                sqlx::query("UPDATE sms SET contact_id = ? WHERE contact_id = ?")
-                    .bind(&canonical.id)
-                    .bind(&duplicate.id)
-                    .execute(&mut *transaction)
-                    .await?;
-
-                sqlx::query("DELETE FROM contacts WHERE id = ?")
-                    .bind(&duplicate.id)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-        }
-
-        transaction.commit().await?;
-        Ok(())
-    }
-
     pub async fn query_all() -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let contacts = sqlx::query_as("SELECT id, name FROM contacts")
@@ -1048,26 +764,17 @@ impl Contact {
     pub async fn find_or_create(&mut self) -> Result<()> {
         let pool = get_pool()?;
 
-        let mut transaction = pool.begin().await?;
-
-        if let Some(id) = Self::merge_equivalent_phone_contacts_for_name(&mut transaction, &self.name).await? {
-            self.id = id;
-            transaction.commit().await?;
-            return Ok(());
-        }
-
         let existing_id = sqlx::query_scalar::<_, Option<String>>(
             r#"
             SELECT id FROM contacts WHERE name = ?
             "#,
         )
         .bind(&self.name)
-        .fetch_one(&mut *transaction)
+        .fetch_one(pool)
         .await;
 
         if let Ok(Some(id)) = existing_id {
             self.id = id;
-            transaction.commit().await?;
             return Ok(());
         }
 
@@ -1078,10 +785,8 @@ impl Contact {
         )
         .bind(&self.id)
         .bind(&self.name)
-        .execute(&mut *transaction)
+        .execute(pool)
         .await?;
-
-        transaction.commit().await?;
 
         Ok(())
     }
@@ -1481,8 +1186,7 @@ impl Sms {
         let sms_list = if let Some(sim_id) = sim_id {
             sqlx::query_as(
                 "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-                  uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response, \
-                  status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw \
+                 uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
                  FROM sms WHERE platform_item_id = ? AND sim_id = ? ORDER BY platform_uploaded_at DESC, id DESC",
             )
             .bind(item_id)
@@ -1492,8 +1196,7 @@ impl Sms {
         } else {
             sqlx::query_as(
                 "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-                  uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response, \
-                  status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw \
+                 uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
                  FROM sms WHERE platform_item_id = ? ORDER BY platform_uploaded_at DESC, id DESC",
             )
             .bind(item_id)
@@ -1508,8 +1211,7 @@ impl Sms {
         let pool = get_pool()?;
         let sms = sqlx::query_as(
             "SELECT id, contact_id, timestamp, message, sim_id, send, status, \
-               uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response, \
-               status_report_requested, submit_ref, delivery_status, delivered_at, delivery_report_raw \
+             uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response \
              FROM sms WHERE sim_id = ? AND message = ? AND send = 0 \
              ORDER BY timestamp DESC LIMIT 1",
         )
@@ -1638,133 +1340,33 @@ impl FirefoxPlatformItem {
         .await?;
         Ok(stats)
     }
-
-    pub async fn upsert_item_name(item_id: &str, item_name: &str) -> Result<()> {
-        let normalized = item_name.trim();
-        if normalized.is_empty() {
-            return Ok(());
-        }
-
-        let pool = get_pool()?;
-        sqlx::query(
-            "INSERT INTO firefox_item_names (item_id, item_name) \
-             VALUES (?, ?) \
-             ON CONFLICT(item_id) DO UPDATE SET item_name = excluded.item_name",
-        )
-        .bind(item_id)
-        .bind(normalized)
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-}
-
-fn extract_primary_item_keyword(item_name: &str) -> Option<String> {
-    // Keep only the first concise keyword segment, e.g. "Facebook(脸书)" -> "Facebook".
-    let primary = item_name
-        .split(['/', '(', '（', '|', ',', ';'])
-        .next()
-        .unwrap_or("")
-        .trim();
-
-    if primary.is_empty() {
-        return None;
-    }
-
-    let cleaned = primary
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-        .trim();
-
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned.to_string())
-    }
 }
 
 /// Build the SMS content to upload to the platform.
 /// If the raw message does not already contain the item name keyword,
 /// prefix it with `[Item_Name] ` so the platform accepts it.
 pub async fn build_upload_sms_content(item_id: &str, raw_content: &str) -> Result<String> {
-    let item_name: Option<String> = match get_pool() {
-        Ok(pool) => {
-            match sqlx::query_scalar::<_, Option<String>>(
-                "SELECT item_name FROM firefox_item_names WHERE item_id = ?",
-            )
+    let pool = get_pool()?;
+    let item_name: Option<String> =
+        sqlx::query_scalar("SELECT item_name FROM firefox_item_names WHERE item_id = ?")
             .bind(item_id)
             .fetch_optional(pool)
-            .await
-            {
-                Ok(value) => value.flatten(),
-                Err(e) => {
-                    log::warn!(
-                        "[Upload SMS] Failed to query item_name for item_id={}: {}",
-                        item_id,
-                        e
-                    );
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!(
-                "[Upload SMS] Failed to get DB pool when resolving item_name for item_id={}: {}",
-                item_id,
-                e
-            );
-            None
-        }
+            .await?;
+
+    let Some(item_name) = item_name else {
+        return Ok(raw_content.to_string());
     };
 
     let raw_lower = raw_content.to_ascii_lowercase();
-    let item_id_lower = item_id.to_ascii_lowercase();
-    if raw_lower.contains(&item_id_lower) {
-        log::debug!(
-            "[Upload SMS] Content already contains item_id, no prefix needed: item_id={}, content={:?}",
-            item_id,
-            raw_content
-        );
+    let name_lower = item_name.to_ascii_lowercase();
+    if raw_lower.contains(&name_lower) {
         return Ok(raw_content.to_string());
     }
 
-    let mut keyword: Option<String> = None;
-    if let Some(name) = item_name.as_deref() {
-        let name_lower = name.to_ascii_lowercase();
-        if raw_lower.contains(&name_lower) {
-            log::debug!(
-                "[Upload SMS] Content already contains full item_name, no prefix needed: item_id={}, item_name={:?}",
-                item_id,
-                item_name
-            );
-            return Ok(raw_content.to_string());
-        }
-
-        if let Some(primary) = extract_primary_item_keyword(name) {
-            if raw_lower.contains(&primary.to_ascii_lowercase()) {
-                log::debug!(
-                    "[Upload SMS] Content already contains primary keyword, no prefix needed: item_id={}, keyword={}",
-                    item_id,
-                    primary
-                );
-                return Ok(raw_content.to_string());
-            }
-            keyword = Some(primary);
-        } else {
-            keyword = Some(name.to_string());
-        }
-    }
-
-    let prefix = match keyword {
-        Some(k) => format!("{} {}", item_id, k),
-        None => item_id.to_string(),
-    };
-    let prefixed = format!("{} {}", prefix, raw_content);
+    let prefixed = format!("[{}] {}", item_name, raw_content);
     log::info!(
-        "[Upload SMS] Prefixed metadata to SMS content: item_id={}, item_name={:?}, original={:?}, prefixed={:?}",
-        item_id,
-        item_name,
-        raw_content,
-        prefixed
+        "[Upload SMS] Prefixed item name to SMS content: item_id={}, item_name={}, original={:?}, prefixed={:?}",
+        item_id, item_name, raw_content, prefixed
     );
     Ok(prefixed)
 }
@@ -1894,6 +1496,120 @@ pub struct PlatformItemStat {
 }
 
 #[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct FirefoxMoneyStat {
+    pub sim_id: String,
+    pub phone_number: Option<String>,
+    pub received_sms_count: i64,
+    pub successful_uploaded_sms_count: i64,
+    pub failed_sms_count: i64,
+    pub money_earning: f64,
+    pub earning_item_names: Option<String>,
+}
+
+impl FirefoxMoneyStat {
+    pub async fn query_all_by_sim() -> Result<Vec<Self>> {
+        let pool = get_pool()?;
+        let rows = sqlx::query_as::<_, FirefoxMoneyStat>(
+            r#"
+            SELECT
+                s.sim_id AS sim_id,
+                MAX(sc.phone_number) AS phone_number,
+                SUM(CASE WHEN s.send = 0 THEN 1 ELSE 0 END) AS received_sms_count,
+                SUM(CASE WHEN s.send = 0 AND s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1 THEN 1 ELSE 0 END) AS successful_uploaded_sms_count,
+                SUM(CASE WHEN s.send = 0 AND s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 0 THEN 1 ELSE 0 END) AS failed_sms_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN s.send = 0 AND s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1
+                                THEN COALESCE(fp.item_uprice, 0.0)
+                            ELSE 0.0
+                        END
+                    ),
+                    0.0
+                ) AS money_earning,
+                GROUP_CONCAT(
+                    DISTINCT CASE
+                        WHEN s.send = 0 AND s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1
+                            THEN COALESCE(fin.item_name, s.platform_item_id)
+                    END
+                ) AS earning_item_names
+            FROM sms s
+            LEFT JOIN sim_cards sc
+                ON sc.id = s.sim_id
+            LEFT JOIN (
+                SELECT item_id, MAX(item_uprice) AS item_uprice
+                FROM firefox_item_prices
+                GROUP BY item_id
+            ) fp
+                ON fp.item_id = s.platform_item_id
+            LEFT JOIN firefox_item_names fin
+                ON fin.item_id = s.platform_item_id
+            GROUP BY s.sim_id
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct FirefoxItemPriceUpsert {
+    pub item_id: String,
+    pub country_id: Option<String>,
+    pub item_name: String,
+    pub item_uprice: f64,
+    pub country_title: Option<String>,
+}
+
+pub async fn upsert_firefox_item_prices(items: &[FirefoxItemPriceUpsert]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let pool = get_pool()?;
+    let mut tx = pool.begin().await?;
+
+    for item in items {
+        sqlx::query(
+            r#"
+            INSERT INTO firefox_item_prices (item_id, country_id, item_name, item_uprice, country_title, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(item_id, country_id)
+            DO UPDATE SET
+                item_name = excluded.item_name,
+                item_uprice = excluded.item_uprice,
+                country_title = excluded.country_title,
+                updated_at = datetime('now')
+            "#,
+        )
+        .bind(&item.item_id)
+        .bind(item.country_id.as_deref())
+        .bind(&item.item_name)
+        .bind(item.item_uprice)
+        .bind(item.country_title.as_deref())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO firefox_item_names (item_id, item_name)
+            VALUES (?, ?)
+            ON CONFLICT(item_id)
+            DO UPDATE SET item_name = excluded.item_name
+            "#,
+        )
+        .bind(&item.item_id)
+        .bind(&item.item_name)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
 pub struct AppSetting {
     pub key: String,
     pub value: Option<String>,
@@ -1928,7 +1644,6 @@ impl AppSetting {
 
 impl Conversation {
     pub async fn query_all() -> Result<Vec<Self>> {
-        Contact::merge_all_equivalent_phone_contacts().await?;
         let pool = get_pool()?;
 
         let conversations = sqlx::query_as(
@@ -1953,7 +1668,6 @@ impl Conversation {
         Ok(conversations)
     }
     pub async fn query_by_contact_ids(contact_ids: &[String]) -> Result<Vec<Self>> {
-        Contact::merge_all_equivalent_phone_contacts().await?;
         let pool = get_pool()?;
 
         if contact_ids.is_empty() {
@@ -2006,10 +1720,6 @@ impl ModemSMS {
         &self,
         transaction: &'a mut Transaction<'_, Sqlite>,
     ) -> Result<String> {
-        if let Some(contact_id) = Contact::merge_equivalent_phone_contacts_for_name(transaction, &self.contact).await? {
-            return Ok(contact_id);
-        }
-
         let contact_id = sqlx::query_scalar::<_, String>(
             r#"
             SELECT id FROM contacts WHERE name = ?
@@ -2084,10 +1794,6 @@ impl ModemSMS {
         let pool = get_pool()?;
 
         let mut transaction = pool.begin().await?;
-
-        for record in records {
-            let _ = Contact::merge_equivalent_phone_contacts_for_name(&mut transaction, &record.contact).await?;
-        }
 
         let mut contact_names = HashSet::new();
         for record in records {
@@ -2502,40 +2208,13 @@ impl MmsInboxNotification {
             r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
                       message_class, expiry_at, status, error_message, retry_count, next_retry_at,
                       subject, from_address, fetched_at, notification_raw, created_at, updated_at
-               FROM mms_inbox
-                             WHERE NOT (
-                                 transaction_id LIKE 'undecoded-%'
-                                 AND EXISTS (
-                                     SELECT 1
-                                     FROM mms_inbox d
-                                     WHERE d.sim_id = mms_inbox.sim_id
-                                         AND d.sender = mms_inbox.sender
-                                         AND d.transaction_id NOT LIKE 'undecoded-%'
-                                         AND ABS(strftime('%s', d.created_at) - strftime('%s', mms_inbox.created_at)) <= 300
-                                 )
-                             )
-               ORDER BY created_at DESC
-               LIMIT ? OFFSET ?"#,
+               FROM mms_inbox ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
         .await?;
-        let total: i64 = sqlx::query_scalar(
-                        r#"SELECT COUNT(*)
-                             FROM mms_inbox
-                             WHERE NOT (
-                                 transaction_id LIKE 'undecoded-%'
-                                 AND EXISTS (
-                                     SELECT 1
-                                     FROM mms_inbox d
-                                     WHERE d.sim_id = mms_inbox.sim_id
-                                         AND d.sender = mms_inbox.sender
-                                         AND d.transaction_id NOT LIKE 'undecoded-%'
-                                         AND ABS(strftime('%s', d.created_at) - strftime('%s', mms_inbox.created_at)) <= 300
-                                 )
-                             )"#,
-        )
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mms_inbox")
             .fetch_one(pool)
             .await?;
         Ok((items, total))

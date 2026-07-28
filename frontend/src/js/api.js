@@ -321,6 +321,13 @@ class ApiClient {
     }
 
     /**
+     * Get money-page statistics grouped by COM port / SIM.
+     */
+    async getFirefoxMoneyStats() {
+        return FetchApi.get('/api/firefox/money-stats');
+    }
+
+    /**
      * Get grouped platform rejection reasons from failed SMS attempts.
      */
     async getFirefoxPlatformRejectionReasons() {

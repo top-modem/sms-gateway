@@ -1,8 +1,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::{path::PathBuf, sync::Arc};
-
-use chrono::{Days, Local, Months, NaiveDate};
+use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 
 use api::SseManager;
 use db::db_init;
@@ -53,18 +52,6 @@ async fn main() {
         return;
     }
 
-    if is_software_expired() {
-        #[cfg(target_os = "windows")]
-        {
-            show_windows_error_dialog("你的软件已过期，请联系作者");
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            eprintln!("你的软件已过期，请联系作者");
-        }
-        std::process::exit(1);
-    }
-
     #[cfg(target_os = "windows")]
     {
         if param.no_tray {
@@ -83,9 +70,9 @@ async fn main() {
             Ok(joined) => {
                 // Backend exited quickly: treat as startup failure and show clear error.
                 let err_text = match joined {
-                    Ok(Ok(())) => "小牛智卡意外退出。".to_string(),
+                    Ok(Ok(())) => "SMS Gateway exited unexpectedly.".to_string(),
                     Ok(Err(err)) => format_startup_error_message(&err.to_string()),
-                    Err(join_err) => format!("小牛智卡启动任务失败: {}", join_err),
+                    Err(join_err) => format!("SMS Gateway startup task failed: {}", join_err),
                 };
                 show_windows_error_dialog(&err_text);
                 eprintln!("Error: {}", err_text);
@@ -104,7 +91,7 @@ async fn main() {
                         eprintln!("Error: {}", err_text);
                     }
                     Err(join_err) => {
-                        let err_text = format!("小牛智卡运行任务失败: {}", join_err);
+                        let err_text = format!("SMS Gateway runtime task failed: {}", join_err);
                         show_windows_error_dialog(&err_text);
                         eprintln!("Error: {}", err_text);
                     }
@@ -198,6 +185,8 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
 
     tokio::spawn(firefox_poll_worker(modem_manager.clone()));
 
+    tokio::spawn(firefox_item_catalog_sync_worker());
+
     firefox_upload_retry_worker::start_retry_worker();
 
     mms_worker::start_mms_worker(
@@ -220,6 +209,75 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn firefox_item_catalog_sync_worker() {
+    let check_interval = tokio::time::Duration::from_secs(6 * 60 * 60);
+
+    loop {
+        if !crate::service_control::is_running() {
+            tokio::time::sleep(check_interval).await;
+            continue;
+        }
+
+        if let Err(e) = sync_firefox_item_catalog_if_due().await {
+            log::warn!("[火狐狸价目] 定时同步失败: {}", e);
+        }
+
+        tokio::time::sleep(check_interval).await;
+    }
+}
+
+async fn sync_firefox_item_catalog_if_due() -> anyhow::Result<()> {
+    let now = Utc::now().naive_utc();
+    let last_sync = db::AppSetting::get("firefox_item_catalog_last_sync_at")
+        .await?
+        .and_then(|v| NaiveDateTime::parse_from_str(v.trim(), "%Y-%m-%d %H:%M:%S").ok());
+
+    if let Some(last) = last_sync {
+        if now - last < ChronoDuration::days(3) {
+            return Ok(());
+        }
+    }
+
+    let token = db::AppSetting::get("firefox_user_token").await.ok().flatten();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let items = firefox_api::get_user_item_prices(&client, token.as_deref(), None).await?;
+    if items.is_empty() {
+        log::warn!("[火狐狸价目] 同步返回空列表，保留本地数据");
+        return Ok(());
+    }
+
+    let upserts: Vec<db::FirefoxItemPriceUpsert> = items
+        .into_iter()
+        .map(|item| {
+            let price = item.item_uprice.trim().parse::<f64>().unwrap_or(0.0);
+            db::FirefoxItemPriceUpsert {
+                item_id: item.item_id.trim().to_string(),
+                country_id: item.country_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+                item_name: item.item_name.trim().to_string(),
+                item_uprice: if price.is_finite() { price.max(0.0) } else { 0.0 },
+                country_title: item.country_title.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+            }
+        })
+        .filter(|item| !item.item_id.is_empty() && !item.item_name.is_empty())
+        .collect();
+
+    if upserts.is_empty() {
+        log::warn!("[火狐狸价目] 同步后没有有效项目，跳过更新");
+        return Ok(());
+    }
+
+    db::upsert_firefox_item_prices(&upserts).await?;
+
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    db::AppSetting::set("firefox_item_catalog_last_sync_at", Some(&timestamp)).await?;
+
+    log::info!("[火狐狸价目] 同步完成: {} 项", upserts.len());
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 fn maybe_start_windows_tray() {
     let url = "http://localhost:8080".to_string();
@@ -236,47 +294,16 @@ fn maybe_start_windows_tray() {
 #[cfg(target_os = "windows")]
 fn format_startup_error_message(err: &str) -> String {
     if err.contains("10048") || err.contains("Only one usage") || err.contains("通常每个套接字地址") {
-        return "小牛智卡已在运行（端口被占用）。请检查系统托盘图标，或先关闭正在运行的实例。".to_string();
+        return "SMS Gateway is already running (port is in use). Please check the tray icons, or stop the existing instance first.".to_string();
     }
-    format!("小牛智卡启动失败: {}", err)
-}
-
-fn is_software_expired() -> bool {
-    let today = Local::now().date_naive();
-    let path = expiry_state_file_path();
-
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(expiry) = NaiveDate::parse_from_str(content.trim(), "%Y-%m-%d") {
-            return today > expiry;
-        }
-    }
-
-    let expiry = today
-        .checked_add_months(Months::new(4))
-        .or_else(|| today.checked_add_days(Days::new(120)))
-        .unwrap_or(today);
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, expiry.format("%Y-%m-%d").to_string());
-    false
-}
-
-fn expiry_state_file_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(base) = exe.parent() {
-            return base.join("data").join(".xiaoniu_expiry");
-        }
-    }
-    PathBuf::from(".xiaoniu_expiry")
+    format!("SMS Gateway failed to start: {}", err)
 }
 
 #[cfg(target_os = "windows")]
 fn show_windows_error_dialog(message: &str) {
     let _ = native_dialog::MessageDialog::new()
         .set_type(native_dialog::MessageType::Error)
-        .set_title("小牛智卡")
+        .set_title("SMS Gateway")
         .set_text(message)
         .show_alert();
 }
@@ -294,59 +321,25 @@ fn open_browser_with_fallback(url: &str) {
 
 #[cfg(target_os = "windows")]
 fn run_windows_tray(url: String) -> anyhow::Result<()> {
-    show_windows_info_message_box("小牛智卡正在系统托盘中运行。", 2500);
+    let _ = native_dialog::MessageDialog::new()
+        .set_type(native_dialog::MessageType::Info)
+        .set_title("SMS Gateway")
+        .set_text("SMS Gateway is running in tray.")
+        .show_alert();
 
     let mut tray = create_windows_tray_item()?;
 
     let open_url = url.clone();
-    tray.add_menu_item("打开面板", move || {
+    tray.add_menu_item("Open Panel", move || {
         open_browser_with_fallback(&open_url);
     })?;
 
-    tray.add_menu_item("退出", || {
+    tray.add_menu_item("Exit", || {
         std::process::exit(0);
     })?;
 
     loop {
         std::thread::park();
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn show_windows_info_message_box(message: &str, timeout_ms: u32) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn MessageBoxTimeoutW(
-            hwnd: isize,
-            lpText: *const u16,
-            lpCaption: *const u16,
-            uType: u32,
-            wLanguageId: u16,
-            dwMilliseconds: u32,
-        ) -> i32;
-    }
-
-    let text: Vec<u16> = OsStr::new(message)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let caption: Vec<u16> = OsStr::new("小牛智卡")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    unsafe {
-        let _ = MessageBoxTimeoutW(
-            0,
-            text.as_ptr(),
-            caption.as_ptr(),
-            0x0000_0040,
-            0,
-            timeout_ms,
-        );
     }
 }
 
@@ -359,41 +352,28 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
 
     fn try_load_icon_from_exe_dir() -> Option<HICON> {
         let exe = std::env::current_exe().ok()?;
-        let base = exe.parent()?;
-        let candidates = [
-            base.join("icon").join("tray.ico"),
-            base.join("icon").join("xiaoniu-zhika.ico"),
-            base.join("xiaoniu-zhika.ico"),
-            base.join("sms-gateway.ico"),
-        ];
-
-        for icon_path in candidates {
-            if !icon_path.exists() {
-                continue;
-            }
-
-            let wide: Vec<u16> = icon_path
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let h = unsafe {
-                LoadImageW(
-                    0,
-                    wide.as_ptr(),
-                    IMAGE_ICON,
-                    64,
-                    64,
-                    LR_LOADFROMFILE,
-                )
-            };
-            if h != 0 {
-                return Some(h as HICON);
-            }
+        let icon_path = exe.parent()?.join("sms-gateway.ico");
+        if !icon_path.exists() {
+            return None;
         }
 
-        None
+        let wide: Vec<u16> = icon_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let h = unsafe {
+            LoadImageW(
+                0,
+                wide.as_ptr(),
+                IMAGE_ICON,
+                64,
+                64,
+                LR_LOADFROMFILE,
+            )
+        };
+        if h == 0 { None } else { Some(h as HICON) }
     }
 
     let hicon = try_load_icon_from_exe_dir().unwrap_or_else(|| unsafe {
@@ -405,7 +385,7 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
         anyhow::bail!("unable to load tray icon handle")
     }
 
-    tray_item::TrayItem::new("小牛智卡", tray_item::IconSource::RawIcon(hicon))
+    tray_item::TrayItem::new("SMS Gateway", tray_item::IconSource::RawIcon(hicon))
         .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
@@ -530,12 +510,6 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             let phone_num = item.get("Phone_Num").and_then(|v| v.as_str()).unwrap_or("?");
                             let country_id = item.get("Country_ID").and_then(|v| v.as_str()).unwrap_or("?");
                             let item_id = item.get("Item_ID").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
-                            let item_name = item
-                                .get("Item_Name")
-                                .or_else(|| item.get("item_name"))
-                                .and_then(|v| v.as_str())
-                                .map(str::trim)
-                                .filter(|v| !v.is_empty());
 
                             if phone_num == "?" || item_id == "?" || country_id == "?" {
                                 continue;
@@ -550,46 +524,18 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 );
                             }
 
-                            if let Some(name) = item_name {
-                                if let Err(e) = db::FirefoxPlatformItem::upsert_item_name(&item_id, name).await {
-                                    log::error!(
-                                        "[火狐狸轮询] 刷新平台项目名称失败 - Item_ID: {}, Item_Name: {}, 错误: {}",
-                                        item_id,
-                                        name,
-                                        e
-                                    );
-                                }
-                            }
-
                             let task_key = format!("{}|{}|{}", country_id, phone_num, item_id);
                             let now = tokio::time::Instant::now();
 
-                            log::debug!(
-                                "[火狐狸轮询] 任务检查 - task_key={}, item_name={:?}",
-                                task_key,
-                                item_name
-                            );
-
                             if let Some(until) = no_sms_backoff_until.get(&task_key) {
                                 if *until > now {
-                                    let remain_secs = until.saturating_duration_since(now).as_secs();
-                                    log::debug!(
-                                        "[火狐狸轮询] 任务处于退避窗口，跳过本轮 - task_key={}, remaining={}s",
-                                        task_key,
-                                        remain_secs
-                                    );
                                     continue;
                                 }
                                 no_sms_backoff_until.remove(&task_key);
-                                log::debug!("[火狐狸轮询] 任务退避窗口结束 - task_key={}", task_key);
                             }
 
                             // Skip if we already processed this item
                             if processed_tasks.contains(&task_key) {
-                                log::debug!(
-                                    "[火狐狸轮询] 任务已处理，先检查释放状态 - task_key={}",
-                                    task_key
-                                );
                                 // Still check result list for release status
                                 if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
                                     if let Some(data) = result_resp.data {
@@ -617,13 +563,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                             let sim_id = match sim_id {
                                 Some(id) => id,
                                 None => {
-                                    log::warn!(
-                                        "[火狐狸轮询] 未找到号码对应的 SIM 卡 - task_key={}, phone={}, country={}, item_id={}",
-                                        task_key,
-                                        phone_num,
-                                        country_id,
-                                        item_id
-                                    );
+                                    log::warn!("[火狐狸轮询] 未找到号码 {} 对应的 SIM 卡", phone_num);
                                     processed_tasks.insert(task_key.clone());
                                     continue;
                                 }
@@ -763,185 +703,11 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
                                 }
                                 Ok(None) => {
                                     mark_task_processed = false;
-                                    log::warn!(
-                                        "[火狐狸轮询] 读取 SMS 后未找到短信 - task_key={}, sim_id={}, phone={}",
-                                        task_key,
-                                        sim_id,
-                                        phone_num
-                                    );
-                                    let fallback_sms = match db::Sms::find_recent_received_sms(&sim_id, 20).await {
-                                        Ok(candidates) => {
-                                            log::debug!(
-                                                "[火狐狸轮询] DB兜底候选数量 - task_key={}, sim_id={}, count={}",
-                                                task_key,
-                                                sim_id,
-                                                candidates.len()
-                                            );
-                                            let cutoff = Local::now().naive_local() - chrono::Duration::minutes(30);
-                                            candidates.into_iter().find(|s| {
-                                                s.id > 0
-                                                    && s.timestamp >= cutoff
-                                                    && !s.message.trim().is_empty()
-                                                    && s.platform_item_id
-                                                        .as_deref()
-                                                        .is_none_or(|v| v == item_id.as_str())
-                                            })
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "[火狐狸轮询] 查询近期未上传短信失败 (SIM: {}, Item_ID: {}): {}",
-                                                sim_id,
-                                                item_id,
-                                                e
-                                            );
-                                            None
-                                        }
-                                    };
-
-                                    if let Some(sms) = fallback_sms {
-                                        mark_task_processed = true;
-                                        log::info!(
-                                            "[火狐狸轮询] 使用DB近期短信兜底上传 (SMS ID: {}, Item_ID: {}, 号码: {})",
-                                            sms.id,
-                                            item_id,
-                                            phone_num
-                                        );
-                                        let upload_content = db::build_upload_sms_content(&item_id, &sms.message)
-                                            .await
-                                            .unwrap_or_else(|e| {
-                                                log::error!(
-                                                    "[火狐狸轮询] 构建兜底上传短信内容失败 (SMS ID: {}, Item_ID: {}): {}，使用原始短信内容",
-                                                    sms.id,
-                                                    item_id,
-                                                    e
-                                                );
-                                                sms.message.clone()
-                                            });
-
-                                        match firefox_api::upload_sms(&client, &api_key, country_id, phone_num, &upload_content).await {
-                                            Ok(upload_resp) if upload_resp.code == "1" => {
-                                                let response_json = serde_json::to_string(&upload_resp).ok();
-                                                if let Err(e) = db::Sms::mark_platform_attempt(
-                                                    sms.id,
-                                                    &item_id,
-                                                    true,
-                                                    response_json.as_deref(),
-                                                )
-                                                .await
-                                                {
-                                                    log::error!(
-                                                        "[火狐狸轮询] 标记兜底短信上传成功失败 (SMS ID: {}, Item_ID: {}): {}",
-                                                        sms.id,
-                                                        item_id,
-                                                        e
-                                                    );
-                                                }
-                                                log::info!("[火狐狸轮询] 兜底短信上传成功 - 号码: {}, Item_ID: {}, 响应: {:?}", phone_num, item_id, upload_resp);
-                                            }
-                                            Ok(upload_resp) => {
-                                                let response_json = serde_json::to_string(&upload_resp).ok();
-                                                if let Err(e) = db::Sms::mark_platform_attempt(
-                                                    sms.id,
-                                                    &item_id,
-                                                    false,
-                                                    response_json.as_deref(),
-                                                )
-                                                .await
-                                                {
-                                                    log::error!(
-                                                        "[火狐狸轮询] 标记兜底短信上传失败失败 (SMS ID: {}, Item_ID: {}): {}",
-                                                        sms.id,
-                                                        item_id,
-                                                        e
-                                                    );
-                                                }
-
-                                                if firefox_api::is_unretryable_platform_rejection(&upload_resp) {
-                                                    log::warn!(
-                                                        "[火狐狸轮询] 兜底短信上传失败（不可重试），不进入重试队列 - 号码: {}, Item_ID: {}, code: {}, data: {:?}",
-                                                        phone_num,
-                                                        item_id,
-                                                        upload_resp.code,
-                                                        upload_resp.data
-                                                    );
-                                                } else {
-                                                    let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
-                                                        sms.id,
-                                                        phone_num.to_string(),
-                                                        country_id.to_string(),
-                                                        sms.message.clone(),
-                                                        format!("Upload failed with code: {}", upload_resp.code),
-                                                        Some(upload_resp.code.clone()),
-                                                    );
-
-                                                    match firefox_upload_retry::FirefoxUploadRetryItem::insert(
-                                                        &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
-                                                        &retry_item
-                                                    ).await {
-                                                        Ok(_) => log::info!("[火狐狸轮询] 兜底短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, code: {}", phone_num, item_id, retry_item.id, upload_resp.code),
-                                                        Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let error_message = format!("Upload failed: {}", e);
-                                                if let Err(mark_err) = db::Sms::mark_platform_attempt(
-                                                    sms.id,
-                                                    &item_id,
-                                                    false,
-                                                    Some(&error_message),
-                                                )
-                                                .await
-                                                {
-                                                    log::error!(
-                                                        "[火狐狸轮询] 标记兜底短信上传错误失败 (SMS ID: {}, Item_ID: {}): {}",
-                                                        sms.id,
-                                                        item_id,
-                                                        mark_err
-                                                    );
-                                                }
-
-                                                let retry_item = firefox_upload_retry::FirefoxUploadRetryItem::new(
-                                                    sms.id,
-                                                    phone_num.to_string(),
-                                                    country_id.to_string(),
-                                                    sms.message.clone(),
-                                                    format!("Upload failed: {}", e),
-                                                    None,
-                                                );
-
-                                                match firefox_upload_retry::FirefoxUploadRetryItem::insert(
-                                                    &db::get_pool().unwrap_or_else(|_| panic!("No DB pool")),
-                                                    &retry_item
-                                                ).await {
-                                                    Ok(_) => log::info!("[火狐狸轮询] 兜底短信上传失败，已加入重试队列 - 号码: {}, Item_ID: {}, 重试ID: {}, 错误: {}", phone_num, item_id, retry_item.id, e),
-                                                    Err(e) => log::error!("[火狐狸轮询] 将失败的短信加入重试队列失败: {}", e),
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if mark_task_processed {
-                                        log::debug!(
-                                            "[火狐狸轮询] 兜底上传已处理任务，跳过平台结果列表检查 - task_key={}",
-                                            task_key
-                                        );
-                                        continue;
-                                    }
-
+                                    log::warn!("[火狐狸轮询] 读取 SMS 后未找到短信 (SIM: {}, 号码: {})", sim_id, phone_num);
                                     // Check the result list in case platform already has content
-                                    log::debug!(
-                                        "[火狐狸轮询] 开始检查平台结果列表兜底 - task_key={}",
-                                        task_key
-                                    );
                                     if let Ok(result_resp) = firefox_api::get_result_phone_list(&client, &api_key, country_id, phone_num, &item_id).await {
                                         if let Some(data) = result_resp.data {
                                             if let Some(arr) = data.as_array() {
-                                                log::debug!(
-                                                    "[火狐狸轮询] 平台结果列表条数 - task_key={}, count={}",
-                                                    task_key,
-                                                    arr.len()
-                                                );
                                                 for result_item in arr {
                                                     if let Some(content) = result_item.get("Phone_SmsContent").and_then(|v| v.as_str()) {
                                                         if !content.is_empty() {

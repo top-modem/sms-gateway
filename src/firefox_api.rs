@@ -1,7 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "http://ks.firefox.fun/ksapi.ashx";
+const USER_API_BASE: &str = "https://www.firefox.fun/yhapi.ashx";
 
 /// Country list parsed from 火狐狸-API上卡协议文档.pdf.
 /// Format: (country_id, dial_prefix, display_name)
@@ -146,6 +147,71 @@ pub fn countries() -> Vec<CountryInfo> {
         .collect()
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UserItemPrice {
+    #[serde(rename = "Item_ID")]
+    pub item_id: String,
+    #[serde(rename = "Item_Name")]
+    pub item_name: String,
+    #[serde(rename = "Item_UPrice")]
+    pub item_uprice: String,
+    #[serde(rename = "Country_ID")]
+    pub country_id: Option<String>,
+    #[serde(rename = "Country_Title")]
+    pub country_title: Option<String>,
+}
+
+pub async fn get_user_item_prices(
+    client: &reqwest::Client,
+    token: Option<&str>,
+    key: Option<&str>,
+) -> Result<Vec<UserItemPrice>> {
+    let mut query: Vec<(&str, String)> = vec![("act", "getItem".to_string())];
+
+    if let Some(v) = token {
+        if !v.trim().is_empty() {
+            query.push(("token", v.trim().to_string()));
+        }
+    }
+
+    if let Some(v) = key {
+        if !v.trim().is_empty() {
+            query.push(("key", v.trim().to_string()));
+        }
+    }
+
+    let response = client
+        .get(USER_API_BASE)
+        .query(&query)
+        .send()
+        .await
+        .context("Failed to request 火狐狸 user item catalog")?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("Failed to read 火狐狸 user item catalog response")?;
+
+    if !status.is_success() {
+        bail!("火狐狸 user API returned HTTP {}: {}", status, text);
+    }
+
+    let raw = text.trim();
+    let payload = if let Some(rest) = raw.strip_prefix("1|") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("0|") {
+        bail!("火狐狸 user API getItem failed: {}", rest);
+    } else {
+        raw
+    };
+
+    let items: Vec<UserItemPrice> = serde_json::from_str(payload)
+        .with_context(|| format!("Failed to parse 火狐狸 user getItem payload: {}", payload))?;
+
+    Ok(items)
+}
+
 // ─── Shared request helper ───────────────────────────────────────────────
 
 async fn do_post<T: Serialize, R: serde::de::DeserializeOwned>(
@@ -224,7 +290,6 @@ pub fn is_unretryable_platform_rejection(resp: &ApiResponse) -> bool {
 
     reason.contains("未匹配到关键字")
         || reason.contains("丢弃纯数字")
-        || reason.contains("已回码或释放")
         || reason.to_ascii_lowercase().contains("keyword")
 }
 
@@ -262,24 +327,8 @@ pub async fn upload_phone_batch(
 ) -> Result<Vec<BatchUploadResult>> {
     const BATCH_SIZE: usize = 50;
     let mut results = Vec::new();
-    let total_chunks = phone_numbers.len().div_ceil(BATCH_SIZE);
 
-    log::info!(
-        "[火狐狸批量上传] 分片开始: country_id={}, total_numbers={}, chunk_size={}, total_chunks={}",
-        country_id,
-        phone_numbers.len(),
-        BATCH_SIZE,
-        total_chunks
-    );
-
-    for (idx, chunk) in phone_numbers.chunks(BATCH_SIZE).enumerate() {
-        log::info!(
-            "[火狐狸批量上传] 提交分片: chunk={}/{}, size={}, first_phone={}",
-            idx + 1,
-            total_chunks,
-            chunk.len(),
-            chunk.first().cloned().unwrap_or_default()
-        );
+    for chunk in phone_numbers.chunks(BATCH_SIZE) {
         let phone_list: Vec<PhoneAddEntry> = chunk
             .iter()
             .map(|num| PhoneAddEntry {
@@ -297,14 +346,6 @@ pub async fn upload_phone_batch(
         };
         let resp: ApiResponse = do_post(client, api_key, &payload).await?;
         let batch_id = resp.data.clone().unwrap_or_default();
-        log::info!(
-            "[火狐狸批量上传] 分片响应: chunk={}/{}, size={}, code={}, batch_id={}",
-            idx + 1,
-            total_chunks,
-            chunk.len(),
-            resp.code,
-            batch_id
-        );
         results.push(BatchUploadResult {
             batch_id,
             phone_numbers: chunk.iter().cloned().collect(),

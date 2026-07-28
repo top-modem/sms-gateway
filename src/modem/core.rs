@@ -11,25 +11,11 @@ use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use crate::api::SseManager;
 use crate::config::SmsStorage;
 use crate::db::{Contact, ModemSMS, SimCard, Sms};
-use crate::decode::{parse_pdu_sms, parse_status_report_pdus};
+use crate::decode::parse_pdu_sms;
 use crate::webhook;
 
 use super::pdu::{build_pdus, string_to_ucs2_pub};
 use super::types::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApreadyProbeResult {
-    Valid,
-    Invalid,
-    Unavailable,
-}
-
-#[derive(Debug, Clone)]
-pub struct SmsSendOutcome {
-    pub sms_id: i64,
-    pub contact_id: String,
-    pub message_refs: Vec<u8>,
-}
 
 /// All SMS timestamps (incoming and outgoing) are normalized to GMT+8 so they
 /// don't depend on the host OS's configured timezone. See also
@@ -253,30 +239,14 @@ impl Modem {
         }
     }
 
-    fn parse_apready_last_value(response: &str) -> Option<i32> {
-        response.lines().find_map(|line| {
-            let trimmed = line.trim();
-            if !trimmed.starts_with("+QCFG:") || !trimmed.contains("\"apready\"") {
-                return None;
-            }
-
-            let mut parts = trimmed.split(',');
-            let _ = parts.next();
-            parts
-                .next_back()
-                .and_then(|v| v.trim().trim_matches('"').parse::<i32>().ok())
-        })
-    }
-
-    /// Quick APREADY probe used during startup/recheck.
-    /// Returns:
-    /// - Valid:   modem responded and APREADY last value is 510/511
-    /// - Invalid: modem responded but APREADY value is not 510/511
-    /// - Unavailable: port cannot be opened or no usable QCFG response
+    /// Quick probe used by the reconnection worker: open a port with a short
+    /// timeout, send AT+CPIN?, and report whether a SIM (or at least a modem
+    /// responding to CPIN) is present. This avoids the ~10-20 second cost of a
+    /// full modem initialization on every empty port.
     pub async fn quick_probe_port(com_port: &str, baud_rate: u32) -> bool {
         const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
         const READ_TIMEOUT: Duration = Duration::from_millis(300);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
         let open_result = tokio::time::timeout(
             OPEN_TIMEOUT,
@@ -298,7 +268,7 @@ impl Modem {
             _ => return false,
         };
 
-        // Drain stale bytes to avoid matching historical responses.
+        // Drain any stale bytes that may be sitting in the port buffer.
         let mut drain = [0u8; 256];
         while let Ok(Ok(n)) =
             tokio::time::timeout(Duration::from_millis(100), stream.read(&mut drain)).await
@@ -322,69 +292,6 @@ impl Modem {
             match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     response.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if response.contains("+CPIN:")
-                        || response.contains("\r\nOK\r\n")
-                        || response.contains("\r\nERROR")
-                    {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        response.contains("+CPIN:") || response.contains("\r\nOK\r\n")
-    }
-
-    pub async fn quick_probe_apready_port(com_port: &str, baud_rate: u32) -> ApreadyProbeResult {
-        const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
-        const READ_TIMEOUT: Duration = Duration::from_millis(300);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
-
-        let open_result = tokio::time::timeout(
-            OPEN_TIMEOUT,
-            tokio::task::spawn_blocking({
-                let port = com_port.to_string();
-                move || {
-                    tokio_serial::new(&port, baud_rate)
-                        .timeout(READ_TIMEOUT)
-                        .flow_control(tokio_serial::FlowControl::None)
-                        .open_native_async()
-                        .map_err(|e| io::Error::other(format!("Failed to open {}: {}", port, e)))
-                }
-            }),
-        )
-        .await;
-
-        let mut stream = match open_result {
-            Ok(Ok(Ok(stream))) => stream,
-            _ => return ApreadyProbeResult::Unavailable,
-        };
-
-        // Drain any stale bytes that may be sitting in the port buffer.
-        let mut drain = [0u8; 256];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut drain)).await
-        {
-            if n == 0 {
-                break;
-            }
-        }
-
-        if stream.write_all(b"AT+QCFG=\"apready\"\r\n").await.is_err() {
-            return ApreadyProbeResult::Unavailable;
-        }
-        if stream.flush().await.is_err() {
-            return ApreadyProbeResult::Unavailable;
-        }
-
-        let mut buf = [0u8; 512];
-        let mut response = String::new();
-        let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => {
-                    response.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if response.contains("\r\nOK\r\n") || response.contains("\r\nERROR") {
                         break;
                     }
@@ -393,11 +300,14 @@ impl Modem {
             }
         }
 
-        match Self::parse_apready_last_value(&response) {
-            Some(510) | Some(511) => ApreadyProbeResult::Valid,
-            Some(_) => ApreadyProbeResult::Invalid,
-            None => ApreadyProbeResult::Unavailable,
+        let upper = response.to_uppercase();
+        if upper.contains("+CPIN:") && !upper.contains("REMOVED") && !upper.contains("NOT INSERTED")
+        {
+            return true;
         }
+        // A plain OK with no CPIN info is unusual for a modem; still treat it as
+        // present so the full init can decide.
+        upper.contains("OK")
     }
 
     // ─── Background reader task ────────────────────────────────────────────────
@@ -732,11 +642,6 @@ impl Modem {
             ("ATE0\r\n", "Disable echo"),
             ("AT+CMEE=1\r\n", "Enable error messages"),
             ("AT+CMGF=0\r\n", "Set PDU mode"),
-            ("AT+CSMS=1\r\n", "Enable SMS service profile"),
-            (
-                "AT+CNMI=2,0,0,2,0\r\n",
-                "Enable delivery report URCs (+CDS)",
-            ),
             ("AT+CSCS=\"UCS2\"\r\n", "Set character encoding"),
             ("AT+CLIP=1\r\n", "Enable caller ID (CLIP)"),
         ];
@@ -1008,7 +913,7 @@ impl Modem {
     /// Send a PDU SMS atomically: holds the write mutex across both the AT+CMGS prompt step
     /// and the PDU data step, preventing other AT commands from slipping in between and
     /// corrupting the modem's PDU input state.
-    async fn send_pdu_atomic(&self, tpdu_len: usize, pdu_hex: &str) -> anyhow::Result<Option<u8>> {
+    async fn send_pdu_atomic(&self, tpdu_len: usize, pdu_hex: &str) -> anyhow::Result<()> {
         let setup_cmd = format!("AT+CMGS={}\r", tpdu_len);
         let full_pdu = format!("{}\x1A", pdu_hex);
 
@@ -1056,7 +961,7 @@ impl Modem {
         };
 
         if final_response.contains("OK\r\n") && final_response.contains("+CMGS:") {
-            Ok(Self::extract_cmgs_mr(&final_response))
+            Ok(())
         } else {
             error!(
                 "Incomplete SMS response: {}",
@@ -1097,37 +1002,11 @@ impl Modem {
         }
     }
 
-    fn extract_cmgs_mr(response: &str) -> Option<u8> {
-        for line in response.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("+CMGS:") {
-                if let Ok(v) = rest.trim().parse::<u16>() {
-                    return Some((v & 0xFF) as u8);
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_qcmgs_mr(response: &str) -> Option<u8> {
-        for line in response.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("+QCMGS:") {
-                let first = rest.split(',').next().unwrap_or("").trim();
-                if let Ok(v) = first.parse::<u16>() {
-                    return Some((v & 0xFF) as u8);
-                }
-            }
-        }
-        None
-    }
-
     pub async fn send_sms_pdu(
         &self,
         contact: &Contact,
         message: &str,
-        status_report_enabled: bool,
-    ) -> anyhow::Result<SmsSendOutcome> {
+    ) -> anyhow::Result<(i64, String)> {
         // Use contact.id if it looks like a phone number (starts with + or is all digits),
         // otherwise fall back to contact.name (contacts auto-created from received SMS
         // store the phone number in the name field with a UUID as the id).
@@ -1153,30 +1032,14 @@ impl Modem {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
-            status_report_requested: false,
-            submit_ref: None,
-            delivery_status: None,
-            delivered_at: None,
-            delivery_report_raw: None,
         };
 
         let sms_id = sms.insert().await?;
 
-        match self
-            .send_pdu_message(&phone, message, status_report_enabled)
-            .await
-        {
-            Ok(message_refs) => {
-                if !status_report_enabled {
-                    Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
-                } else {
-                    Sms::mark_status_report_requested(sms_id, message_refs.first().copied()).await?;
-                }
-                Ok(SmsSendOutcome {
-                    sms_id,
-                    contact_id: contact.id.clone(),
-                    message_refs,
-                })
+        match self.send_pdu_message(&phone, message).await {
+            Ok(_) => {
+                Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
+                Ok((sms_id, contact.id.clone()))
             }
             Err(e) => {
                 Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Failed).await?;
@@ -1185,22 +1048,14 @@ impl Modem {
         }
     }
 
-    async fn send_pdu_message(
-        &self,
-        phone: &str,
-        message: &str,
-        status_report_enabled: bool,
-    ) -> anyhow::Result<Vec<u8>> {
-        let pdus = build_pdus(phone, message, status_report_enabled)?;
-        let mut refs = Vec::new();
+    async fn send_pdu_message(&self, phone: &str, message: &str) -> anyhow::Result<()> {
+        let pdus = build_pdus(phone, message, false)?;
 
         for (pdu_data, tpdu_length) in pdus {
-            if let Some(mr) = self.send_pdu_atomic(tpdu_length, &pdu_data).await? {
-                refs.push(mr);
-            }
+            self.send_pdu_atomic(tpdu_length, &pdu_data).await?;
         }
 
-        Ok(refs)
+        Ok(())
     }
 
     pub async fn read_sms_async_insert(
@@ -1224,11 +1079,6 @@ impl Modem {
         }
 
         if sms_list.is_empty() {
-            if mms_found {
-                if let Ok(conversations) = crate::db::Conversation::query_all().await {
-                    sse_manager.send(conversations);
-                }
-            }
             return Ok(());
         }
 
@@ -1282,51 +1132,12 @@ impl Modem {
                                                 if sms.send {
                                                     continue;
                                                 }
-                                                let upload_content = match crate::db::FirefoxPlatformItem::find_latest_item_for_phone(phone_num).await {
-                                                    Ok(Some(item_id)) => {
-                                                        log::debug!(
-                                                            "[{}] Direct upload resolved item_id={} for phone={} before content build",
-                                                            sim_id,
-                                                            item_id,
-                                                            phone_num
-                                                        );
-                                                        crate::db::build_upload_sms_content(&item_id, &sms.message)
-                                                        .await
-                                                        .unwrap_or_else(|e| {
-                                                            log::error!(
-                                                                "[{}] Failed to build upload SMS content for phone={} item_id={}: {}. Using raw message.",
-                                                                sim_id,
-                                                                phone_num,
-                                                                item_id,
-                                                                e
-                                                            );
-                                                            sms.message.clone()
-                                                        })
-                                                    }
-                                                    Ok(None) => {
-                                                        log::debug!(
-                                                            "[{}] Direct upload no item_id mapping for phone={}, using raw SMS content",
-                                                            sim_id,
-                                                            phone_num
-                                                        );
-                                                        sms.message.clone()
-                                                    }
-                                                    Err(e) => {
-                                                        log::error!(
-                                                            "[{}] Failed to resolve latest item_id for phone={} before upload: {}",
-                                                            sim_id,
-                                                            phone_num,
-                                                            e
-                                                        );
-                                                        sms.message.clone()
-                                                    }
-                                                };
                                                 match crate::firefox_api::upload_sms(
                                                     &client,
                                                     &api_key,
                                                     country_id,
                                                     phone_num,
-                                                    &upload_content,
+                                                    &sms.message,
                                                 )
                                                 .await
                                                 {
@@ -1633,48 +1444,8 @@ impl Modem {
         if trimmed != "OK" && !trimmed.is_empty() {
             log::info!("[{}] AT+CMGL raw response: {}", sim_id, trimmed);
         }
-
-        let status_reports = parse_status_report_pdus(&response);
-        for report in &status_reports {
-            match Sms::apply_status_report_by_submit_ref(
-                &sim_id,
-                report.submit_ref,
-                report.tp_status,
-                &report.raw_pdu_hex,
-            )
-            .await
-            {
-                Ok(affected) if affected > 0 => {
-                    log::info!(
-                        "[{}] Applied SMS status report: MR={}, TP-ST=0x{:02X}, rows={}",
-                        sim_id,
-                        report.submit_ref,
-                        report.tp_status,
-                        affected
-                    );
-                }
-                Ok(_) => {
-                    log::debug!(
-                        "[{}] Ignored SMS status report (no pending row): MR={}, TP-ST=0x{:02X}",
-                        sim_id,
-                        report.submit_ref,
-                        report.tp_status
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[{}] Failed to apply SMS status report MR={}: {}",
-                        sim_id,
-                        report.submit_ref,
-                        e
-                    );
-                }
-            }
-        }
-
         let (sms_list, mms_candidates) = parse_pdu_sms(&response, &sim_id);
         let mms_found = !mms_candidates.is_empty();
-        let status_report_found = !status_reports.is_empty();
         // Capture MMS WAP-push notifications *before* the caller deletes SMS from
         // the modem (this is our only chance -- there is no "leave undeleted for
         // retry" option like a ModemManager-based stack would have).
@@ -1688,7 +1459,7 @@ impl Modem {
                 );
             }
         }
-        Ok((sms_list, mms_found || status_report_found))
+        Ok((sms_list, mms_found))
     }
 
     /// Delete all SMS messages from modem storage (AT+CMGD=1,4)
@@ -1743,12 +1514,6 @@ impl Modem {
         }
 
         false
-    }
-
-    pub async fn check_apready_valid(&self) -> io::Result<bool> {
-        let raw_response = self.send_command_with_ok("AT+QCFG=\"apready\"\r\n").await?;
-        let last = Self::parse_apready_last_value(&raw_response);
-        Ok(matches!(last, Some(510) | Some(511)))
     }
 
     pub async fn get_signal_quality(&self) -> io::Result<Option<SignalQuality>> {
@@ -1877,8 +1642,7 @@ impl Modem {
         &self,
         contact: &Contact,
         message: &str,
-        status_report_enabled: bool,
-    ) -> anyhow::Result<SmsSendOutcome> {
+    ) -> anyhow::Result<(i64, String)> {
         let phone = if contact.id.starts_with('+') || contact.id.chars().all(|c| c.is_ascii_digit())
         {
             contact.id.clone()
@@ -1901,30 +1665,14 @@ impl Modem {
             platform_item_id: None,
             platform_uploaded_at: None,
             platform_response: None,
-            status_report_requested: false,
-            submit_ref: None,
-            delivery_status: None,
-            delivered_at: None,
-            delivery_report_raw: None,
         };
 
         let sms_id = sms.insert().await?;
 
-        match self
-            .send_text_message(&phone, message, status_report_enabled)
-            .await
-        {
-            Ok(message_refs) => {
-                if !status_report_enabled {
-                    Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
-                } else {
-                    Sms::mark_status_report_requested(sms_id, message_refs.first().copied()).await?;
-                }
-                Ok(SmsSendOutcome {
-                    sms_id,
-                    contact_id: contact.id.clone(),
-                    message_refs,
-                })
+        match self.send_text_message(&phone, message).await {
+            Ok(_) => {
+                Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Read).await?;
+                Ok((sms_id, contact.id.clone()))
             }
             Err(e) => {
                 Sms::update_status_by_id(sms_id, crate::db::SmsStatus::Failed).await?;
@@ -1933,130 +1681,12 @@ impl Modem {
         }
     }
 
-    async fn send_text_message(
-        &self,
-        phone: &str,
-        message: &str,
-        status_report_enabled: bool,
-    ) -> anyhow::Result<Vec<u8>> {
-        // Keep receive-side PDU parsing intact: enter text mode only for the
-        // send operation, then always restore CMGF=0.
-        self.send_command_with_ok("AT+CMGF=1\r\n").await?;
-        self.send_command_with_ok("AT+CSCS=\"UCS2\"\r\n").await?;
-        let fo = if status_report_enabled { 49 } else { 17 };
-        self.send_command_with_ok(&format!("AT+CSMP={},167,0,8\r\n", fo)).await?;
-
-        // Modem init keeps CSCS=UCS2. In text mode under UCS2 charset,
-        // destination number passed to AT+CMGS must also be UCS2 encoded
-        // (not plain digits), otherwise +CMS ERROR is returned before prompt.
-        let phone_ucs2 = string_to_ucs2_pub(phone)?;
-        let segments = Self::split_text_mode_segments(message, 67);
-
-        let send_result = if segments.len() <= 1 {
-            self.send_sms_content(&format!("AT+CMGS=\"{}\"\r", phone_ucs2), message, |msg| {
-                string_to_ucs2_pub(msg)
-            })
-            .await
-            .map(|resp| Self::extract_cmgs_mr(&resp).into_iter().collect::<Vec<u8>>())
-        } else {
-            self.send_text_message_long_qcmgs(&phone_ucs2, &segments).await
-        };
-
-        let restore_result = self.send_command_with_ok("AT+CMGF=0\r\n").await;
-
-        match (send_result, restore_result) {
-            (Ok(refs), Ok(_)) => Ok(refs),
-            (Err(e), Ok(_)) => Err(e),
-            (Ok(_), Err(e)) => Err(anyhow::anyhow!(
-                "SMS sent in text mode but failed to restore PDU mode: {}",
-                e
-            )),
-            (Err(send_err), Err(restore_err)) => Err(anyhow::anyhow!(
-                "Text SMS send failed: {}; also failed to restore PDU mode: {}",
-                send_err,
-                restore_err
-            )),
-        }
-    }
-
-    fn split_text_mode_segments(message: &str, max_utf16_units: usize) -> Vec<String> {
-        if message.is_empty() {
-            return vec![String::new()];
-        }
-
-        let mut segments: Vec<String> = Vec::new();
-        let mut current = String::new();
-        let mut current_units = 0usize;
-
-        for ch in message.chars() {
-            let units = ch.len_utf16();
-            if current_units + units > max_utf16_units && !current.is_empty() {
-                segments.push(current);
-                current = String::new();
-                current_units = 0;
-            }
-
-            current.push(ch);
-            current_units += units;
-        }
-
-        if !current.is_empty() {
-            segments.push(current);
-        }
-
-        if segments.is_empty() {
-            vec![String::new()]
-        } else {
-            segments
-        }
-    }
-
-    async fn send_text_message_long_qcmgs(
-        &self,
-        phone_ucs2: &str,
-        segments: &[String],
-    ) -> anyhow::Result<Vec<u8>> {
-        let total = segments.len();
-        anyhow::ensure!(
-            total <= u8::MAX as usize,
-            "Too many text segments for QCMGS: {}",
-            total
-        );
-
-        let mut refs = Vec::new();
-        for (idx, segment) in segments.iter().enumerate() {
-            let setup_cmd = format!(
-                "AT+QCMGS=\"{}\",10,{},{}\r",
-                phone_ucs2,
-                idx + 1,
-                total
-            );
-            let prompt_response = self.send_command_priority(&setup_cmd, 1).await?;
-            if !prompt_response.contains("> ") {
-                return Err(anyhow::anyhow!(
-                    "QCMGS prompt not received for segment {}/{}: {}",
-                    idx + 1,
-                    total,
-                    Self::format_log(&prompt_response)
-                ));
-            }
-
-            let body = format!("{}\x1A", string_to_ucs2_pub(segment)?);
-            let final_response = self.send_command_priority(&body, 1).await?;
-            if !(final_response.contains("OK\r\n") && final_response.contains("+QCMGS:")) {
-                return Err(anyhow::anyhow!(
-                    "QCMGS segment {}/{} failed: {}",
-                    idx + 1,
-                    total,
-                    Self::format_log(&final_response)
-                ));
-            }
-            if let Some(mr) = Self::extract_qcmgs_mr(&final_response) {
-                refs.push(mr);
-            }
-        }
-
-        Ok(refs)
+    async fn send_text_message(&self, phone: &str, message: &str) -> anyhow::Result<()> {
+        self.send_sms_content(&format!("AT+CMGS=\"{}\"\r", phone), message, |msg| {
+            string_to_ucs2_pub(msg)
+        })
+        .await?;
+        Ok(())
     }
 
     pub async fn read_sms_sync_insert(&self, _sms_type: SmsType) -> anyhow::Result<()> {

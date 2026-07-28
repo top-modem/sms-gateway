@@ -1,5 +1,5 @@
 use fancy_regex::Regex;
-use std::{collections::HashSet, convert::Infallible, path::PathBuf, sync::Arc, sync::OnceLock, time::Duration};
+use std::{collections::{HashMap, HashSet}, convert::Infallible, path::PathBuf, sync::Arc, sync::OnceLock, time::Duration};
 
 use axum::{
     extract::{Path, Query, State},
@@ -22,10 +22,7 @@ use crate::{
     config::SmsStorage,
     db::{AppSetting, BarcodeScan, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
-    modem::{
-        ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality,
-        SmsSendMode, SmsType,
-    },
+    modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
     phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
     service_control,
     ModemManagerRef,
@@ -253,6 +250,10 @@ pub async fn run_api(
         .route("/firefox/platform-items", get(firefox_platform_items))
         .route("/firefox/platform-items/{item_id}", get(firefox_platform_item_detail))
         .route("/firefox/platform-statistics", get(firefox_platform_statistics))
+        .route(
+            "/firefox/money-stats",
+            get(firefox_money_stats).with_state(modem_manager.clone()),
+        )
         .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
         // ── Firefox upload retry queue routes ────────────────────────────
         .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
@@ -450,28 +451,18 @@ async fn send_sms(
     }
 
     match modem_manager
-        .send_sms(
-            &sim_id,
-            &payload.contact,
-            &payload.message,
-            payload.sms_format,
-            payload.status_report_enabled,
-        )
+        .send_sms(&sim_id, &payload.contact, &payload.message)
         .await
     {
-        Ok(outcome) => {
+        Ok((sms_id, contact_id)) => {
             if let Ok(convs) =
-                Conversation::query_by_contact_ids(&[outcome.contact_id.clone()]).await
+                Conversation::query_by_contact_ids(&[contact_id.clone()]).await
             {
                 sse_manager.send(convs);
             }
             (
                 StatusCode::OK,
-                Json(json!({
-                    "sms_id": outcome.sms_id,
-                    "contact_id": outcome.contact_id,
-                    "message_refs": outcome.message_refs,
-                })),
+                Json(json!({ "sms_id": sms_id, "contact_id": contact_id })),
             )
                 .into_response()
         }
@@ -665,7 +656,6 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
 
         details.push(json!({
             "available": true,
-            "is_invalid": false,
             "sim_id": json_sim_id,
             "has_sim": has_sim,
             "name": sim_id.clone(),
@@ -694,10 +684,8 @@ async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Respo
         }
 
         let last_known = modem_manager.get_last_known_sim_card_for_port(&com_port).await;
-        let is_invalid = modem_manager.is_invalid_port(&com_port).await;
         details.push(json!({
             "available": false,
-            "is_invalid": is_invalid,
             "sim_id": last_known.as_ref().map(|card| card.id.clone()),
             "has_sim": false,
             "name": last_known.as_ref().map(|card| card.id.clone()),
@@ -1724,10 +1712,6 @@ pub struct SmsPayload {
     contact: Contact,
     message: String,
     new: bool,
-    #[serde(default)]
-    sms_format: SmsSendMode,
-    #[serde(default)]
-    status_report_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -2120,13 +2104,6 @@ async fn firefox_upload(
             .into_response();
     }
 
-    log::info!(
-        "[火狐狸批量上传] 请求开始: country_id={}, selected_sims={}, valid_numbers={}",
-        country_id,
-        request.sim_ids.len(),
-        phone_numbers.len()
-    );
-
     // Persist the selected country code on each uploaded SIM.
     for sim_id in &sim_ids_to_update {
         if let Some(mut card) = sim_cards.iter().find(|c| &c.id == sim_id).cloned() {
@@ -2143,13 +2120,6 @@ async fn firefox_upload(
                 .iter()
                 .map(|r| r.batch_id.clone())
                 .collect();
-            log::info!(
-                "[火狐狸批量上传] 上传完成: country_id={}, valid_numbers={}, batch_count={}, batch_ids={:?}",
-                country_id,
-                phone_numbers.len(),
-                batch_ids.len(),
-                batch_ids
-            );
             let api_responses: Vec<firefox_api::ApiResponse> = results
                 .iter()
                 .map(|r| r.response.clone())
@@ -2545,6 +2515,162 @@ async fn firefox_platform_statistics() -> Response {
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct FirefoxMoneyStatsRow {
+    com_port: String,
+    phone_number: String,
+    waiting_sms_count: i64,
+    received_sms_count: i64,
+    successful_uploaded_sms_count: i64,
+    failed_sms_count: i64,
+    money_earning: f64,
+    earning_item_names: String,
+}
+
+fn normalize_phone_for_match(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .trim_start_matches('0')
+        .to_string()
+}
+
+fn com_port_sort_key(port: &str) -> u32 {
+    port.trim_start_matches(|c: char| !c.is_ascii_digit())
+        .parse::<u32>()
+        .unwrap_or(u32::MAX)
+}
+
+async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Response {
+    let aggregate_rows = match crate::db::FirefoxMoneyStat::query_all_by_sim().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to query money stats: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut aggregate_by_sim: HashMap<String, crate::db::FirefoxMoneyStat> = HashMap::new();
+    for row in aggregate_rows {
+        aggregate_by_sim.insert(row.sim_id.clone(), row);
+    }
+
+    let mut wait_count_by_phone: HashMap<String, i64> = HashMap::new();
+    if let Ok(Some(api_key)) = AppSetting::get("firefox_api_key").await {
+        if !api_key.trim().is_empty() {
+            if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+                if let Ok(wait_resp) = firefox_api::get_wait_phone_list(&client, &api_key).await {
+                    if let Some(items) = wait_resp.data.and_then(|d| d.as_array().cloned()) {
+                        for item in items {
+                            let phone = item
+                                .get("Phone_Num")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            if phone.is_empty() {
+                                continue;
+                            }
+                            let key = normalize_phone_for_match(phone);
+                            if key.is_empty() {
+                                continue;
+                            }
+                            *wait_count_by_phone.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let sim_cards = match SimCard::query_all().await {
+        Ok(cards) => cards,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to query SIM cards: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let sim_card_by_id: HashMap<String, SimCard> = sim_cards
+        .into_iter()
+        .map(|card| (card.id.clone(), card))
+        .collect();
+
+    let mut port_rows: Vec<(String, Option<String>, String)> = Vec::new();
+    let sim_ids = modem_manager.get_sim_ids().await;
+    let mut active_ports: HashSet<String> = HashSet::new();
+
+    for sim_id in sim_ids {
+        if let Some(modem) = modem_manager.get_modem(&sim_id).await {
+            let phone_number = sim_card_by_id
+                .get(&sim_id)
+                .and_then(|c| c.phone_number.clone())
+                .unwrap_or_default();
+            active_ports.insert(modem.com_port.clone());
+            port_rows.push((modem.com_port.clone(), Some(sim_id.clone()), phone_number));
+        }
+    }
+
+    for (com_port, _baud_rate) in modem_manager.configured_ports() {
+        if active_ports.contains(&com_port) {
+            continue;
+        }
+
+        let mut sim_id: Option<String> = None;
+        let mut phone_number = String::new();
+        if let Some(last_known) = modem_manager.get_last_known_sim_card_for_port(&com_port).await {
+            phone_number = last_known.phone_number.unwrap_or_default();
+            sim_id = Some(last_known.id);
+        }
+        port_rows.push((com_port, sim_id, phone_number));
+    }
+
+    port_rows.sort_by_key(|row| com_port_sort_key(&row.0));
+
+    let mut result: Vec<FirefoxMoneyStatsRow> = Vec::new();
+    for (com_port, sim_id, phone_number) in port_rows {
+        let agg = sim_id
+            .as_ref()
+            .and_then(|id| aggregate_by_sim.get(id));
+
+        let normalized_phone = normalize_phone_for_match(&phone_number);
+        let waiting_sms_count = if normalized_phone.is_empty() {
+            0
+        } else {
+            *wait_count_by_phone.get(&normalized_phone).unwrap_or(&0)
+        };
+
+        let earning_item_names = agg
+            .and_then(|a| a.earning_item_names.clone())
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        result.push(FirefoxMoneyStatsRow {
+            com_port,
+            phone_number,
+            waiting_sms_count,
+            received_sms_count: agg.map(|a| a.received_sms_count).unwrap_or(0),
+            successful_uploaded_sms_count: agg
+                .map(|a| a.successful_uploaded_sms_count)
+                .unwrap_or(0),
+            failed_sms_count: agg.map(|a| a.failed_sms_count).unwrap_or(0),
+            money_earning: agg.map(|a| a.money_earning).unwrap_or(0.0),
+            earning_item_names,
+        });
+    }
+
+    (StatusCode::OK, Json(json!(result))).into_response()
 }
 
 async fn firefox_platform_rejection_reasons() -> Response {

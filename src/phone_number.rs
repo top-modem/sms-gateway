@@ -4,7 +4,6 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::db::{Contact, SimCard, Sms};
-use crate::modem::SmsSendMode;
 use crate::modem::manager::ModemManager;
 use crate::modem::types::SmsType;
 use log;
@@ -261,7 +260,7 @@ pub async fn sms_exchange(mm: Arc<ModemManager>, task: TaskHandle) {
                 id: receiver_sim.clone(),
                 name: receiver_phone.clone(),
             };
-            mm.send_sms(&sender_sim, &contact, message, SmsSendMode::Pdu, false)
+            mm.send_sms(&sender_sim, &contact, message)
                 .await
                 .map_err(|e| format!("发短信失败: {}", e))?;
 

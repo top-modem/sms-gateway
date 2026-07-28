@@ -225,6 +225,7 @@ const translations = {
     // Platform integration
     btn_connect_platform:     'Connect Platform',
     btn_platform_stats:       'Platform Stats',
+    btn_money:                'Money',
     btn_force_register:       'Register',
     force_register_running:   'Registering…',
     btn_register_again:       'Register Again',
@@ -289,6 +290,19 @@ const translations = {
     no_sms_attempts_row:             'No SMS attempts found for this row.',
     loading_detail:                  'Loading detail...',
     select_row_hint:                 'Select a current or legacy row to inspect its SMS attempts.',
+
+    // Money page
+    money_page_title:                'Money Dashboard',
+    err_load_money_stats:            'Failed to load money statistics',
+    money_col_port:                  'Port',
+    money_col_phone:                 'Phone',
+    money_col_waiting:               'Waiting',
+    money_col_received:              'Received',
+    money_col_uploaded:              'Uploaded',
+    money_col_failed:                'Failed',
+    money_col_earning:               'Earning',
+    money_col_earning_items:         'Earning Items',
+    money_empty:                     'No data yet.',
 
     platform_sim_hint:        'Only SIM cards with a phone number and a home or roaming network status can be uploaded.',
     net_not_registered:       'Not Registered',
@@ -630,6 +644,7 @@ const translations = {
     // Platform integration
     btn_connect_platform:     '平台',
     btn_platform_stats:       '统计',
+    btn_money:                '钱数',
     btn_force_register:       '注册',
     force_register_running:   '注册中…',
     btn_register_again:       '再次注册',
@@ -694,6 +709,19 @@ const translations = {
     no_sms_attempts_row:             '该记录暂无 SMS 尝试。',
     loading_detail:                  '加载详情中...',
     select_row_hint:                 '选择当前项目或历史记录以查看其 SMS 尝试。',
+
+    // Money page
+    money_page_title:                '钱数看板',
+    err_load_money_stats:            '加载钱数统计失败',
+    money_col_port:                  '端口',
+    money_col_phone:                 '手机号',
+    money_col_waiting:               '等码数',
+    money_col_received:              '收码数',
+    money_col_uploaded:              '上传数',
+    money_col_failed:                '失败数',
+    money_col_earning:               '盈利',
+    money_col_earning_items:         '盈利项目',
+    money_empty:                     '暂无数据。',
 
     platform_sim_hint:        '只有已设置电话号码且网络状态为本地或漫游的SIM卡才能上传。',
     net_not_registered:       '未注册',

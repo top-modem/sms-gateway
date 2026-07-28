@@ -294,16 +294,16 @@ fn maybe_start_windows_tray() {
 #[cfg(target_os = "windows")]
 fn format_startup_error_message(err: &str) -> String {
     if err.contains("10048") || err.contains("Only one usage") || err.contains("通常每个套接字地址") {
-        return "SMS Gateway is already running (port is in use). Please check the tray icons, or stop the existing instance first.".to_string();
+        return "小牛智卡 is already running (port is in use). Please check the tray icons, or stop the existing instance first.".to_string();
     }
-    format!("SMS Gateway failed to start: {}", err)
+    format!("小牛智卡 failed to start: {}", err)
 }
 
 #[cfg(target_os = "windows")]
 fn show_windows_error_dialog(message: &str) {
     let _ = native_dialog::MessageDialog::new()
         .set_type(native_dialog::MessageType::Error)
-        .set_title("SMS Gateway")
+        .set_title("小牛智卡")
         .set_text(message)
         .show_alert();
 }
@@ -321,12 +321,6 @@ fn open_browser_with_fallback(url: &str) {
 
 #[cfg(target_os = "windows")]
 fn run_windows_tray(url: String) -> anyhow::Result<()> {
-    let _ = native_dialog::MessageDialog::new()
-        .set_type(native_dialog::MessageType::Info)
-        .set_title("SMS Gateway")
-        .set_text("SMS Gateway is running in tray.")
-        .show_alert();
-
     let mut tray = create_windows_tray_item()?;
 
     let open_url = url.clone();
@@ -350,33 +344,37 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
         LoadIconW, LoadImageW, HICON, IDI_APPLICATION, IMAGE_ICON, LR_LOADFROMFILE,
     };
 
-    fn try_load_icon_from_exe_dir() -> Option<HICON> {
+    fn try_load_icon_from_candidates() -> Option<HICON> {
         let exe = std::env::current_exe().ok()?;
-        let icon_path = exe.parent()?.join("sms-gateway.ico");
-        if !icon_path.exists() {
-            return None;
+        let exe_dir = exe.parent()?;
+        let candidate_paths = [
+            exe_dir.join("icon").join("tray.ico"),
+            exe_dir.join("icon").join("xiaoniu-zhika.ico"),
+            exe_dir.join("xiaoniu-zhika.ico"),
+            exe_dir.join("sms-gateway.ico"),
+        ];
+
+        for icon_path in candidate_paths {
+            if !icon_path.exists() {
+                continue;
+            }
+
+            let wide: Vec<u16> = icon_path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let h = unsafe { LoadImageW(0, wide.as_ptr(), IMAGE_ICON, 64, 64, LR_LOADFROMFILE) };
+            if h != 0 {
+                return Some(h as HICON);
+            }
         }
 
-        let wide: Vec<u16> = icon_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let h = unsafe {
-            LoadImageW(
-                0,
-                wide.as_ptr(),
-                IMAGE_ICON,
-                64,
-                64,
-                LR_LOADFROMFILE,
-            )
-        };
-        if h == 0 { None } else { Some(h as HICON) }
+        None
     }
 
-    let hicon = try_load_icon_from_exe_dir().unwrap_or_else(|| unsafe {
+    let hicon = try_load_icon_from_candidates().unwrap_or_else(|| unsafe {
         // Guaranteed Windows fallback so tray creation never fails on icon loading.
         LoadIconW(0, IDI_APPLICATION as *const u16)
     });
@@ -385,7 +383,7 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
         anyhow::bail!("unable to load tray icon handle")
     }
 
-    tray_item::TrayItem::new("SMS Gateway", tray_item::IconSource::RawIcon(hicon))
+    tray_item::TrayItem::new("小牛智卡", tray_item::IconSource::RawIcon(hicon))
         .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 

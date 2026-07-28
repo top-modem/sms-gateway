@@ -2,9 +2,12 @@
   import { onMount, onDestroy } from 'svelte';
   import Icon from '@iconify/svelte';
   import { apiClient } from '../js/api.js';
+  import pkg from '../../package.json';
   import { getModuleLabel } from '../js/modem.js';
   import { logout } from '../stores/auth.js';
   import { t, lang } from '../js/i18n.js';
+
+  const APP_VERSION = pkg?.version ?? '0.0.0';
 
   // ── MCC → Country map ─────────────────────────────────────────────────────
   const mccMap = {
@@ -308,8 +311,7 @@
       <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('sim_dashboard_title')}</h1>
       {#if !loading}
         <span class="text-xs text-gray-400 dark:text-gray-500">
-          {rows.length === 1 ? $t('sim_count', { n: rows.length }) : $t('sim_count_plural', { n: rows.length })}
-          {#if selected.size > 0}· {$t('selected_count', { n: selected.size })}{/if}
+          v{APP_VERSION}
         </span>
       {/if}
     </div>

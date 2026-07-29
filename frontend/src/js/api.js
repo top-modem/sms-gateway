@@ -111,8 +111,9 @@ class ApiClient {
     /**
      * Get all SIM dynamic information
      */
-    async getAllSimsInfo() {
-        return FetchApi.get('/api/sims/info');
+    async getAllSimsInfo(lite = false) {
+        const query = lite ? { lite: '1' } : {};
+        return FetchApi.get('/api/sims/info', query);
     }
 
     /**

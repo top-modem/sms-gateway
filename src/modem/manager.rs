@@ -81,7 +81,7 @@ pub struct ModemManager {
     post_register_recovery_seq: AtomicU64,
 }
 
-const SIM_PROBE_FAILURE_THRESHOLD: u8 = 1;
+const SIM_PROBE_FAILURE_THRESHOLD: u8 = 2;
 
 impl ModemManager {
     pub async fn is_initialization_complete(&self) -> bool {

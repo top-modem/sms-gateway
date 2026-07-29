@@ -194,28 +194,39 @@
   });
 
   // ── Data fetching ─────────────────────────────────────────────────────────
-  async function fetchData() {
+  async function fetchData(loadFullDetails = false) {
     if (isFetching) return;
     isFetching = true;
     try {
       const [infoRes, cardsRes, statsRes] = await Promise.all([
-        apiClient.getAllSimsInfo(),
+        apiClient.getAllSimsInfo(true),
         apiClient.getAllSimCards(),
         apiClient.getSimStats(),
       ]);
       simsInfo  = Array.isArray(infoRes)  ? infoRes  : (infoRes?.data  ?? []);
       simCards  = Array.isArray(cardsRes) ? cardsRes : (cardsRes?.data ?? []);
       simStats  = Array.isArray(statsRes) ? statsRes : (statsRes?.data ?? []);
+
+      // Show basic rows as soon as possible; heavy AT details can finish later.
+      loading = false;
+
+      if (loadFullDetails) {
+        try {
+          const fullInfoRes = await apiClient.getAllSimsInfo(false);
+          simsInfo = Array.isArray(fullInfoRes) ? fullInfoRes : (fullInfoRes?.data ?? []);
+        } catch (detailErr) {
+          console.warn('Failed to load full SIM details:', detailErr);
+        }
+      }
     } catch (e) {
       error = e?.message ?? $t('err_load_sim');
     } finally {
       isFetching = false;
-      loading = false;
     }
   }
 
   async function refreshAll() {
-    await fetchData();
+    await fetchData(true);
   }
 
   // ── Force registration (强制注册) ─────────────────────────────────────────
@@ -252,7 +263,7 @@
   let pollTimer;
   onMount(async () => {
     await refreshAll();
-    pollTimer = setInterval(refreshAll, 4000);
+    pollTimer = setInterval(() => fetchData(false), 4000);
   });
 
   onDestroy(() => clearInterval(pollTimer));
@@ -412,7 +423,7 @@
         {reRegisterBusy ? $t('register_again_running') : $t('btn_register_again')}
       </button>
       <button
-        onclick={() => { loading = true; error = ''; fetchData(); }}
+        onclick={() => { loading = true; error = ''; fetchData(true); }}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300

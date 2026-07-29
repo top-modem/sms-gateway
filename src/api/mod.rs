@@ -476,7 +476,60 @@ async fn send_sms(
     }
 }
 
-async fn get_all_sim_info(State(modem_manager): State<ModemManagerRef>) -> Response {
+#[derive(Debug, Deserialize)]
+struct SimsInfoQuery {
+    lite: Option<String>,
+}
+
+async fn get_all_sim_info(
+    State(modem_manager): State<ModemManagerRef>,
+    Query(query): Query<SimsInfoQuery>,
+) -> Response {
+
+    let lite_mode = query
+        .lite
+        .as_deref()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+
+    if lite_mode {
+        let sim_ids = modem_manager.get_sim_ids().await;
+        let mut details = Vec::new();
+
+        for sim_id in sim_ids {
+            let sim_data = modem_manager.get_sim_card_cached(&sim_id).await;
+            let (com_port, baud_rate) = match modem_manager.get_modem(&sim_id).await {
+                Some(modem) => (modem.com_port.clone(), modem.baud_rate),
+                None => ("N/A".to_string(), 0),
+            };
+
+            let phone_number = sim_data.as_ref().and_then(|s| s.phone_number.clone());
+
+            details.push(json!({
+                "available": true,
+                "sim_id": sim_id,
+                "has_sim": true,
+                "name": sim_data.as_ref().map(|s| s.get_effective_alias()).unwrap_or_else(|| "SIM".to_string()),
+                "com_port": com_port,
+                "baud_rate": baud_rate,
+                "signal_quality": null,
+                "network_registration": null,
+                "operator_info": null,
+                "model_info": null,
+                "imei": null,
+                "phone_number": phone_number,
+                "sms_center": null,
+                "sim_status": null,
+                "memory_status": null,
+            }));
+        }
+
+        return (StatusCode::OK, Json(json!(details))).into_response();
+    }
+
     use futures::future::join_all;
     use tokio::time::{timeout, Duration};
 

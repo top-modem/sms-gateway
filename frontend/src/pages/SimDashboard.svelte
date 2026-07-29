@@ -203,7 +203,8 @@
         apiClient.getAllSimCards(),
         apiClient.getSimStats(),
       ]);
-      simsInfo  = Array.isArray(infoRes)  ? infoRes  : (infoRes?.data  ?? []);
+      const liteInfo = Array.isArray(infoRes) ? infoRes : (infoRes?.data ?? []);
+      simsInfo = mergeLiteInfoWithExisting(simsInfo, liteInfo);
       simCards  = Array.isArray(cardsRes) ? cardsRes : (cardsRes?.data ?? []);
       simStats  = Array.isArray(statsRes) ? statsRes : (statsRes?.data ?? []);
 
@@ -227,6 +228,30 @@
 
   async function refreshAll() {
     await fetchData(true);
+  }
+
+  function mergeLiteInfoWithExisting(existingRows, incomingRows) {
+    const existingBySimId = new Map((existingRows || []).map((row) => [String(row?.sim_id ?? ''), row]));
+
+    return (incomingRows || []).map((row) => {
+      const key = String(row?.sim_id ?? '');
+      const prev = existingBySimId.get(key);
+      if (!prev) return row;
+
+      return {
+        ...prev,
+        ...row,
+        // Keep expensive detail fields from last full fetch when lite poll gives null.
+        signal_quality: row?.signal_quality ?? prev?.signal_quality,
+        network_registration: row?.network_registration ?? prev?.network_registration,
+        operator_info: row?.operator_info ?? prev?.operator_info,
+        model_info: row?.model_info ?? prev?.model_info,
+        imei: row?.imei ?? prev?.imei,
+        sms_center: row?.sms_center ?? prev?.sms_center,
+        sim_status: row?.sim_status ?? prev?.sim_status,
+        memory_status: row?.memory_status ?? prev?.memory_status,
+      };
+    });
   }
 
   // ── Force registration (强制注册) ─────────────────────────────────────────

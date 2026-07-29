@@ -328,6 +328,23 @@ class ApiClient {
     }
 
     /**
+     * Get item options for money page selector (supports keyword search by item id/name).
+     * @param {string} [keyword='']
+     * @param {number} [limit=200]
+     */
+    async getFirefoxMoneyItems(keyword = '', limit = 200) {
+        return FetchApi.get('/api/firefox/money-items', { keyword, limit });
+    }
+
+    /**
+     * Get successful uploaded SMS count for a selected item.
+     * @param {string} itemId
+     */
+    async getFirefoxMoneyItemEarning(itemId) {
+        return FetchApi.get('/api/firefox/money-item-earning', { item_id: itemId });
+    }
+
+    /**
      * Get grouped platform rejection reasons from failed SMS attempts.
      */
     async getFirefoxPlatformRejectionReasons() {

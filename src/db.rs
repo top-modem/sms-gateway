@@ -1519,6 +1519,14 @@ pub struct FirefoxMoneyStat {
     pub earning_item_names: Option<String>,
 }
 
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct MoneyItemOption {
+    pub item_id: String,
+    pub item_name: String,
+    pub country_id: Option<String>,
+    pub item_uprice: Option<f64>,
+}
+
 impl FirefoxMoneyStat {
     pub async fn query_all_by_sim() -> Result<Vec<Self>> {
         let pool = get_pool()?;
@@ -1563,6 +1571,75 @@ impl FirefoxMoneyStat {
         .fetch_all(pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn query_money_item_options(
+        keyword: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<MoneyItemOption>> {
+        let pool = get_pool()?;
+        let keyword = keyword
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("%{}%", k));
+
+        let rows = sqlx::query_as::<_, MoneyItemOption>(
+            r#"
+            WITH ids AS (
+                SELECT DISTINCT item_id FROM firefox_platform_items
+                UNION
+                SELECT DISTINCT item_id FROM firefox_item_prices
+                UNION
+                SELECT DISTINCT platform_item_id AS item_id
+                FROM sms
+                WHERE platform_item_id IS NOT NULL AND TRIM(platform_item_id) <> ''
+            ),
+            price_agg AS (
+                SELECT item_id, MAX(country_id) AS country_id, MAX(item_uprice) AS item_uprice
+                FROM firefox_item_prices
+                GROUP BY item_id
+            )
+            SELECT
+                i.item_id AS item_id,
+                COALESCE(fin.item_name, i.item_id) AS item_name,
+                p.country_id AS country_id,
+                p.item_uprice AS item_uprice
+            FROM ids i
+            LEFT JOIN firefox_item_names fin ON fin.item_id = i.item_id
+            LEFT JOIN price_agg p ON p.item_id = i.item_id
+            WHERE (
+                ?1 IS NULL
+                OR i.item_id LIKE ?1
+                OR COALESCE(fin.item_name, '') LIKE ?1
+            )
+            ORDER BY i.item_id
+            LIMIT ?2
+            "#,
+        )
+        .bind(keyword)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn query_successful_uploaded_count_for_item(item_id: &str) -> Result<i64> {
+        let pool = get_pool()?;
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sms
+            WHERE send = 0
+              AND platform_item_id = ?
+              AND uploaded_to_platform = 1
+            "#,
+        )
+        .bind(item_id)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(count)
     }
 }
 

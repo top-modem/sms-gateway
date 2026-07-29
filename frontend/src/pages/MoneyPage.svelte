@@ -9,6 +9,13 @@
   let rows = $state([]);
   let loading = $state(true);
   let error = $state('');
+  let itemOptions = $state([]);
+  let itemKeyword = $state('');
+  let selectedItemId = $state('');
+  let selectedItemName = $state('');
+  let unitPriceInput = $state('');
+  let selectedSuccessCount = $state(0);
+  let selectedEarningLoading = $state(false);
 
   let pollTimer;
 
@@ -17,6 +24,17 @@
     if (!Number.isFinite(num)) return '0';
     return num.toFixed(2).replace(/\.00$/, '');
   }
+
+  function parseUnitPrice(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+  }
+
+  const selectedUnitPrice = $derived(parseUnitPrice(unitPriceInput));
+  const selectedEarning = $derived(
+    selectedUnitPrice == null ? 0 : selectedSuccessCount * selectedUnitPrice
+  );
 
   async function fetchData() {
     try {
@@ -30,8 +48,54 @@
     }
   }
 
+  async function fetchItemOptions(keyword = '') {
+    try {
+      const data = await apiClient.getFirefoxMoneyItems(keyword, 300);
+      itemOptions = Array.isArray(data) ? data : (data?.data ?? []);
+    } catch (e) {
+      console.warn('Failed to load money item options:', e);
+      itemOptions = [];
+    }
+  }
+
+  async function fetchSelectedItemEarning() {
+    selectedSuccessCount = 0;
+    if (!selectedItemId) return;
+
+    selectedEarningLoading = true;
+    try {
+      const data = await apiClient.getFirefoxMoneyItemEarning(selectedItemId);
+      const payload = data?.data ?? data;
+      selectedSuccessCount = Number(payload?.success_count ?? 0);
+      if (!Number.isFinite(selectedSuccessCount)) {
+        selectedSuccessCount = 0;
+      }
+    } catch (e) {
+      console.warn('Failed to load selected item earning stats:', e);
+      selectedSuccessCount = 0;
+    } finally {
+      selectedEarningLoading = false;
+    }
+  }
+
+  function onChooseItem(event) {
+    const itemId = event.currentTarget?.value || '';
+    selectedItemId = itemId;
+    const item = itemOptions.find((opt) => opt.item_id === itemId);
+    selectedItemName = item?.item_name || '';
+    if (!unitPriceInput && item?.item_uprice != null) {
+      unitPriceInput = String(item.item_uprice);
+    }
+    fetchSelectedItemEarning();
+  }
+
+  function onItemKeywordInput(event) {
+    itemKeyword = event.currentTarget?.value || '';
+    fetchItemOptions(itemKeyword);
+  }
+
   onMount(async () => {
-    await fetchData();
+    await Promise.all([fetchData(), fetchItemOptions('')]);
     pollTimer = setInterval(fetchData, 5000);
   });
 
@@ -73,6 +137,71 @@
         {error}
       </div>
     {:else}
+      <section class="border-b border-gray-300 bg-white px-3 py-3 dark:border-zinc-700 dark:bg-zinc-800">
+        <div class="max-w-xl overflow-hidden rounded border border-gray-300 dark:border-zinc-600">
+          <div class="grid grid-cols-[88px,1fr] border-b border-gray-300 dark:border-zinc-600">
+            <label for="money-item-select" class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
+              {$t('money_item_label')}
+            </label>
+            <div class="p-2">
+              <input
+                type="text"
+                class="mb-2 w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                placeholder={$t('money_item_search_placeholder')}
+                value={itemKeyword}
+                oninput={onItemKeywordInput}
+              />
+              <select
+                id="money-item-select"
+                class="w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                value={selectedItemId}
+                onchange={onChooseItem}
+              >
+                <option value="">{$t('money_item_select_placeholder')}</option>
+                {#each itemOptions as opt}
+                  <option value={opt.item_id}>
+                    {opt.item_id} | {opt.item_name}
+                  </option>
+                {/each}
+              </select>
+            </div>
+          </div>
+          <div class="grid grid-cols-[88px,1fr]">
+            <label for="money-unit-price" class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
+              {$t('money_unit_price_label')}
+            </label>
+            <div class="p-2">
+              <input
+                id="money-unit-price"
+                type="number"
+                min="0"
+                step="0.01"
+                class="w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                placeholder={$t('money_unit_price_placeholder')}
+                bind:value={unitPriceInput}
+              />
+            </div>
+          </div>
+        </div>
+
+        {#if selectedItemId}
+          <div class="mt-3 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-700 dark:bg-blue-900/25 dark:text-blue-200">
+            <div class="font-semibold">
+              {$t('money_selected_item_result_title')}
+            </div>
+            <div class="mt-1 text-xs">
+              {$t('money_selected_item_result_item')}: {selectedItemId}{selectedItemName ? ` | ${selectedItemName}` : ''}
+            </div>
+            <div class="mt-1 text-xs">
+              {$t('money_selected_item_result_upload_count')}: {selectedEarningLoading ? '...' : selectedSuccessCount}
+            </div>
+            <div class="mt-1 text-sm font-bold text-[#10a248] dark:text-green-300">
+              {$t('money_selected_item_result_earning')}: {formatMoney(selectedEarning)}
+            </div>
+          </div>
+        {/if}
+      </section>
+
       <section class="overflow-hidden border-y border-gray-300 bg-white dark:border-zinc-700 dark:bg-zinc-800">
         <div class="overflow-x-auto">
           <table class="money-table min-w-full text-[13px] leading-none">

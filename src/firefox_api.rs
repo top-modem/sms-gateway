@@ -648,7 +648,17 @@ pub async fn upload_sms(
             ),
         }
 
+        if let Ok(r) = &retry_resp {
+            if r.code == "1" {
+                crate::sound_player::play_sms_upload_success_sound();
+            }
+        }
+
         return retry_resp;
+    }
+
+    if first_ok.code == "1" {
+        crate::sound_player::play_sms_upload_success_sound();
     }
 
     Ok(first_ok)

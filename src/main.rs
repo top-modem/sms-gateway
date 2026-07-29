@@ -26,6 +26,7 @@ mod mms_worker;
 mod modem;
 mod phone_number;
 mod service_control;
+mod sound_player;
 mod transcribe;
 #[cfg(test)]
 mod tests;

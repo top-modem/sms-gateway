@@ -254,6 +254,8 @@ pub async fn run_api(
             "/firefox/money-stats",
             get(firefox_money_stats).with_state(modem_manager.clone()),
         )
+        .route("/firefox/money-items", get(firefox_money_items))
+        .route("/firefox/money-item-earning", get(firefox_money_item_earning))
         .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
         // ── Firefox upload retry queue routes ────────────────────────────
         .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
@@ -2529,6 +2531,17 @@ struct FirefoxMoneyStatsRow {
     earning_item_names: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MoneyItemsQuery {
+    keyword: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoneyItemEarningQuery {
+    item_id: String,
+}
+
 fn normalize_phone_for_match(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_digit())
@@ -2703,6 +2716,44 @@ async fn firefox_platform_rejection_reasons() -> Response {
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to query rejection reason summary: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn firefox_money_items(Query(query): Query<MoneyItemsQuery>) -> Response {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    match crate::db::FirefoxMoneyStat::query_money_item_options(query.keyword.as_deref(), limit)
+        .await
+    {
+        Ok(items) => (StatusCode::OK, Json(json!(items))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query money item options: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn firefox_money_item_earning(Query(query): Query<MoneyItemEarningQuery>) -> Response {
+    let item_id = query.item_id.trim();
+    if item_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_id is required"})),
+        )
+            .into_response();
+    }
+
+    match crate::db::FirefoxMoneyStat::query_successful_uploaded_count_for_item(item_id).await {
+        Ok(success_count) => (
+            StatusCode::OK,
+            Json(json!({"item_id": item_id, "success_count": success_count})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query selected item earning stats: {}", e)})),
         )
             .into_response(),
     }

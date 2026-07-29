@@ -527,6 +527,45 @@ async fn get_all_sim_info(
             }));
         }
 
+        let active_ports: std::collections::HashSet<String> = details
+            .iter()
+            .filter_map(|entry| entry["com_port"].as_str().map(str::to_owned))
+            .collect();
+
+        for (com_port, baud_rate) in modem_manager.configured_ports() {
+            if active_ports.contains(&com_port) {
+                continue;
+            }
+
+            let last_known = modem_manager.get_last_known_sim_card_for_port(&com_port).await;
+            details.push(json!({
+                "available": false,
+                "sim_id": last_known.as_ref().map(|card| card.id.clone()),
+                "has_sim": false,
+                "name": last_known.as_ref().map(|card| card.id.clone()),
+                "com_port": com_port,
+                "baud_rate": baud_rate,
+                "signal_quality": null,
+                "network_registration": null,
+                "operator_info": null,
+                "model_info": null,
+                "imei": null,
+                "phone_number": last_known.as_ref().and_then(|card| card.phone_number.clone()),
+                "sms_center": null,
+                "sim_status": null,
+                "memory_status": null,
+            }));
+        }
+
+        details.sort_by_key(|entry| {
+            entry["com_port"]
+                .as_str()
+                .unwrap_or("")
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+        });
+
         return (StatusCode::OK, Json(json!(details))).into_response();
     }
 

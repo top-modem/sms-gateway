@@ -226,7 +226,9 @@
     if (selected.size === 0 || forceRegBusy) return;
     forceRegBusy = true;
     try {
-      await apiClient.forceRegister([...selected]);
+      const selectedSimIds = getSelectedSimIds();
+      if (selectedSimIds.length === 0) return;
+      await apiClient.forceRegister(selectedSimIds);
       // Refresh live data so network status reflects the new registration
       fetchData();
     } catch (e) {
@@ -240,7 +242,9 @@
     if (selected.size === 0 || reRegisterBusy) return;
     reRegisterBusy = true;
     try {
-      await apiClient.reRegister([...selected]);
+      const selectedSimIds = getSelectedSimIds();
+      if (selectedSimIds.length === 0) return;
+      await apiClient.reRegister(selectedSimIds);
       fetchData();
     } catch (e) {
       console.error('Re-register failed', e);
@@ -258,7 +262,19 @@
   onDestroy(() => clearInterval(pollTimer));
 
   // ── Selection ─────────────────────────────────────────────────────────────
-  function handleRowSelection(event, id, index) {
+  function getSelectedSimIds() {
+    return rows
+      .filter((r) => selected.has(r.info.com_port))
+      .map((r) => r.info.sim_id)
+      .filter((id) => !!id);
+  }
+
+  function getSingleSelectedSimId() {
+    const ids = getSelectedSimIds();
+    return ids.length === 1 ? ids[0] : null;
+  }
+
+  function handleRowSelection(event, port, index) {
     const isShift = !!(event?.shiftKey);
     const next = new Set(selected);
 
@@ -271,27 +287,27 @@
       const start = Math.min(lastClickedRowIndex, index);
       const end = Math.max(lastClickedRowIndex, index);
       for (const row of rows.slice(start, end + 1)) {
-        next.add(row.info.sim_id);
+        next.add(row.info.com_port);
       }
       selected = next;
       lastClickedRowIndex = index;
       return;
     }
 
-    next.has(id) ? next.delete(id) : next.add(id);
+    next.has(port) ? next.delete(port) : next.add(port);
     selected = next;
     lastClickedRowIndex = index;
   }
 
   function areAllRowsSelected() {
-    return rows.length > 0 && rows.every(r => selected.has(r.info.sim_id));
+    return rows.length > 0 && rows.every(r => selected.has(r.info.com_port));
   }
 
   function toggleAll() {
     if (areAllRowsSelected()) {
       selected = new Set();
     } else {
-      selected = new Set(rows.map(r => r.info.sim_id));
+      selected = new Set(rows.map(r => r.info.com_port));
     }
     lastClickedRowIndex = null;
   }
@@ -368,7 +384,7 @@
         {$t('btn_mms')}
       </button>
       <button
-        onclick={() => onNavigate(selected.size === 1 ? [...selected][0] : null)}
+        onclick={() => onNavigate(getSingleSelectedSimId())}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -378,7 +394,7 @@
         {$t('col_sms')}
       </button>
       <button
-        onclick={() => onNavigateCall(selected.size === 1 ? [...selected][0] : null)}
+        onclick={() => onNavigateCall(getSingleSelectedSimId())}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -389,7 +405,7 @@
       </button>
       <button
         onclick={forceRegister}
-        disabled={selected.size === 0 || forceRegBusy || reRegisterBusy}
+        disabled={getSelectedSimIds().length === 0 || forceRegBusy || reRegisterBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -401,7 +417,7 @@
       </button>
       <button
         onclick={reRegister}
-        disabled={selected.size === 0 || reRegisterBusy || forceRegBusy}
+        disabled={getSelectedSimIds().length === 0 || reRegisterBusy || forceRegBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -412,7 +428,7 @@
         {reRegisterBusy ? $t('register_again_running') : $t('btn_register_again')}
       </button>
       <button
-        onclick={() => { loading = true; error = ''; fetchData(true); }}
+        onclick={() => { loading = true; error = ''; fetchData(); }}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
@@ -518,7 +534,7 @@
             </tr>
           {:else}
             {#each rows as { info, card, stats }, i}
-              {@const isSelected = selected.has(info.sim_id)}
+              {@const isSelected = selected.has(info.com_port)}
               {@const net = getNetStatus(info.network_registration)}
               {@const bars = signalBars(info.signal_quality?.rssi)}
               {@const hasSim = info.has_sim !== false}
@@ -529,17 +545,17 @@
                        {isSelected
                          ? 'bg-blue-50 dark:bg-blue-900/20'
                          : 'hover:bg-gray-50 dark:hover:bg-zinc-800/50'}"
-                onclick={(e) => handleRowSelection(e, info.sim_id, i)}
-                onmouseenter={() => hoveredRow = info.sim_id}
+                onclick={(e) => handleRowSelection(e, info.com_port, i)}
+                onmouseenter={() => hoveredRow = info.com_port}
                 onmouseleave={() => hoveredRow = null}
               >
                 <!-- # / checkbox -->
                 <td class="px-3 py-2.5 text-center text-gray-400 select-none">
-                  {#if isSelected || hoveredRow === info.sim_id}
+                  {#if isSelected || hoveredRow === info.com_port}
                     <input
                       type="checkbox"
                       checked={isSelected}
-                      onchange={(e) => handleRowSelection(e, info.sim_id, i)}
+                      onchange={(e) => handleRowSelection(e, info.com_port, i)}
                        onclick={(e) => e.stopPropagation()}
                       class="rounded cursor-pointer accent-blue-500"
                     />

@@ -603,11 +603,7 @@
                 <td class="px-3 py-2.5 whitespace-nowrap">
                   <div class="flex items-center gap-2">
                     <span class="font-mono text-gray-700 dark:text-gray-200">
-                      {#if info.available === false}
-                        —
-                      {:else}
-                        {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
-                      {/if}
+                      {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
                     </span>
                     {#if hasSim}
                       <button
@@ -637,11 +633,7 @@
 
                 <!-- Country -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {#if info.available === false}
-                    <span class="text-gray-400">—</span>
-                  {:else}
-                    {getMccCountry(card.imsi, $lang)}
-                  {/if}
+                  {card.imsi ? getMccCountry(card.imsi, $lang) : '—'}
                 </td>
 
                 <!-- Platform status -->
@@ -669,20 +661,12 @@
 
                 <!-- ICCID (= sim_id / card.id) -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {#if info.available === false}
-                    <span class="text-gray-400">—</span>
-                  {:else}
-                    {card.id ?? info.sim_id ?? '—'}
-                  {/if}
+                  {card.id ?? info.sim_id ?? '—'}
                 </td>
 
                 <!-- IMSI -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {#if info.available === false}
-                    <span class="text-gray-400">—</span>
-                  {:else}
-                    {card.imsi ?? '—'}
-                  {/if}
+                  {card.imsi ?? '—'}
                 </td>
 
                 <!-- IMEI -->

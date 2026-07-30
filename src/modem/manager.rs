@@ -81,7 +81,7 @@ pub struct ModemManager {
     post_register_recovery_seq: AtomicU64,
 }
 
-const SIM_PROBE_FAILURE_THRESHOLD: u8 = 2;
+const SIM_PROBE_FAILURE_THRESHOLD: u8 = 4;
 
 impl ModemManager {
     pub async fn is_initialization_complete(&self) -> bool {
@@ -152,7 +152,7 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
-        const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+        const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
         loop {
             tokio::time::sleep(PROBE_INTERVAL).await;

@@ -194,66 +194,28 @@
   });
 
   // ── Data fetching ─────────────────────────────────────────────────────────
-  async function fetchData(loadFullDetails = false) {
+  async function fetchData() {
     if (isFetching) return;
     isFetching = true;
     try {
       const [infoRes, cardsRes, statsRes] = await Promise.all([
-        apiClient.getAllSimsInfo(true),
+        apiClient.getAllSimsInfo(),
         apiClient.getAllSimCards(),
         apiClient.getSimStats(),
       ]);
-      const liteInfo = Array.isArray(infoRes) ? infoRes : (infoRes?.data ?? []);
-      simsInfo = mergeLiteInfoWithExisting(simsInfo, liteInfo);
+      simsInfo  = Array.isArray(infoRes)  ? infoRes  : (infoRes?.data  ?? []);
       simCards  = Array.isArray(cardsRes) ? cardsRes : (cardsRes?.data ?? []);
       simStats  = Array.isArray(statsRes) ? statsRes : (statsRes?.data ?? []);
-
-      // Show basic rows as soon as possible; heavy AT details can finish later.
-      loading = false;
-
-      if (loadFullDetails) {
-        try {
-          const fullInfoRes = await apiClient.getAllSimsInfo(false);
-          simsInfo = Array.isArray(fullInfoRes) ? fullInfoRes : (fullInfoRes?.data ?? []);
-          shouldRetryFullDetails = false;
-        } catch (detailErr) {
-          console.warn('Failed to load full SIM details:', detailErr);
-          shouldRetryFullDetails = true;
-        }
-      }
     } catch (e) {
       error = e?.message ?? $t('err_load_sim');
     } finally {
       isFetching = false;
+      loading = false;
     }
   }
 
   async function refreshAll() {
-    await fetchData(true);
-  }
-
-  function mergeLiteInfoWithExisting(existingRows, incomingRows) {
-    const existingBySimId = new Map((existingRows || []).map((row) => [String(row?.sim_id ?? ''), row]));
-
-    return (incomingRows || []).map((row) => {
-      const key = String(row?.sim_id ?? '');
-      const prev = existingBySimId.get(key);
-      if (!prev) return row;
-
-      return {
-        ...prev,
-        ...row,
-        // Keep expensive detail fields from last full fetch when lite poll gives null.
-        signal_quality: row?.signal_quality ?? prev?.signal_quality,
-        network_registration: row?.network_registration ?? prev?.network_registration,
-        operator_info: row?.operator_info ?? prev?.operator_info,
-        model_info: row?.model_info ?? prev?.model_info,
-        imei: row?.imei ?? prev?.imei,
-        sms_center: row?.sms_center ?? prev?.sms_center,
-        sim_status: row?.sim_status ?? prev?.sim_status,
-        memory_status: row?.memory_status ?? prev?.memory_status,
-      };
-    });
+    await fetchData();
   }
 
   // ── Force registration (强制注册) ─────────────────────────────────────────
@@ -288,15 +250,9 @@
   }
 
   let pollTimer;
-  let shouldRetryFullDetails = false;
-  let pollCycle = 0;
   onMount(async () => {
     await refreshAll();
-    pollTimer = setInterval(() => {
-      pollCycle += 1;
-      const periodicFullRefresh = pollCycle % 8 === 0;
-      fetchData(shouldRetryFullDetails || periodicFullRefresh);
-    }, 4000);
+    pollTimer = setInterval(fetchData, 4000);
   });
 
   onDestroy(() => clearInterval(pollTimer));

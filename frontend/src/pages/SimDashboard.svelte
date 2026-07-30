@@ -215,8 +215,10 @@
         try {
           const fullInfoRes = await apiClient.getAllSimsInfo(false);
           simsInfo = Array.isArray(fullInfoRes) ? fullInfoRes : (fullInfoRes?.data ?? []);
+          shouldRetryFullDetails = false;
         } catch (detailErr) {
           console.warn('Failed to load full SIM details:', detailErr);
+          shouldRetryFullDetails = true;
         }
       }
     } catch (e) {
@@ -286,9 +288,15 @@
   }
 
   let pollTimer;
+  let shouldRetryFullDetails = false;
+  let pollCycle = 0;
   onMount(async () => {
     await refreshAll();
-    pollTimer = setInterval(() => fetchData(false), 4000);
+    pollTimer = setInterval(() => {
+      pollCycle += 1;
+      const periodicFullRefresh = pollCycle % 8 === 0;
+      fetchData(shouldRetryFullDetails || periodicFullRefresh);
+    }, 4000);
   });
 
   onDestroy(() => clearInterval(pollTimer));

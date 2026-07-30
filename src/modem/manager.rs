@@ -84,6 +84,12 @@ pub struct ModemManager {
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 4;
 
 impl ModemManager {
+    async fn set_last_known_sim_port(&self, com_port: &str, sim_id: &str) {
+        let mut last_known = self.last_known_sim_ids_by_port.write().await;
+        last_known.retain(|port, id| id != sim_id || port == com_port);
+        last_known.insert(com_port.to_string(), sim_id.to_string());
+    }
+
     pub async fn is_initialization_complete(&self) -> bool {
         *self.initialization_complete.read().await
     }
@@ -227,10 +233,7 @@ impl ModemManager {
                         Ok(cards) => {
                             if let Some(card) = cards.into_iter().next() {
                                 self.sim_cards_cache.write().await.insert(sim_id.clone(), card);
-                                self.last_known_sim_ids_by_port
-                                    .write()
-                                    .await
-                                    .insert(com_port.clone(), sim_id.clone());
+                                self.set_last_known_sim_port(&com_port, &sim_id).await;
                                 log::info!(
                                     "[recheck] Updated cache for reconnected SIM {} on port {}",
                                     sim_id, com_port
@@ -770,6 +773,7 @@ impl ModemManager {
             let mut last_known = self.last_known_sim_ids_by_port.write().await;
             last_known.clear();
             for (sim_id, modem) in modems.iter() {
+                last_known.retain(|port, id| id != sim_id || port == &modem.com_port);
                 last_known.insert(modem.com_port.clone(), sim_id.clone());
             }
         }
@@ -1253,6 +1257,11 @@ impl ModemManager {
         for (iccid, com_port, probed_modem) in demotions {
             log::info!("[recheck] Demoting modem {} on {}", iccid, com_port);
             let baud_rate = probed_modem.baud_rate;
+
+            // This port is no longer hosting a valid SIM session; drop stale
+            // fallback mapping immediately so unavailable rows won't mirror a
+            // SIM that has moved to another COM port.
+            self.last_known_sim_ids_by_port.write().await.remove(&com_port);
 
             // Remove the map entry only if it is still the exact modem we probed.
             // A concurrent reconnect worker may already have replaced it with the

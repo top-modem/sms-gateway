@@ -619,7 +619,11 @@
                 <td class="px-3 py-2.5 whitespace-nowrap">
                   <div class="flex items-center gap-2">
                     <span class="font-mono text-gray-700 dark:text-gray-200">
-                      {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
+                      {#if info.available === false}
+                        —
+                      {:else}
+                        {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
+                      {/if}
                     </span>
                     {#if hasSim}
                       <button
@@ -649,7 +653,11 @@
 
                 <!-- Country -->
                 <td class="px-3 py-2.5 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                  {card.imsi ? getMccCountry(card.imsi, $lang) : '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {card.imsi ? getMccCountry(card.imsi, $lang) : '—'}
+                  {/if}
                 </td>
 
                 <!-- Platform status -->
@@ -677,12 +685,20 @@
 
                 <!-- ICCID (= sim_id / card.id) -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {card.id ?? info.sim_id ?? '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {card.id ?? info.sim_id ?? '—'}
+                  {/if}
                 </td>
 
                 <!-- IMSI -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {card.imsi ?? '—'}
+                  {#if info.available === false}
+                    <span class="text-gray-400">—</span>
+                  {:else}
+                    {card.imsi ?? '—'}
+                  {/if}
                 </td>
 
                 <!-- IMEI -->

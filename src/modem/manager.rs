@@ -158,7 +158,7 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
-        const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+        const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
         loop {
             // If the port is no longer in the unavailable list, this worker is done.
@@ -708,20 +708,38 @@ impl ModemManager {
             );
         }
 
-        let pre_sim_id = match modem.get_sim_iccid().await {
-            Ok(Some(id)) => Some(id),
-            Ok(None) => {
-                log::warn!("No SIM detected on port {}, treating as unavailable", port);
-                return Err(anyhow::anyhow!("No SIM detected"));
+        // Newly inserted SIMs can take a short moment before ICCID becomes readable.
+        // Retry quickly here so hot-inserted cards do not wait for the next worker cycle.
+        let mut pre_sim_id = None;
+        for attempt in 1..=3 {
+            match modem.get_sim_iccid().await {
+                Ok(Some(id)) => {
+                    pre_sim_id = Some(id);
+                    break;
+                }
+                Ok(None) => {
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(700)).await;
+                        continue;
+                    }
+                    log::warn!("No SIM detected on port {}, treating as unavailable", port);
+                    return Err(anyhow::anyhow!("No SIM detected"));
+                }
+                Err(e) => {
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(700)).await;
+                        continue;
+                    }
+                    log::warn!(
+                        "Failed to read SIM ICCID on port {} (cannot communicate): {}. Treating as unavailable.",
+                        port, e
+                    );
+                    return Err(anyhow::anyhow!("Failed to read SIM ICCID: {}", e));
+                }
             }
-            Err(e) => {
-                log::warn!(
-                    "Failed to read SIM ICCID on port {} (cannot communicate): {}. Treating as unavailable.",
-                    port, e
-                );
-                return Err(anyhow::anyhow!("Failed to read SIM ICCID: {}", e));
-            }
-        };
+        }
+
+        let pre_sim_id = pre_sim_id;
 
         let is_new_sim = Self::is_new_sim_id(pre_sim_id.as_ref().unwrap()).await;
 

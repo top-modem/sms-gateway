@@ -164,6 +164,7 @@ impl ModemManager {
     ) {
         const PROBE_INTERVAL: Duration = Duration::from_secs(3);
         let mut consecutive_init_failures: u8 = 0;
+        let mut probe_miss_streak: u8 = 0;
 
         loop {
             // If the port is no longer in the unavailable list, this worker is done.
@@ -178,7 +179,18 @@ impl ModemManager {
                 Modem::quick_probe_port(&com_port, baud_rate).await
             };
             if !present {
-                continue;
+                probe_miss_streak = probe_miss_streak.saturating_add(1);
+                if probe_miss_streak < 3 {
+                    tokio::time::sleep(PROBE_INTERVAL).await;
+                    continue;
+                }
+                log::debug!(
+                    "Port {} quick probe missed {} times; forcing a full init attempt to avoid false negatives.",
+                    com_port,
+                    probe_miss_streak
+                );
+            } else {
+                probe_miss_streak = 0;
             }
 
             // Full init for ports that look like they have a modem/SIM.

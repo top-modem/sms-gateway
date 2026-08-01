@@ -118,14 +118,11 @@ const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
     fn should_defer_sms_reads_from_snapshots(snapshots: &[PortRuntimeSnapshot]) -> bool {
-        const RECOVERY_PORT_THRESHOLD: usize = 4;
         snapshots
             .iter()
-            .filter(|snapshot| {
+            .any(|snapshot| {
                 snapshot.last_sim_id.is_some() && snapshot.lifecycle != PortLifecycle::Active
             })
-            .count()
-            >= RECOVERY_PORT_THRESHOLD
     }
 
     async fn begin_port_probe_cycle(&self, com_port: &str) -> u64 {
@@ -1078,6 +1075,15 @@ impl ModemManager {
     }
 
     async fn init_new_sim_sms_data(&self, new_sim_ids: Vec<String>) {
+        let snapshots = self.get_port_runtime_snapshots().await;
+        if Self::should_defer_sms_reads_from_snapshots(&snapshots) {
+            log::info!(
+                "Deferring initial SMS backfill for {} new SIM(s) while port recovery is still in progress",
+                new_sim_ids.len()
+            );
+            return;
+        }
+
         let mut futures = FuturesUnordered::new();
 
         for sim_id in new_sim_ids {

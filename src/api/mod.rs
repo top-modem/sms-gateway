@@ -489,17 +489,17 @@ async fn get_all_sim_info(
         }
     }
 
-    let sim_ids = modem_manager.get_sim_ids();
-
-    // 并发获取所有调制解调器信息，带超时控制
-    let sim_ids = sim_ids.await;
-    let modem_futures: Vec<_> = sim_ids
+    let port_snapshots = modem_manager.get_port_runtime_snapshots().await;
+    let modem_futures: Vec<_> = port_snapshots
         .iter()
-        .map(|sim_id| {
-            let sim_id = sim_id.clone();
+        .filter(|snapshot| snapshot.active_sim_id.is_some())
+        .map(|snapshot| {
+            let sim_id = snapshot.active_sim_id.clone().unwrap_or_default();
+            let com_port = snapshot.com_port.clone();
+            let baud_rate = snapshot.baud_rate;
             let modem_manager = modem_manager.clone();
             async move {
-                log::debug!("Getting SIM details for: {}", sim_id);
+                log::debug!("Getting SIM details for: {} on {}", sim_id, com_port);
 
                 // 并发执行所有AT命令，每个都有超时保护
                 let signal_future = timeout(
@@ -592,6 +592,8 @@ async fn get_all_sim_info(
 
                 (
                     sim_id,
+                    com_port,
+                    baud_rate,
                     signal_data,
                     signal_error,
                     network_data,
@@ -619,6 +621,8 @@ async fn get_all_sim_info(
     let mut details = Vec::new();
     for (
         sim_id,
+        com_port,
+        baud_rate,
         signal_data,
         _signal_error,
         network_data,
@@ -648,12 +652,6 @@ async fn get_all_sim_info(
             sim.get_effective_alias()
         } else {
             format!("SIM {}", sim_id)
-        };
-
-        // Get modem info for com_port and baud_rate
-        let (com_port, baud_rate) = match modem_manager.get_modem(&sim_id).await {
-            Some(modem) => (modem.com_port.clone(), modem.baud_rate),
-            _ => ("N/A".to_string(), 0),
         };
 
         let phone_number = sim_data.as_ref().and_then(|s| s.phone_number.clone());
@@ -686,22 +684,22 @@ async fn get_all_sim_info(
         .filter_map(|entry| entry["sim_id"].as_str().map(str::to_owned))
         .collect();
 
-    for (com_port, baud_rate) in modem_manager.configured_ports() {
-        if active_ports.contains(&com_port) {
+    for snapshot in port_snapshots {
+        if active_ports.contains(&snapshot.com_port) {
             continue;
         }
 
         let last_known = modem_manager
-            .get_last_known_sim_card_for_port(&com_port)
+            .get_last_known_sim_card_for_port(&snapshot.com_port)
             .await
             .filter(|card| !active_sim_ids.contains(&card.id));
         details.push(json!({
-            "available": false,
-            "sim_id": last_known.as_ref().map(|card| card.id.clone()),
-            "has_sim": false,
+            "available": snapshot.active_sim_id.is_some() && matches!(snapshot.lifecycle, crate::modem::manager::PortLifecycle::Active),
+            "sim_id": snapshot.active_sim_id.clone().or_else(|| last_known.as_ref().map(|card| card.id.clone())),
+            "has_sim": snapshot.active_sim_id.is_some(),
             "name": last_known.as_ref().map(|card| card.id.clone()),
-            "com_port": com_port,
-            "baud_rate": baud_rate,
+            "com_port": snapshot.com_port,
+            "baud_rate": snapshot.baud_rate,
             "signal_quality": null,
             "network_registration": null,
             "operator_info": null,

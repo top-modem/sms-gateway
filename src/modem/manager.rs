@@ -52,6 +52,7 @@ impl TranscribeConfig {
 pub struct ModemManager {
     modems: Arc<RwLock<HashMap<String, Arc<Modem>>>>,
     sim_cards_cache: Arc<RwLock<HashMap<String, SimCard>>>,
+    port_runtime: Arc<RwLock<HashMap<String, PortRuntimeState>>>,
     /// Last SIM ID observed on each COM port so unavailable-port rows can
     /// still display the prior SIM identity instead of going blank.
     last_known_sim_ids_by_port: Arc<RwLock<HashMap<String, String>>>,
@@ -82,12 +83,111 @@ pub struct ModemManager {
     post_register_recovery_tasks: RwLock<HashMap<String, (u64, JoinHandle<()>)>>,
     /// Monotonic sequence used to avoid stale task cleanup races.
     post_register_recovery_seq: AtomicU64,
+    /// Monotonic sequence used to version per-port probe/init cycles.
+    port_runtime_seq: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortLifecycle {
+    Unknown,
+    Probing,
+    Active,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortRuntimeState {
+    pub generation: u64,
+    pub lifecycle: PortLifecycle,
+    pub active_sim_id: Option<String>,
+    pub last_sim_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortRuntimeSnapshot {
+    pub com_port: String,
+    pub baud_rate: u32,
+    pub generation: u64,
+    pub lifecycle: PortLifecycle,
+    pub active_sim_id: Option<String>,
+    pub last_sim_id: Option<String>,
 }
 
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 4;
 const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
+    async fn begin_port_probe_cycle(&self, com_port: &str) -> u64 {
+        let generation = self.port_runtime_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut runtime = self.port_runtime.write().await;
+        let entry = runtime.entry(com_port.to_string()).or_insert(PortRuntimeState {
+            generation,
+            lifecycle: PortLifecycle::Unknown,
+            active_sim_id: None,
+            last_sim_id: None,
+        });
+        entry.generation = generation;
+        entry.lifecycle = PortLifecycle::Probing;
+        entry.active_sim_id = None;
+        generation
+    }
+
+    async fn mark_port_active(&self, com_port: &str, sim_id: &str, generation: u64) -> bool {
+        let mut runtime = self.port_runtime.write().await;
+        let entry = runtime.entry(com_port.to_string()).or_insert(PortRuntimeState {
+            generation,
+            lifecycle: PortLifecycle::Unknown,
+            active_sim_id: None,
+            last_sim_id: None,
+        });
+        if entry.generation > generation {
+            return false;
+        }
+        entry.generation = generation;
+        entry.lifecycle = PortLifecycle::Active;
+        entry.active_sim_id = Some(sim_id.to_string());
+        entry.last_sim_id = Some(sim_id.to_string());
+        true
+    }
+
+    async fn mark_port_unavailable(&self, com_port: &str, sim_id: Option<&str>) {
+        let mut runtime = self.port_runtime.write().await;
+        let entry = runtime.entry(com_port.to_string()).or_insert(PortRuntimeState {
+            generation: 0,
+            lifecycle: PortLifecycle::Unknown,
+            active_sim_id: None,
+            last_sim_id: None,
+        });
+        entry.lifecycle = PortLifecycle::Unavailable;
+        entry.active_sim_id = None;
+        if let Some(sim_id) = sim_id {
+            entry.last_sim_id = Some(sim_id.to_string());
+        }
+    }
+
+    pub async fn get_port_runtime_snapshots(&self) -> Vec<PortRuntimeSnapshot> {
+        let runtime = self.port_runtime.read().await;
+        self.devices
+            .iter()
+            .map(|device| {
+                let state = runtime.get(&device.com_port).cloned().unwrap_or(PortRuntimeState {
+                    generation: 0,
+                    lifecycle: PortLifecycle::Unknown,
+                    active_sim_id: None,
+                    last_sim_id: None,
+                });
+                PortRuntimeSnapshot {
+                    com_port: device.com_port.clone(),
+                    baud_rate: device.baud_rate,
+                    generation: state.generation,
+                    lifecycle: state.lifecycle,
+                    active_sim_id: state.active_sim_id,
+                    last_sim_id: state.last_sim_id,
+                }
+            })
+            .collect()
+    }
+
     async fn set_last_known_sim_port(&self, com_port: &str, sim_id: &str) {
         let mut last_known = self.last_known_sim_ids_by_port.write().await;
         last_known.retain(|port, id| id != sim_id || port == com_port);
@@ -111,6 +211,8 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
+        self.mark_port_unavailable(&com_port, None).await;
+
         let mut ports = self.unavailable_ports.write().await;
         if !ports.iter().any(|(p, _)| p == &com_port) {
             ports.push((com_port.clone(), baud_rate));
@@ -171,6 +273,8 @@ impl ModemManager {
             if !self.unavailable_ports.read().await.iter().any(|(p, _)| p == &com_port) {
                 break;
             }
+
+            let generation = self.begin_port_probe_cycle(&com_port).await;
 
             // Quick probe: empty ports fail fast. Acquire the shared probe semaphore
             // so a large number of unavailable ports cannot overwhelm the USB hub.
@@ -253,6 +357,16 @@ impl ModemManager {
                             com_port, sim_id
                         );
                         consecutive_init_failures = consecutive_init_failures.saturating_add(1);
+                        continue;
+                    }
+
+                    if !self.mark_port_active(&com_port, &sim_id, generation).await {
+                        log::debug!(
+                            "Ignoring stale promotion result for {} on {} (generation {})",
+                            sim_id,
+                            com_port,
+                            generation
+                        );
                         continue;
                     }
 
@@ -341,6 +455,7 @@ impl ModemManager {
                         "Port {} quick probe passed but full init failed: {}",
                         com_port, e
                     );
+                    self.mark_port_unavailable(&com_port, None).await;
                     consecutive_init_failures = consecutive_init_failures.saturating_add(1);
                 }
             }
@@ -411,10 +526,23 @@ impl ModemManager {
             .saturating_mul(4)
             .clamp(8, 32)
             .min(device_count);
+        let mut port_runtime = HashMap::new();
+        for device in &config.devices {
+            port_runtime.insert(
+                device.com_port.clone(),
+                PortRuntimeState {
+                    generation: 0,
+                    lifecycle: PortLifecycle::Unknown,
+                    active_sim_id: None,
+                    last_sim_id: None,
+                },
+            );
+        }
 
         Self {
             modems: Arc::new(RwLock::new(HashMap::new())),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
+            port_runtime: Arc::new(RwLock::new(port_runtime)),
             last_known_sim_ids_by_port: Arc::new(RwLock::new(HashMap::new())),
             probe_semaphore: Arc::new(Semaphore::new(probe_concurrency)),
             urc_tasks: RwLock::new(HashMap::new()),
@@ -429,6 +557,7 @@ impl ModemManager {
             initialization_complete: RwLock::new(false),
             post_register_recovery_tasks: RwLock::new(HashMap::new()),
             post_register_recovery_seq: AtomicU64::new(0),
+            port_runtime_seq: AtomicU64::new(0),
         }
     }
 
@@ -668,8 +797,10 @@ impl ModemManager {
             let sms_storage = device.sms_storage.or(self.default_sms_storage);
             let temp_device_id = format!("device_{}", index);
             let sem = init_semaphore.clone();
+            let mm = self.clone();
 
             init_futs.push(async move {
+                let generation = mm.begin_port_probe_cycle(&port).await;
                 let _permit = sem.acquire().await;
                 let result = Self::initialize_single_modem_safe(
                     port.clone(),
@@ -680,12 +811,12 @@ impl ModemManager {
                     force_uk_mcc_to_46001,
                 )
                 .await;
-                (port, index, result)
+                (port, index, generation, result)
             });
         }
 
         let mut unavailable_after_init: Vec<(String, u32, usize)> = Vec::new();
-        while let Some((port, index, result)) = init_futs.next().await {
+        while let Some((port, index, generation, result)) = init_futs.next().await {
             match result {
                 Ok((sim_id, modem, is_new)) => {
                     if is_new {
@@ -694,10 +825,13 @@ impl ModemManager {
                     let modem_arc = Arc::new(modem);
                     // Make the active modem visible to the API immediately,
                     // rather than waiting for the whole initialization pass.
+                    self.mark_port_active(&port, &sim_id, generation).await;
+                    self.set_last_known_sim_port(&port, &sim_id).await;
                     self.modems.write().await.insert(sim_id, modem_arc);
                 }
                 Err(e) => {
                     error!("Failed to initialize modem on {}: {}", port, e);
+                    self.mark_port_unavailable(&port, None).await;
                     unavailable_after_init.push((port, self.devices[index].baud_rate, index));
                 }
             }
@@ -926,39 +1060,9 @@ impl ModemManager {
     /// after a SIM has been pulled out (especially when the server was stopped
     /// at the time the SIM was removed).
     async fn cleanup_stale_sim_cards(&self) -> anyhow::Result<()> {
-        let modems = self.modems.read().await;
-        let active_ids: std::collections::HashSet<&str> =
-            modems.keys().map(|k| k.as_str()).collect();
-        if active_ids.is_empty() {
-            log::info!("No active modems; skipping stale sim_cards cleanup");
-            return Ok(());
-        }
-
-        let all_cards = SimCard::query_all().await?;
-        let mut deleted = 0;
-        for card in all_cards {
-            if !active_ids.contains(card.id.as_str()) {
-                match SimCard::delete_by_id(&card.id).await {
-                    Ok(true) => {
-                        deleted += 1;
-                        log::info!(
-                            "[cleanup] Deleted stale sim_cards row for absent SIM {}",
-                            card.id
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(e) => log::warn!(
-                        "[cleanup] Failed to delete stale sim_cards row {}: {}",
-                        card.id,
-                        e
-                    ),
-                }
-            }
-        }
-
-        if deleted > 0 {
-            info!("Cleaned up {} stale sim_cards row(s) for removed SIMs", deleted);
-        }
+        log::info!(
+            "Skipping destructive stale sim_cards cleanup during runtime churn; keeping last-known SIM identity rows intact"
+        );
         Ok(())
     }
 
@@ -1446,29 +1550,7 @@ impl ModemManager {
                 if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {
                     task.abort();
                 }
-
-                // Remove demoted SIM from cache so dashboard doesn't show stale data
-                let mut cache = self.sim_cards_cache.write().await;
-                if cache.remove(&iccid).is_some() {
-                    log::info!("[recheck] Removed demoted SIM {} from cache (port {})", iccid, com_port);
-                }
-                // Also delete the DB record so the SIM card list does not retain
-                // stale IMSI/ICCID/phone info after the physical SIM is removed.
-                match SimCard::delete_by_id(&iccid).await {
-                    Ok(true) => log::info!(
-                        "[recheck] Deleted sim_cards DB row for removed SIM {} (port {})",
-                        iccid, com_port
-                    ),
-                    Ok(false) => log::debug!(
-                        "[recheck] No sim_cards DB row to delete for SIM {} (port {})",
-                        iccid, com_port
-                    ),
-                    Err(e) => log::warn!(
-                        "[recheck] Failed to delete sim_cards DB row for SIM {} (port {}): {}",
-                        iccid, com_port, e
-                    ),
-                }
-                drop(cache);
+                self.mark_port_unavailable(&com_port, Some(&iccid)).await;
             } else {
                 log::info!(
                     "[recheck] Skipped demotion of {} on {}: active entry was already replaced (SIM re-detected on another port).",

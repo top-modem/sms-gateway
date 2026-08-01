@@ -1208,7 +1208,8 @@ impl ModemManager {
         enum ProbeOutcome {
             Healthy { iccid: String, modem: Arc<Modem> },
             Swap { iccid: String, com_port: String, modem: Arc<Modem> },
-            MissingOrError { iccid: String, com_port: String, modem: Arc<Modem> },
+            ConfirmedAbsent { iccid: String, com_port: String, modem: Arc<Modem> },
+            TransientIssue { iccid: String, com_port: String },
         }
 
         let mut demotion_futs = FuturesUnordered::new();
@@ -1229,14 +1230,34 @@ impl ModemManager {
                     .map(|s| s.trim().eq_ignore_ascii_case("READY"))
                     .unwrap_or(false);
                 if !status_ready {
-                    log::info!(
-                        "SIM status on {} is not READY (was {}, status={:?}). Treating as absent.",
+                    let explicit_absent = status
+                        .as_deref()
+                        .map(|s| {
+                            let upper = s.trim().to_ascii_uppercase();
+                            upper.contains("REMOVED")
+                                || upper.contains("NOT INSERTED")
+                                || upper.contains("SIM FAILURE")
+                        })
+                        .unwrap_or(false);
+                    if explicit_absent {
+                        log::info!(
+                            "SIM status on {} confirms absence (was {}, status={:?}).",
+                            modem.com_port, iccid, status
+                        );
+                        return ProbeOutcome::ConfirmedAbsent {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                            modem,
+                        };
+                    }
+
+                    log::debug!(
+                        "SIM status on {} is inconclusive (was {}, status={:?}); keeping modem active for now.",
                         modem.com_port, iccid, status
                     );
-                    return ProbeOutcome::MissingOrError {
+                    return ProbeOutcome::TransientIssue {
                         iccid,
                         com_port: modem.com_port.clone(),
-                        modem,
                     };
                 }
 
@@ -1260,36 +1281,33 @@ impl ModemManager {
                         }
                     }
                     Ok(Ok(None)) => {
-                        log::info!(
-                            "ICCID read returned empty on {} (was {}). Treating as absent.",
+                        log::debug!(
+                            "ICCID read returned empty on {} (was {}). Keeping modem active for now.",
                             modem.com_port, iccid
                         );
-                        ProbeOutcome::MissingOrError {
+                        ProbeOutcome::TransientIssue {
                             iccid,
                             com_port: modem.com_port.clone(),
-                            modem,
                         }
                     }
                     Ok(Err(e)) => {
-                        log::info!(
-                            "ICCID read failed on {} (was {}): {}. Treating as absent.",
+                        log::debug!(
+                            "ICCID read failed on {} (was {}): {}. Keeping modem active for now.",
                             modem.com_port, iccid, e
                         );
-                        ProbeOutcome::MissingOrError {
+                        ProbeOutcome::TransientIssue {
                             iccid,
                             com_port: modem.com_port.clone(),
-                            modem,
                         }
                     }
                     Err(_) => {
-                        log::info!(
-                            "ICCID read timed out on {} (was {}). Treating as absent.",
+                        log::debug!(
+                            "ICCID read timed out on {} (was {}). Keeping modem active for now.",
                             modem.com_port, iccid
                         );
-                        ProbeOutcome::MissingOrError {
+                        ProbeOutcome::TransientIssue {
                             iccid,
                             com_port: modem.com_port.clone(),
-                            modem,
                         }
                     }
                 }
@@ -1360,7 +1378,7 @@ impl ModemManager {
                     self.sim_probe_fail_counts.write().await.remove(&iccid);
                     demotions.push((iccid, com_port, modem));
                 }
-                ProbeOutcome::MissingOrError { iccid, com_port, modem } => {
+                ProbeOutcome::ConfirmedAbsent { iccid, com_port, modem } => {
                     let in_cooldown = self
                         .sim_probe_cooldown_until
                         .read()
@@ -1408,6 +1426,12 @@ impl ModemManager {
                             iccid
                         );
                     }
+                }
+                ProbeOutcome::TransientIssue { iccid, com_port } => {
+                    log::debug!(
+                        "Transient probe issue on {} (SIM {}); leaving modem active.",
+                        com_port, iccid
+                    );
                 }
             }
         }

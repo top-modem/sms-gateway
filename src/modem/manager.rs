@@ -117,6 +117,17 @@ const SIM_PROBE_FAILURE_THRESHOLD: u8 = 4;
 const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
+    fn should_defer_sms_reads_from_snapshots(snapshots: &[PortRuntimeSnapshot]) -> bool {
+        const RECOVERY_PORT_THRESHOLD: usize = 4;
+        snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.last_sim_id.is_some() && snapshot.lifecycle != PortLifecycle::Active
+            })
+            .count()
+            >= RECOVERY_PORT_THRESHOLD
+    }
+
     async fn begin_port_probe_cycle(&self, com_port: &str) -> u64 {
         let generation = self.port_runtime_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut runtime = self.port_runtime.write().await;
@@ -1236,6 +1247,18 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         webhook_manager: Option<webhook::WebhookManager>,
     ) {
+        let snapshots = self.get_port_runtime_snapshots().await;
+        if Self::should_defer_sms_reads_from_snapshots(&snapshots) {
+            log::info!(
+                "Deferring SMS read cycle while {} previously occupied port(s) are still recovering",
+                snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.last_sim_id.is_some() && snapshot.lifecycle != PortLifecycle::Active)
+                    .count()
+            );
+            return;
+        }
+
         // Snapshot the active modems and release the map lock BEFORE any serial
         // I/O. Holding the read guard across the SMS reads below blocks all
         // writers (SIM promotions/demotions) for the duration of the slowest

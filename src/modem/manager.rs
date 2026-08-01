@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::api::sse_manager::CallEvent;
 use crate::api::SseManager;
@@ -73,6 +74,8 @@ pub struct ModemManager {
     default_sms_storage: Option<SmsStorage>,
     /// Transient AT+CCID probe failures before a modem is considered truly unavailable.
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
+    /// Cooldown window after a demotion to avoid immediate re-demotion loops.
+    sim_probe_cooldown_until: RwLock<HashMap<String, Instant>>,
     /// True once the initial background modem initialization has completed.
     initialization_complete: RwLock<bool>,
     /// One delayed post-register recovery task per SIM (task_id, handle).
@@ -82,6 +85,7 @@ pub struct ModemManager {
 }
 
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 4;
+const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
     async fn set_last_known_sim_port(&self, com_port: &str, sim_id: &str) {
@@ -189,6 +193,57 @@ impl ModemManager {
             .await
             {
                 Ok((sim_id, modem, is_new)) => {
+                    let modem_arc = Arc::new(modem);
+
+                    // Stabilization gate: confirm READY + same ICCID twice in a row
+                    // before promotion to reduce rapid port flip oscillation.
+                    let stable = {
+                        let first_ok = tokio::time::timeout(Duration::from_secs(2), modem_arc.get_sim_status())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten()
+                            .map(|s| s.trim().eq_ignore_ascii_case("READY"))
+                            .unwrap_or(false)
+                            && tokio::time::timeout(Duration::from_secs(2), modem_arc.get_sim_iccid())
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .flatten()
+                                .map(|id| id == sim_id)
+                                .unwrap_or(false);
+
+                        if !first_ok {
+                            false
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            let second_ready = tokio::time::timeout(Duration::from_secs(2), modem_arc.get_sim_status())
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .flatten()
+                                .map(|s| s.trim().eq_ignore_ascii_case("READY"))
+                                .unwrap_or(false);
+                            let second_same_iccid = tokio::time::timeout(Duration::from_secs(2), modem_arc.get_sim_iccid())
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .flatten()
+                                .map(|id| id == sim_id)
+                                .unwrap_or(false);
+                            second_ready && second_same_iccid
+                        }
+                    };
+
+                    if !stable {
+                        log::info!(
+                            "Port {} init result for SIM {} failed stability gate; retrying later",
+                            com_port, sim_id
+                        );
+                        consecutive_init_failures = consecutive_init_failures.saturating_add(1);
+                        continue;
+                    }
+
                     // Guard against unstable SIM "port flapping": if the same SIM
                     // is already active on another port and that port is still READY,
                     // ignore this promotion attempt and keep probing this port.
@@ -238,7 +293,7 @@ impl ModemManager {
                         .modems
                         .write()
                         .await
-                        .insert(sim_id.clone(), Arc::new(modem));
+                        .insert(sim_id.clone(), modem_arc);
                     let moved_from: Option<(String, u32)> = previous.and_then(|old_modem| {
                         let old_port = old_modem.com_port.clone();
                         let old_baud = old_modem.baud_rate;
@@ -391,6 +446,7 @@ impl ModemManager {
             max_concurrent_modem_init: init_concurrency,
             default_sms_storage: config.settings.sms_storage,
             sim_probe_fail_counts: RwLock::new(HashMap::new()),
+            sim_probe_cooldown_until: RwLock::new(HashMap::new()),
             initialization_complete: RwLock::new(false),
             post_register_recovery_tasks: RwLock::new(HashMap::new()),
             post_register_recovery_seq: AtomicU64::new(0),
@@ -1248,6 +1304,7 @@ impl ModemManager {
             match result {
                 ProbeOutcome::Healthy { iccid, modem } => {
                     self.sim_probe_fail_counts.write().await.remove(&iccid);
+                    self.sim_probe_cooldown_until.write().await.remove(&iccid);
 
                     // Ensure the sim_cards DB row exists and has the current IMSI.
                     // A transient demotion may have deleted the row while the modem
@@ -1304,6 +1361,22 @@ impl ModemManager {
                     demotions.push((iccid, com_port, modem));
                 }
                 ProbeOutcome::MissingOrError { iccid, com_port, modem } => {
+                    let in_cooldown = self
+                        .sim_probe_cooldown_until
+                        .read()
+                        .await
+                        .get(&iccid)
+                        .copied()
+                        .map(|until| until > Instant::now())
+                        .unwrap_or(false);
+                    if in_cooldown {
+                        log::debug!(
+                            "SIM {} on {} is in demotion cooldown; skipping this failure sample",
+                            iccid, com_port
+                        );
+                        continue;
+                    }
+
                     let failures = {
                         let mut fail_counts = self.sim_probe_fail_counts.write().await;
                         let count = fail_counts.entry(iccid.clone()).or_insert(0);
@@ -1317,6 +1390,14 @@ impl ModemManager {
                             failures, com_port, iccid
                         );
                         self.sim_probe_fail_counts.write().await.remove(&iccid);
+                        self
+                            .sim_probe_cooldown_until
+                            .write()
+                            .await
+                            .insert(
+                                iccid.clone(),
+                                Instant::now() + Duration::from_secs(SIM_DEMOTION_COOLDOWN_SECS),
+                            );
                         demotions.push((iccid, com_port, modem));
                     } else {
                         log::debug!(

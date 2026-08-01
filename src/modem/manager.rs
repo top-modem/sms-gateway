@@ -161,8 +161,6 @@ impl ModemManager {
         const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
         loop {
-            tokio::time::sleep(PROBE_INTERVAL).await;
-
             // If the port is no longer in the unavailable list, this worker is done.
             if !self.unavailable_ports.read().await.iter().any(|(p, _)| p == &com_port) {
                 break;
@@ -277,6 +275,8 @@ impl ModemManager {
                     );
                 }
             }
+
+            tokio::time::sleep(PROBE_INTERVAL).await;
         }
 
         // Clean up our own task handle so the supervisor does not respawn us.
@@ -567,7 +567,16 @@ impl ModemManager {
         let init_semaphore = Arc::new(Semaphore::new(max_concurrent));
         let mut init_futs = FuturesUnordered::new();
 
-        for index in probed_present {
+        let init_candidates: Vec<usize> = if probed_present.is_empty() {
+            log::warn!(
+                "Quick probe found 0 active ports; running immediate full-init fallback across all configured ports"
+            );
+            (0..self.devices.len()).collect()
+        } else {
+            probed_present
+        };
+
+        for index in init_candidates {
             let device = &self.devices[index];
             let port = device.com_port.clone();
             let baud_rate = device.baud_rate;

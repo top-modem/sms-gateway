@@ -326,19 +326,27 @@ impl ModemManager {
     }
 
     pub fn new(config: &crate::config::AppConfig) -> Self {
+        let init_concurrency = config.settings.max_concurrent_modem_init.unwrap_or(3).max(1);
+        let device_count = config.devices.len().max(1);
+        // Quick probes are lightweight compared with full modem init. Keep probe
+        // concurrency higher so hot-insert detection across many ports (e.g. 17-32)
+        // is not serialized behind a tiny init semaphore.
+        let probe_concurrency = init_concurrency
+            .saturating_mul(4)
+            .clamp(8, 32)
+            .min(device_count);
+
         Self {
             modems: Arc::new(RwLock::new(HashMap::new())),
             sim_cards_cache: Arc::new(RwLock::new(HashMap::new())),
             last_known_sim_ids_by_port: Arc::new(RwLock::new(HashMap::new())),
-            probe_semaphore: Arc::new(Semaphore::new(
-                config.settings.max_concurrent_modem_init.unwrap_or(3).max(1),
-            )),
+            probe_semaphore: Arc::new(Semaphore::new(probe_concurrency)),
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
             unavailable_port_tasks: RwLock::new(HashMap::new()),
             devices: config.devices.clone(),
             force_uk_mcc_to_46001: config.settings.force_uk_mcc_to_46001.unwrap_or(true),
-            max_concurrent_modem_init: config.settings.max_concurrent_modem_init.unwrap_or(3),
+            max_concurrent_modem_init: init_concurrency,
             default_sms_storage: config.settings.sms_storage,
             sim_probe_fail_counts: RwLock::new(HashMap::new()),
             initialization_complete: RwLock::new(false),

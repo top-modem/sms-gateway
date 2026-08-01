@@ -5,6 +5,8 @@ use fancy_regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, fmt, path::Path, str::FromStr};
 
+const MAX_WINDOWS_COM_PORT: u16 = 128;
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub settings: Settings,
@@ -186,16 +188,65 @@ impl AppConfig {
         // Deserialize the config file into the `AppConfig` struct
         let mut app_config: AppConfig = config.try_deserialize()?;
 
-        // Backward compatibility: allow config files that omit [[devices]] and
-        // derive COM ports from windows_com_port_start/end.
+        // Prefer system COM auto-discovery when [[devices]] is omitted.
+        // Fallback to legacy windows_com_port_start/end only when discovery
+        // yields no ports (for backward compatibility / restricted systems).
         if app_config.devices.is_empty() {
-            app_config.devices = build_devices_from_windows_range(&app_config.settings)?;
+            app_config.devices = build_devices_from_system_ports(&app_config.settings)?;
+            if app_config.devices.is_empty() {
+                app_config.devices = build_devices_from_windows_range(&app_config.settings)?;
+            }
         }
 
         // Validate the configuration
         test_config(&app_config)?;
 
         Ok(app_config)
+    }
+}
+
+fn parse_windows_com_number(port_name: &str) -> Option<u16> {
+    let trimmed = port_name.trim();
+    if !trimmed.to_ascii_uppercase().starts_with("COM") {
+        return None;
+    }
+    let num = trimmed[3..].trim().parse::<u16>().ok()?;
+    if (1..=MAX_WINDOWS_COM_PORT).contains(&num) {
+        Some(num)
+    } else {
+        None
+    }
+}
+
+fn build_devices_from_system_ports(settings: &Settings) -> Result<Vec<Device>> {
+    let _ = settings;
+
+    #[cfg(windows)]
+    {
+        let mut com_numbers: Vec<u16> = serialport::available_ports()
+            .context("Failed to enumerate system serial ports")?
+            .iter()
+            .filter_map(|p| parse_windows_com_number(&p.port_name))
+            .collect();
+
+        com_numbers.sort_unstable();
+        com_numbers.dedup();
+
+        let devices = com_numbers
+            .into_iter()
+            .map(|num| Device {
+                com_port: format!("COM{}", num),
+                baud_rate: 115_200,
+                sms_storage: None,
+            })
+            .collect();
+
+        return Ok(devices);
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
     }
 }
 
@@ -217,8 +268,12 @@ fn build_devices_from_windows_range(settings: &Settings) -> Result<Vec<Device>> 
             start
         );
     }
-    if end > 128 {
-        anyhow::bail!("Fatal: windows_com_port_end ({}) exceeds maximum 128", end);
+    if end > MAX_WINDOWS_COM_PORT {
+        anyhow::bail!(
+            "Fatal: windows_com_port_end ({}) exceeds maximum {}",
+            end,
+            MAX_WINDOWS_COM_PORT
+        );
     }
 
     let mut devices = Vec::new();

@@ -23,6 +23,7 @@ config = "0.15"
 log = "0.4"
 flexi_logger = "0.29"
 tokio-serial = "5.4"
+serialport = "4.5"
 toml = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "chrono", "sqlite"] }
 structopt = "0.3"

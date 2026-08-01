@@ -256,39 +256,6 @@ impl ModemManager {
                         continue;
                     }
 
-                    // Guard against unstable SIM "port flapping": if the same SIM
-                    // is already active on another port and that port is still READY,
-                    // ignore this promotion attempt and keep probing this port.
-                    if let Some(existing_modem) = self.modems.read().await.get(&sim_id).cloned() {
-                        if existing_modem.com_port != com_port {
-                            let existing_ready = tokio::time::timeout(
-                                Duration::from_secs(2),
-                                existing_modem.get_sim_status(),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok())
-                            .flatten()
-                            .map(|s| s.trim().eq_ignore_ascii_case("READY"))
-                            .unwrap_or(false);
-
-                            if existing_ready {
-                                log::info!(
-                                    "Ignoring unstable SIM move {} from {} to {} because existing port is still READY",
-                                    sim_id,
-                                    existing_modem.com_port,
-                                    com_port
-                                );
-                                consecutive_init_failures = consecutive_init_failures.saturating_add(1);
-                                let backoff_secs = (3_u64)
-                                    .saturating_mul(1_u64 << consecutive_init_failures.min(4))
-                                    .min(30);
-                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                                continue;
-                            }
-                        }
-                    }
-
                     info!(
                         "Port {} reconnected with SIM {}. Promoting to active.",
                         com_port, sim_id

@@ -902,7 +902,10 @@ impl Modem {
         if response.contains("OK\r\n") {
             Ok(response)
         } else {
-            error!("Command failed: {}", response);
+            // Non-OK responses (e.g. +CME ERROR: 10/13 for absent SIMs) are
+            // expected on empty ports; the error is propagated so callers log
+            // it with context. Keep this low-level line at debug to avoid noise.
+            debug!("Command failed: {}", Self::format_log(&response));
             Err(io::Error::other(format!(
                 "Command failed: {}",
                 Self::format_log(&response)

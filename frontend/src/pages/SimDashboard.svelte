@@ -608,8 +608,12 @@
                 <td class="px-3 py-2.5 whitespace-nowrap font-medium">
                   {#if hasSim}
                     <span class="{net.cls}">{net.key ? $t(net.key, { n: net.codeN }) : '—'}</span>
+                  {:else if info.sim_status}
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">
+                      {info.sim_status}
+                    </span>
                   {:else if info.available === false}
-                    <span class="text-gray-400">—</span>
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">{$t('sim_removed')}</span>
                   {:else}
                     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-gray-100 dark:bg-zinc-700 text-gray-500 dark:text-gray-400">{$t('no_sim')}</span>
                   {/if}

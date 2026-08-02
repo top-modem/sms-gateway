@@ -113,7 +113,7 @@ pub struct PortRuntimeSnapshot {
     pub last_sim_id: Option<String>,
 }
 
-const SIM_PROBE_FAILURE_THRESHOLD: u8 = 4;
+const SIM_PROBE_FAILURE_THRESHOLD: u8 = 2;
 const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
@@ -383,34 +383,42 @@ impl ModemManager {
                         com_port, sim_id
                     );
 
-                    // Insert the new modem. If this SIM was previously active on a
-                    // different port, that old port is now abandoned (no active
-                    // modem, no watcher) and would vanish from the dashboard, so
-                    // mark it unavailable. The recheck supervisor will spawn its
-                    // reconnect worker (calling add_unavailable_port directly here
-                    // would create a worker -> add_unavailable_port -> worker
-                    // future cycle that is not Send).
-                    let previous = self
-                        .modems
-                        .write()
-                        .await
-                        .insert(sim_id.clone(), modem_arc);
-                    let moved_from: Option<(String, u32)> = previous.and_then(|old_modem| {
-                        let old_port = old_modem.com_port.clone();
-                        let old_baud = old_modem.baud_rate;
-                        drop(old_modem);
-                        (old_port != com_port).then_some((old_port, old_baud))
-                    });
-                    if let Some((old_port, old_baud)) = moved_from {
+                    // The modems map is keyed by physical COM port. If this same
+                    // SIM currently maps to a different port (it was physically
+                    // moved), release that stale port so its identity does not
+                    // linger; the recheck supervisor will re-probe and re-init it.
+                    let stale_ports: Vec<String> = {
+                        let modems = self.modems.read().await;
+                        let mut v = Vec::new();
+                        for (p, m) in modems.iter() {
+                            if p != &com_port
+                                && m.sim_id.read().await.as_deref() == Some(sim_id.as_str())
+                            {
+                                v.push(p.clone());
+                            }
+                        }
+                        v
+                    };
+                    for stale_port in stale_ports {
                         info!(
-                            "SIM {} moved from {} to {}; marking {} as unavailable.",
-                            sim_id, old_port, com_port, old_port
+                            "SIM {} moved to {}; releasing stale port {}.",
+                            sim_id, com_port, stale_port
                         );
+                        self.modems.write().await.remove(&stale_port);
+                        self.mark_port_unavailable(&stale_port, Some(&sim_id)).await;
+                        let stale_baud = self
+                            .devices
+                            .iter()
+                            .find(|d| d.com_port == stale_port)
+                            .map(|d| d.baud_rate)
+                            .unwrap_or(baud_rate);
                         let mut ports = self.unavailable_ports.write().await;
-                        if !ports.iter().any(|(p, _)| p == &old_port) {
-                            ports.push((old_port, old_baud));
+                        if !ports.iter().any(|(pp, _)| pp == &stale_port) {
+                            ports.push((stale_port, stale_baud));
                         }
                     }
+                    // Key the modem by its physical COM port, not by SIM id.
+                    self.modems.write().await.insert(com_port.clone(), modem_arc);
 
                     if is_new {
                         self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
@@ -835,7 +843,8 @@ impl ModemManager {
                     // rather than waiting for the whole initialization pass.
                     self.mark_port_active(&port, &sim_id, generation).await;
                     self.set_last_known_sim_port(&port, &sim_id).await;
-                    self.modems.write().await.insert(sim_id, modem_arc);
+                    // Key the modem by its physical COM port, not by SIM id.
+                    self.modems.write().await.insert(port.clone(), modem_arc);
                 }
                 Err(e) => {
                     error!("Failed to initialize modem on {}: {}", port, e);
@@ -949,7 +958,7 @@ impl ModemManager {
                         tokio::time::sleep(Duration::from_millis(700)).await;
                         continue;
                     }
-                    log::warn!("No SIM detected on port {}, treating as unavailable", port);
+                    log::debug!("No SIM detected on port {}, treating as unavailable", port);
                     return Err(anyhow::anyhow!("No SIM detected"));
                 }
                 Err(e) => {
@@ -957,7 +966,7 @@ impl ModemManager {
                         tokio::time::sleep(Duration::from_millis(700)).await;
                         continue;
                     }
-                    log::warn!(
+                    log::debug!(
                         "Failed to read SIM ICCID on port {} (cannot communicate): {}. Treating as unavailable.",
                         port, e
                     );
@@ -980,6 +989,11 @@ impl ModemManager {
 
         let sim_id = pre_sim_id.unwrap();
 
+        // Guarantee the modem carries its resolved SIM id even if init_sim_info's
+        // DB step failed. The modems map is keyed by COM port and lookups scan by
+        // each modem's own sim_id, so this must always be set on a promoted modem.
+        *modem.sim_id.write().await = Some(sim_id.clone());
+
         info!(
             "Successfully initialized modem on {} with SIM ID: {}",
             port, sim_id
@@ -999,21 +1013,32 @@ impl ModemManager {
     }
 
     async fn init_sim_cache(&self) -> anyhow::Result<()> {
-        let modems = self.modems.read().await;
-        let sim_ids: Vec<&str> = modems.keys().map(|k| k.as_str()).collect();
+        // The modems map is keyed by COM port, so build (sim_id, modem) pairs
+        // from each modem's own runtime SIM id.
+        let sim_modems: Vec<(String, Arc<Modem>)> = {
+            let modems = self.modems.read().await;
+            let mut v = Vec::with_capacity(modems.len());
+            for modem in modems.values() {
+                if let Some(sid) = modem.sim_id.read().await.clone() {
+                    v.push((sid, modem.clone()));
+                }
+            }
+            v
+        };
 
-        if sim_ids.is_empty() {
+        if sim_modems.is_empty() {
             info!("Initialized SIM cache with 0 cards (no modems available)");
             return Ok(());
         }
 
-        let sim_cards = SimCard::get_by_ids(&sim_ids).await?;
+        let sim_id_refs: Vec<&str> = sim_modems.iter().map(|(id, _)| id.as_str()).collect();
+        let sim_cards = SimCard::get_by_ids(&sim_id_refs).await?;
         let cached_ids: HashSet<String> = sim_cards.keys().cloned().collect();
 
         // Active modems without a sim_cards row can appear after a transient
         // demotion deleted the DB record while the modem stayed active. Recreate
         // the row from live SIM info so the dashboard always shows IMSI.
-        let missing: Vec<(String, Arc<Modem>)> = modems
+        let missing: Vec<(String, Arc<Modem>)> = sim_modems
             .iter()
             .filter(|(id, _)| !cached_ids.contains(id.as_str()))
             .map(|(id, modem)| (id.clone(), modem.clone()))
@@ -1026,13 +1051,11 @@ impl ModemManager {
         {
             let mut last_known = self.last_known_sim_ids_by_port.write().await;
             last_known.clear();
-            for (sim_id, modem) in modems.iter() {
+            for (sim_id, modem) in sim_modems.iter() {
                 last_known.retain(|port, id| id != sim_id || port == &modem.com_port);
                 last_known.insert(modem.com_port.clone(), sim_id.clone());
             }
         }
-
-        drop(modems);
 
         for (iccid, modem) in missing {
             log::info!(
@@ -1090,10 +1113,7 @@ impl ModemManager {
             // Clone the modem Arc and release the map lock BEFORE the slow
             // full-SIM SMS scan below; holding the read guard across it stalls
             // all other promotions/demotions.
-            let modem = {
-                let modems = self.modems.read().await;
-                modems.get(&sim_id).cloned()
-            };
+            let modem = self.get_modem(&sim_id).await;
             futures.push(async move {
                 if let Some(modem) = modem {
                     match modem.read_sms_sync_insert(SmsType::All).await {
@@ -1108,7 +1128,15 @@ impl ModemManager {
     }
 
     pub async fn get_sim_ids(&self) -> Vec<String> {
-        self.modems.read().await.keys().cloned().collect()
+        // The modems map is keyed by COM port; each modem carries its own SIM id.
+        let modems = self.modems.read().await;
+        let mut ids = Vec::with_capacity(modems.len());
+        for modem in modems.values() {
+            if let Some(sid) = modem.sim_id.read().await.clone() {
+                ids.push(sid);
+            }
+        }
+        ids
     }
 
     /// All configured (com_port, baud_rate) pairs, in config order.
@@ -1119,8 +1147,18 @@ impl ModemManager {
             .collect()
     }
 
+    /// Resolve a modem by its current SIM id. The modems map is keyed by COM
+    /// port, so this scans the (small, <=128) set matching each modem's own
+    /// runtime SIM id. This keeps SIM identity a property of the physical port
+    /// instead of a fragile map key that breaks on hot-swap.
     pub async fn get_modem(&self, sim_id: &str) -> Option<Arc<Modem>> {
-        self.modems.read().await.get(sim_id).cloned()
+        let modems = self.modems.read().await;
+        for modem in modems.values() {
+            if modem.sim_id.read().await.as_deref() == Some(sim_id) {
+                return Some(modem.clone());
+            }
+        }
+        None
     }
 
     pub async fn send_sms(
@@ -1271,11 +1309,15 @@ impl ModemManager {
         // modem, which stalled dashboard updates for minutes after a SIM move.
         let entries: Vec<(String, Arc<Modem>)> = {
             let modems = self.modems.read().await;
-            modems
-                .iter()
-                .filter(|(sim_id, _)| !sim_id.starts_with("fallback_sim_"))
-                .map(|(sim_id, modem)| (sim_id.clone(), modem.clone()))
-                .collect()
+            let mut v = Vec::with_capacity(modems.len());
+            for modem in modems.values() {
+                if let Some(sid) = modem.sim_id.read().await.clone() {
+                    if !sid.starts_with("fallback_sim_") {
+                        v.push((sid, modem.clone()));
+                    }
+                }
+            }
+            v
         };
 
         let mut futures = FuturesUnordered::new();
@@ -1310,10 +1352,13 @@ impl ModemManager {
         // ── Demotion: parallel AT+CPIN? / AT+CCID on all active modems ────────
         let active_entries: Vec<(String, Arc<Modem>)> = {
             let modems = self.modems.read().await;
-            modems
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+            let mut v = Vec::with_capacity(modems.len());
+            for modem in modems.values() {
+                if let Some(sid) = modem.sim_id.read().await.clone() {
+                    v.push((sid, modem.clone()));
+                }
+            }
+            v
         };
         let active_entries_len = active_entries.len();
 
@@ -1351,10 +1396,24 @@ impl ModemManager {
                                 || upper.contains("SIM FAILURE")
                         })
                         .unwrap_or(false);
-                    if explicit_absent {
+
+                    // Many modems do not emit an explicit "NOT INSERTED" after a
+                    // hot pull; AT+CPIN? just returns an empty/non-READY response
+                    // (e.g. +CME ERROR: 10). Corroborate with a fresh IMSI read:
+                    // a physically absent SIM cannot return a valid IMSI, while a
+                    // transient CPIN glitch on a present SIM still can.
+                    let imsi_ok = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_imsi())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten()
+                        .map(|v| !v.trim().is_empty())
+                        .unwrap_or(false);
+
+                    if explicit_absent || !imsi_ok {
                         log::info!(
-                            "SIM status on {} confirms absence (was {}, status={:?}).",
-                            modem.com_port, iccid, status
+                            "SIM absence evidence on {} (was {}, status={:?}, imsi_readable={}).",
+                            modem.com_port, iccid, status, imsi_ok
                         );
                         return ProbeOutcome::ConfirmedAbsent {
                             iccid,
@@ -1364,7 +1423,7 @@ impl ModemManager {
                     }
 
                     log::debug!(
-                        "SIM status on {} is inconclusive (was {}, status={:?}); keeping modem active for now.",
+                        "SIM status on {} is inconclusive but IMSI still readable (was {}, status={:?}); keeping modem active.",
                         modem.com_port, iccid, status
                     );
                     return ProbeOutcome::TransientIssue {
@@ -1547,7 +1606,14 @@ impl ModemManager {
                 }
             }
         }
-        log::info!("Recheck demotion phase found {} modem(s) to demote", demotions.len());
+        if demotions.is_empty() {
+            log::debug!("Recheck demotion phase found 0 modem(s) to demote");
+        } else {
+            log::info!(
+                "Recheck demotion phase found {} modem(s) to demote",
+                demotions.len()
+            );
+        }
         for (iccid, com_port, probed_modem) in demotions {
             log::info!("[recheck] Demoting modem {} on {}", iccid, com_port);
             let baud_rate = probed_modem.baud_rate;
@@ -1564,11 +1630,11 @@ impl ModemManager {
             let removed = {
                 let mut modems = self.modems.write().await;
                 if modems
-                    .get(&iccid)
+                    .get(&com_port)
                     .map(|current| Arc::ptr_eq(current, &probed_modem))
                     .unwrap_or(false)
                 {
-                    modems.remove(&iccid);
+                    modems.remove(&com_port);
                     true
                 } else {
                     false
@@ -1819,11 +1885,7 @@ impl ModemManager {
     }
 
     pub async fn get_modem_by_com_port(&self, com_port: &str) -> Option<Arc<Modem>> {
-        let modems = self.modems.read().await;
-        modems
-            .values()
-            .find(|m| m.com_port == com_port)
-            .cloned()
+        self.modems.read().await.get(com_port).cloned()
     }
 
     pub async fn send_at_command(&self, com_port: &str, command: &str) -> anyhow::Result<String> {
@@ -2210,14 +2272,21 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
-        let modems = self.modems.read().await;
-        if modems.is_empty() {
+        let entries: Vec<(String, Arc<Modem>)> = {
+            let modems = self.modems.read().await;
+            let mut v = Vec::with_capacity(modems.len());
+            for modem in modems.values() {
+                if let Some(sid) = modem.sim_id.read().await.clone() {
+                    v.push((sid, modem.clone()));
+                }
+            }
+            v
+        };
+        if entries.is_empty() {
             log::info!("No active modems; skipping URC handler startup");
             return;
         }
-        for (sim_id, modem) in modems.iter() {
-            let sim_id = sim_id.clone();
-            let modem = modem.clone();
+        for (sim_id, modem) in entries {
             let sse = sse_manager.clone();
             let cfg = transcribe_cfg.clone();
             let sim_id_for_task = sim_id.clone();

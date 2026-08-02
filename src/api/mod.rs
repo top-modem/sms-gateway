@@ -100,8 +100,35 @@ fn format_memory_status(memory_status: &str) -> String {
     memory_status.to_string()
 }
 
+fn resolve_sim_status(sim_status: Option<String>, has_sim: bool, available: bool) -> Option<String> {
+    if has_sim {
+        return sim_status.filter(|status| !status.trim().is_empty());
+    }
+
+    if available {
+        Some("NO SIM".to_string())
+    } else {
+        Some("SIM REMOVED".to_string())
+    }
+}
+
 mod auth;
 pub(crate) mod sse_manager;
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_sim_status;
+
+    #[test]
+    fn resolves_removed_state_for_unavailable_ports() {
+        assert_eq!(resolve_sim_status(None, false, false), Some("SIM REMOVED".to_string()));
+    }
+
+    #[test]
+    fn preserves_live_status_for_inserted_sims() {
+        assert_eq!(resolve_sim_status(Some("READY".to_string()), true, true), Some("READY".to_string()));
+    }
+}
 
 use rust_embed::RustEmbed;
 
@@ -669,7 +696,7 @@ async fn get_all_sim_info(
             "model_info": model_data,
             "imei": imei_data,
             "sms_center": if has_sim { sms_center_data.as_ref().and_then(|s| s.as_ref()).map(|s| decode_sms_center(s)) } else { None },
-            "sim_status": if has_sim { sim_status_data } else { None },
+            "sim_status": resolve_sim_status(sim_status_data.flatten(), has_sim, true),
             "memory_status": if has_sim { memory_status_data.as_ref().and_then(|s| s.as_ref()).map(|s| format_memory_status(s)) } else { None },
             "phone_number": if has_sim { phone_number } else { None }
         }));
@@ -706,7 +733,7 @@ async fn get_all_sim_info(
             "model_info": null,
             "imei": null,
             "sms_center": null,
-            "sim_status": null,
+            "sim_status": resolve_sim_status(None, snapshot.active_sim_id.is_some(), snapshot.active_sim_id.is_some() && matches!(snapshot.lifecycle, crate::modem::manager::PortLifecycle::Active)),
             "memory_status": null,
             "phone_number": last_known.and_then(|card| card.phone_number)
         }));

@@ -425,7 +425,7 @@ async fn recheck_fallback_worker(
             continue;
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         modem_manager
             .clone()
             .recheck_fallback_modems(

@@ -431,6 +431,76 @@ class ApiClient {
         }
         return response.blob();
     }
+
+    // ── eSIM management ──────────────────────────────────────────────────────
+
+    /** List eSIM-capable ports and their current mode/session status. */
+    async esimListPorts() {
+        return FetchApi.get('/api/esim/ports');
+    }
+
+    /** Enter eSIM-management mode on a port (acquires the machine-wide lock). */
+    async esimEnter(com) {
+        return FetchApi.post(`/api/esim/${com}/session/enter`);
+    }
+
+    /** Exit eSIM-management mode and release the lock. */
+    async esimExit(com) {
+        return FetchApi.post(`/api/esim/${com}/session/exit`);
+    }
+
+    /** Abnormal-state recovery (ath0). */
+    async esimReset(com) {
+        return FetchApi.post(`/api/esim/${com}/reset`);
+    }
+
+    /** Read eUICC chip info (EID, default SM-DP+). */
+    async esimChip(com) {
+        return FetchApi.get(`/api/esim/${com}/chip`);
+    }
+
+    /** List installed profiles. */
+    async esimProfiles(com) {
+        return FetchApi.get(`/api/esim/${com}/profiles`);
+    }
+
+    /**
+     * Download a profile.
+     * @param {string} com
+     * @param {{smdp?:string, matching_id?:string, confirmation_code?:string, imei?:string, activation_code?:string}} body
+     */
+    async esimDownload(com, body) {
+        return FetchApi.post(`/api/esim/${com}/profiles/download`, body);
+    }
+
+    async esimEnable(com, iccid, refreshFlag = true) {
+        return FetchApi.post(`/api/esim/${com}/profiles/enable`, { iccid, refresh_flag: refreshFlag });
+    }
+
+    async esimDisable(com, iccid, refreshFlag = true) {
+        return FetchApi.post(`/api/esim/${com}/profiles/disable`, { iccid, refresh_flag: refreshFlag });
+    }
+
+    async esimDelete(com, iccid) {
+        return FetchApi.post(`/api/esim/${com}/profiles/delete`, { iccid });
+    }
+
+    async esimNickname(com, iccid, nickname) {
+        return FetchApi.post(`/api/esim/${com}/profiles/nickname`, { iccid, nickname });
+    }
+
+    async esimNotifications(com) {
+        return FetchApi.get(`/api/esim/${com}/notifications`);
+    }
+
+    async esimNotificationProcess(com, seq, remove = false) {
+        return FetchApi.post(`/api/esim/${com}/notifications/process`, { seq, remove });
+    }
+
+    /** One-shot enter → download → enable → notify → exit flow. */
+    async esimProvision(com, body) {
+        return FetchApi.post(`/api/esim/${com}/provision`, body);
+    }
 }
 
 // Export as a singleton

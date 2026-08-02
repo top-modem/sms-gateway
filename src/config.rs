@@ -49,6 +49,20 @@ pub struct Settings {
     pub windows_com_port_start: Option<u16>,
     /// Optional Windows COM auto-expansion range end, e.g. 64 for COM64.
     pub windows_com_port_end: Option<u16>,
+    /// Enable the eSIM management feature (default false).
+    pub esim_enabled: Option<bool>,
+    /// Path to the lpac executable used for eUICC/profile operations.
+    pub lpac_exe: Option<String>,
+    /// lpac APDU backend (default "pcsc").
+    pub lpac_apdu_backend: Option<String>,
+    /// lpac HTTP backend (default "winhttp" on Windows).
+    pub lpac_http_backend: Option<String>,
+    /// Optional fixed PC/SC reader name for lpac (LPAC_APDU_PCSC_DRV_NAME).
+    pub lpac_pcsc_reader_name: Option<String>,
+    /// Fallback SM-DP+ server address used when a download omits `-s`.
+    pub esim_default_smdp: Option<String>,
+    /// Milliseconds to wait after `ath7` for the smart-card reader to appear (default 1500).
+    pub esim_reader_settle_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

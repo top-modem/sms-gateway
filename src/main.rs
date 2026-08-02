@@ -17,6 +17,8 @@ mod api;
 mod config;
 mod db;
 mod decode;
+#[cfg(not(feature = "mock-data"))]
+mod esim;
 mod firefox_api;
 mod firefox_upload_retry;
 mod firefox_upload_retry_worker;
@@ -135,6 +137,12 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
 
     let modem_manager = Arc::new(ModemManager::new(&config));
 
+    #[cfg(not(feature = "mock-data"))]
+    let esim_service = Arc::new(esim::EsimService::new(
+        modem_manager.clone(),
+        &config.settings,
+    ));
+
     let sse_manager = Arc::new(api::SseManager::new());
 
     let transcribe_cfg = TranscribeConfig::from_settings(&config.settings);
@@ -204,6 +212,8 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
         sse_manager.clone(),
         None,
         None,
+        #[cfg(not(feature = "mock-data"))]
+        esim_service.clone(),
     )
     .await?;
 

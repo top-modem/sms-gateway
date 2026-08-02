@@ -111,6 +111,11 @@ pub struct Modem {
     /// file is actually written -- issuing `AT+QFDWL` right after that `OK` races the file
     /// write for larger downloads (observed on real hardware as a 0-byte file via QFDWL).
     pending_http_readfile: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<i32>>>>,
+    /// eSIM capability detection cache: `None` until `ath?` has been probed, then
+    /// `Some(true)` if the reply contains "ESIM", `Some(false)` otherwise.
+    pub esim_capable: RwLock<Option<bool>>,
+    /// True while this port is in eSIM-management mode (SMS/recheck suspended).
+    pub esim_mode: RwLock<bool>,
 }
 
 impl Modem {
@@ -190,6 +195,8 @@ impl Modem {
             pending_mms: Arc::new(tokio::sync::Mutex::new(None)),
             pending_http_get: Arc::new(tokio::sync::Mutex::new(None)),
             pending_http_readfile: Arc::new(tokio::sync::Mutex::new(None)),
+            esim_capable: RwLock::new(None),
+            esim_mode: RwLock::new(false),
         })
     }
 }
@@ -198,6 +205,85 @@ impl Drop for Modem {
     fn drop(&mut self) {
         self.reader_task.abort();
         self.command_task.abort();
+    }
+}
+
+/// eSIM machine support. On these devices each COM port has two modes: a normal
+/// SMS mode and an eSIM-management mode. The mode is toggled with vendor AT
+/// commands over the same serial port; the actual eUICC/profile work is done
+/// out-of-band via lpac over PC/SC. See esim_feature_design.txt.
+impl Modem {
+    /// Whether this port has been detected as eSIM-capable (`ath?` → contains "ESIM").
+    pub async fn is_esim_capable(&self) -> bool {
+        self.esim_capable.read().await.unwrap_or(false)
+    }
+
+    /// Whether this port is currently in eSIM-management mode.
+    pub async fn is_esim_mode(&self) -> bool {
+        *self.esim_mode.read().await
+    }
+
+    async fn set_esim_mode(&self, on: bool) {
+        *self.esim_mode.write().await = on;
+    }
+
+    /// Detect eSIM capability by sending `ath?`; the reply of an eSIM machine
+    /// contains "ESIM". The result is cached so the probe only runs once.
+    pub async fn detect_esim_capability(&self) -> bool {
+        if let Some(v) = *self.esim_capable.read().await {
+            return v;
+        }
+        let capable =
+            match tokio::time::timeout(Duration::from_secs(5), self.send_command("ath?\r\n")).await {
+                Ok(Ok(resp)) => resp.to_ascii_uppercase().contains("ESIM"),
+                _ => false,
+            };
+        *self.esim_capable.write().await = Some(capable);
+        capable
+    }
+
+    /// Send a single mode-switch command (e.g. `atl6`) and require an `OK` reply.
+    async fn send_switch_command(&self, cmd: &str) -> io::Result<()> {
+        let full = format!("{}\r\n", cmd);
+        let resp = tokio::time::timeout(Duration::from_secs(10), self.send_command(&full))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{} timed out", cmd)))??;
+        if resp.contains("OK") {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "{} did not return OK: {}",
+                cmd,
+                Self::format_log(&resp)
+            )))
+        }
+    }
+
+    /// Enter eSIM-management mode: `atl6` then `ath7`. A Windows smart-card
+    /// device appears after `ath7`. Sets `esim_mode` on success.
+    pub async fn esim_enter(&self) -> io::Result<()> {
+        self.send_switch_command("atl6").await?;
+        self.send_switch_command("ath7").await?;
+        self.set_esim_mode(true).await;
+        Ok(())
+    }
+
+    /// Exit eSIM-management mode: `atl7` then `ath6`. Always clears `esim_mode`
+    /// (even on partial failure) so the port is never left flagged as busy.
+    pub async fn esim_exit(&self) -> io::Result<()> {
+        let r1 = self.send_switch_command("atl7").await;
+        let r2 = self.send_switch_command("ath6").await;
+        self.set_esim_mode(false).await;
+        r1?;
+        r2?;
+        Ok(())
+    }
+
+    /// Abnormal-state recovery: `ath0` restores factory defaults. Clears `esim_mode`.
+    pub async fn esim_reset(&self) -> io::Result<()> {
+        let r = self.send_switch_command("ath0").await;
+        self.set_esim_mode(false).await;
+        r
     }
 }
 

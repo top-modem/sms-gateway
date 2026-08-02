@@ -1311,6 +1311,9 @@ impl ModemManager {
             let modems = self.modems.read().await;
             let mut v = Vec::with_capacity(modems.len());
             for modem in modems.values() {
+                if modem.is_esim_mode().await {
+                    continue;
+                }
                 if let Some(sid) = modem.sim_id.read().await.clone() {
                     if !sid.starts_with("fallback_sim_") {
                         v.push((sid, modem.clone()));
@@ -1354,6 +1357,9 @@ impl ModemManager {
             let modems = self.modems.read().await;
             let mut v = Vec::with_capacity(modems.len());
             for modem in modems.values() {
+                if modem.is_esim_mode().await {
+                    continue;
+                }
                 if let Some(sid) = modem.sim_id.read().await.clone() {
                     v.push((sid, modem.clone()));
                 }
@@ -1886,6 +1892,12 @@ impl ModemManager {
 
     pub async fn get_modem_by_com_port(&self, com_port: &str) -> Option<Arc<Modem>> {
         self.modems.read().await.get(com_port).cloned()
+    }
+
+    /// Snapshot of all currently-tracked modems (used by the eSIM service to
+    /// enumerate ports and probe eSIM capability).
+    pub async fn all_modems(&self) -> Vec<Arc<Modem>> {
+        self.modems.read().await.values().cloned().collect()
     }
 
     pub async fn send_at_command(&self, com_port: &str, command: &str) -> anyhow::Result<String> {

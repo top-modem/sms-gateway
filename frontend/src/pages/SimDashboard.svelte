@@ -315,7 +315,7 @@
   // ── Logout ────────────────────────────────────────────────────────────────
   // uses logout() imported from auth store
 
-  let { onNavigate = () => {}, onNavigateCall = () => {}, onNavigateSim = () => {}, onNavigateSetPhone = () => {}, onNavigatePlatform = () => {}, onNavigatePhoneNumber = () => {}, onNavigatePlatformStats = () => {}, onNavigateMoney = () => {}, onNavigateMms = () => {} } = $props();
+  let { onNavigate = () => {}, onNavigateCall = () => {}, onNavigateSim = () => {}, onNavigateSetPhone = () => {}, onNavigatePlatform = () => {}, onNavigatePhoneNumber = () => {}, onNavigatePlatformStats = () => {}, onNavigateMoney = () => {}, onNavigateMms = () => {}, onNavigateEsim = () => {} } = $props();
 </script>
 
 <div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-zinc-950 text-sm font-sans">
@@ -382,6 +382,16 @@
       >
         <Icon icon="carbon:image" class="w-4 h-4" />
         {$t('btn_mms')}
+      </button>
+      <button
+        onclick={() => onNavigateEsim()}
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+               border border-gray-200 dark:border-zinc-700
+               text-gray-600 dark:text-gray-300
+               hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
+      >
+        <Icon icon="carbon:sim-card" class="w-4 h-4" />
+        {$t('esim_title')}
       </button>
       <button
         onclick={() => onNavigate(getSingleSelectedSimId())}

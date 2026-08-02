@@ -113,6 +113,8 @@ fn resolve_sim_status(sim_status: Option<String>, has_sim: bool, available: bool
 }
 
 mod auth;
+#[cfg(not(feature = "mock-data"))]
+pub mod esim;
 pub(crate) mod sse_manager;
 
 #[cfg(test)]
@@ -145,6 +147,7 @@ pub async fn run_api(
     sse_manager: Arc<SseManager>,
     barcode_output_file: Option<String>,
     barcode_launcher_path: Option<String>,
+    #[cfg(not(feature = "mock-data"))] esim_service: Arc<crate::esim::EsimService>,
 ) -> anyhow::Result<()> {
     let barcode_state = BarcodeState {
         output_file: barcode_output_file,
@@ -336,11 +339,15 @@ pub async fn run_api(
         )
         .route("/mms/inbox", get(get_mms_inbox_paginated))
         .route("/mms/inbox/{id}", get(get_mms_inbox_detail))
-        .route("/mms/inbox/{id}/parts/{part_id}", get(get_mms_inbox_part))
-        .layer(axum::middleware::from_fn_with_state(
-            (username.to_string(), password.to_string()),
-            auth::basic_auth,
-        ));
+        .route("/mms/inbox/{id}/parts/{part_id}", get(get_mms_inbox_part));
+
+    #[cfg(not(feature = "mock-data"))]
+    let api = api.merge(esim::routes(esim_service.clone()));
+
+    let api = api.layer(axum::middleware::from_fn_with_state(
+        (username.to_string(), password.to_string()),
+        auth::basic_auth,
+    ));
 
     let app = Router::new()
         .nest_service("/api", api)

@@ -29,6 +29,15 @@ read_sms_frequency = 30          # How often to check for new SMS messages
 # windows_com_port_end = 128
 # mms_send_timeout_secs = 60               # AT+QMMSEND timeout and max wait for the +QMMSEND: completion URC (default 60)
 
+# ── eSIM management (optional; requires eSIM-capable machines + lpac CLI) ──
+# esim_enabled = false                     # Master switch for the eSIM feature (default false)
+# lpac_exe = "lpac"                        # Path to the lpac executable (github.com/estkme-group/lpac)
+# lpac_apdu_backend = "pcsc"               # lpac APDU backend (PC/SC recommended; AT backend is demo-only)
+# lpac_http_backend = "winhttp"            # lpac HTTP backend (winhttp on Windows, or curl)
+# lpac_pcsc_reader_name = ""               # Optional fixed PC/SC reader name (LPAC_APDU_PCSC_DRV_NAME)
+# esim_default_smdp = ""                   # Fallback SM-DP+ server used when a download omits it
+# esim_reader_settle_ms = 1500             # Wait after ath7 for the smart-card reader to appear (ms)
+
 # Webhook configuration
 webhooks_max_concurrent = 10     # Maximum concurrent webhook requests
 

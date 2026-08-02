@@ -2502,6 +2502,32 @@ impl MmsInboxPart {
 }
 
 /// Initializes SQLite database
+/// Append a row to the eSIM operation audit log. Best-effort: callers log but
+/// do not fail their operation if this write fails.
+pub async fn log_esim_operation(
+    com_port: &str,
+    eid: Option<&str>,
+    op_type: &str,
+    params_json: Option<&str>,
+    result_code: Option<i64>,
+    message: Option<&str>,
+) -> Result<()> {
+    let pool = get_pool()?;
+    sqlx::query(
+        r#"INSERT INTO esim_operations (com_port, eid, op_type, params_json, result_code, message)
+           VALUES (?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(com_port)
+    .bind(eid)
+    .bind(op_type)
+    .bind(params_json)
+    .bind(result_code)
+    .bind(message)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn db_init() -> Result<()> {
     #[cfg(debug_assertions)]
     let db_path = "sqlite://./data/data.db";

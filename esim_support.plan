@@ -1,0 +1,210 @@
+# eSIM Support Plan (sms-gateway)
+
+Status: PLAN ONLY — do not implement yet.
+Author basis: doc/ESIM的机器软件说明.docx, doc/ESIM指令流程.xlsx, and github.com/estkme-group/lpac.
+
+--------------------------------------------------------------------------------
+## 1. Background — what the hardware and docs tell us
+
+### 1.1 eSIM machine vs. normal modem pool (from 软件说明.docx)
+- An eSIM machine looks like a normal EG25 modem pool, but **each COM port has TWO modes**:
+  - **Normal mode** — behaves like today's pool: receives SMS / calls (current app behavior).
+  - **eSIM-management mode** — the port CANNOT receive SMS; instead you can read the EID,
+    download / activate / deactivate / delete eSIM profiles.
+- A port boots in Normal mode.
+
+### 1.2 Mode-switch AT commands (sent over the SAME COM serial port)
+| Purpose | Command sequence | Expected | Notes |
+|---|---|---|---|
+| Detect eSIM machine | `ath?` | reply contains `ESIM` | Run ONCE at init per machine (per xlsx note) |
+| Enter eSIM mode | `atl6` → `ath7` | each returns `OK` | A Windows **smart-card device appears** after `ath7` |
+| Exit to Normal mode | `atl7` → `ath6` | each returns `OK` | Smart-card device disappears; ICCID now = written eSIM |
+| Abnormal recovery | `ath0` | `OK` | Restores factory default; then retry |
+
+### 1.3 Hard constraints (from both docs)
+- **Only ONE port machine-wide may be in eSIM mode at a time.** Finish + return a port to
+  Normal before operating the next port. => a machine-wide serialization gate is mandatory.
+- Detecting whether the machine is an eSIM machine only needs a single `ath?` at init.
+
+### 1.4 Canonical provisioning flow (from 指令流程.xlsx)
+```
+1  COMx  ath?                         -> confirm ESIM machine (once)
+2  COMx  atl6
+3  COMx  ath7                         -> enter eSIM management (smartcard appears)
+4  CLI   lpac profile download <...>  -> download eSIM profile
+5  CLI   lpac profile enable <ICCID>  -> activate eSIM
+6  COMx  atl7
+7  COMx  ath6                         -> exit eSIM management
+8  COMx  (normal SMS reception)       -> ICCID is now the eSIM's ICCID
+```
+
+--------------------------------------------------------------------------------
+## 2. lpac integration facts (from lpac USAGE / ENVVARS / backends docs)
+
+- lpac is a C CLI (`lpac <subcommand> [subcommand2] [params]`) implementing SGP.22 LPA.
+- **All output is JSON**: `{"type":"lpa","payload":{"code":0,"message":"success","data":...}}`
+  - `code==0` = success; otherwise error code. `message` = "success" or error text.
+- Subcommands we need:
+  - `chip info` — EID + default SM-DP+/SM-DS.
+  - `profile list | enable <ICCID/AID> [1/0] | disable <ICCID/AID> [1/0] | delete <ICCID> | nickname <ICCID> <name>`
+  - `profile download -s <smdp> -m <matchingId> [-c <conf>] [-i <imei>] [-a <LPA:1$smdp$matchingId>]`
+  - `notification list | process [-a] [-r] <seq> | remove [-a] <seq>` (GSMA requires processing).
+- **APDU backend selection (env vars):**
+  - `LPAC_APDU=pcsc` (DEFAULT, recommended here): talks to the Windows smart-card reader
+    that appears in eSIM mode. Select reader via `LPAC_APDU_PCSC_DRV_NAME=<name>` or
+    `LPAC_APDU_PCSC_DRV_IFID=<index>`. Enumerate with `lpac driver apdu`.
+  - `LPAC_APDU=at` / `at_csim` + `LPAC_APDU_AT_DEVICE=COMx`: APDU over the serial port itself.
+    lpac docs mark this **"FOR DEMO PURPOSES ONLY"** — 300 ms max response time, download/delete
+    often fail, and it would need EXCLUSIVE serial access (conflicts with our open handle).
+    => **Do NOT use the AT backend for real provisioning; PC/SC is the supported path.**
+  - `LPAC_HTTP=winhttp` on Windows (or `curl`).
+- **Key architectural consequence:** mode-switching uses the serial port; the eUICC/profile
+  work uses a SEPARATE PC/SC smart-card channel. Our Rust app can keep its serial handle open;
+  it just must PAUSE SMS activity on that port while in eSIM mode. Because only one port is ever
+  in eSIM mode, exactly ONE smart-card reader is present at a time — trivial to target.
+
+--------------------------------------------------------------------------------
+## 3. Design decisions
+
+- D1. Use **lpac.exe (PC/SC backend)** as an external process; wrap + parse its JSON. Do not
+  reimplement SGP.22.
+- D2. **Machine-wide async gate** (`tokio::sync::Mutex` or a single-permit `Semaphore`) serializes
+  all eSIM sessions. A session = enter → operations → exit, held for the whole span.
+- D3. Add a **per-port operational mode** (`Normal` | `EnteringEsim` | `EsimManaging` | `Exiting`).
+  Existing SMS/recheck/URC workers must skip a port unless mode == `Normal`.
+- D4. **RAII session guard**: acquiring a session returns a guard that, on drop/error/panic,
+  ALWAYS attempts `atl7`→`ath6` (and `ath0` if abnormal) and releases the gate — so a port can
+  never get stuck in eSIM mode.
+- D5. **Reuse the existing serial channel** (`Modem::send_command`) for `ath?/atl6/ath7/atl7/ath6/ath0`.
+  No second serial opener.
+- D6. After exiting eSIM mode, **trigger a re-init/recheck of that port** so the SMS side re-reads
+  the (possibly new) ICCID/IMSI and resumes receiving on the activated profile.
+
+--------------------------------------------------------------------------------
+## 4. Data model / migrations (migrations/2026XXXX_esim.sql)
+
+- `esim_capable_ports` (or add columns to existing port/modem tracking):
+  - `com_port TEXT PRIMARY KEY`, `eid TEXT`, `is_esim_capable INTEGER`, `updated_at`.
+- `esim_profiles` (cache of `lpac profile list`, keyed to a port/EID):
+  - `id`, `com_port`, `eid`, `iccid`, `isdp_aid`, `profile_state` (enabled/disabled),
+    `nickname`, `service_provider_name`, `profile_name`, `profile_class`, `updated_at`.
+- `esim_operations` (audit log):
+  - `id`, `com_port`, `eid`, `op_type` (detect/enter/exit/reset/download/enable/disable/delete/nickname),
+    `params_json`, `result_code`, `message`, `created_at`.
+- Migrations follow existing naming (see migrations/README.md and prior `2026...` files).
+
+--------------------------------------------------------------------------------
+## 5. Config additions (src/config.rs `Settings`, all optional/back-compat)
+
+- `esim_enabled: Option<bool>`                (default false)
+- `lpac_exe: Option<String>`                  (path to lpac.exe)
+- `lpac_apdu_backend: Option<String>`         (default "pcsc")
+- `lpac_http_backend: Option<String>`         (default "winhttp")
+- `lpac_pcsc_reader_name: Option<String>`     (optional fixed reader name)
+- `esim_default_smdp: Option<String>`         (fallback SM-DP+)
+- `esim_state_switch_timeout_secs: Option<u64>` (default ~10)
+- `esim_reader_settle_ms: Option<u64>`        (wait after ath7 for smartcard to appear, default ~1500)
+- Per-`Device`: optional `esim_capable: Option<bool>` manual override.
+- Document all in config.toml.example.
+
+--------------------------------------------------------------------------------
+## 6. Backend module design (new: src/esim/)
+
+- `src/esim/mod.rs`      — public surface: `EsimService` handle wired into main.rs + ModemManager.
+- `src/esim/state.rs`    — `PortMode` enum, machine-wide gate, `EsimSession` RAII guard
+                           (enter/exit sequences via `Modem::send_command`, error recovery `ath0`).
+- `src/esim/lpac.rs`     — spawn lpac with the right env (`LPAC_APDU`, `LPAC_HTTP`,
+                           `LPAC_APDU_PCSC_DRV_NAME/IFID`); typed wrappers:
+                           `chip_info`, `profile_list`, `download`, `enable`, `disable`, `delete`,
+                           `nickname`, `notification_*`; JSON envelope parse -> `Result<T, LpacError>`.
+- `src/esim/reader.rs`   — enumerate PC/SC readers via `lpac driver apdu`; pick the single present
+                           reader (or configured name) while in eSIM mode.
+- ModemManager integration:
+  - Add `esim_capable` + `mode: RwLock<PortMode>` to `Modem` (src/modem/core.rs) OR a side map in
+    manager keyed by com_port.
+  - At init: after successful modem init, run `ath?` once; set `esim_capable` if reply has `ESIM`.
+  - Gate SMS read loop, recheck/demotion worker, URC handlers, and hot-swap probe on
+    `mode == Normal` so an eSIM-mode port is NOT demoted or read.
+
+--------------------------------------------------------------------------------
+## 7. API endpoints (src/api/mod.rs, prefix /api/esim, admin-auth like the rest)
+
+- `GET  /api/esim/ports`                     — list eSIM-capable ports, mode, EID, gate status.
+- `POST /api/esim/{com}/session/enter`       — acquire gate + atl6/ath7 (returns session state).
+- `POST /api/esim/{com}/session/exit`        — atl7/ath6 + release gate + trigger port re-init.
+- `POST /api/esim/{com}/reset`               — ath0 recovery.
+- `GET  /api/esim/{com}/chip`                — lpac chip info (EID, default SM-DP+).
+- `GET  /api/esim/{com}/profiles`            — lpac profile list (also refresh DB cache).
+- `POST /api/esim/{com}/profiles/download`   — body {smdp, matching_id, confirmation_code, imei, activation_code}.
+- `POST /api/esim/{com}/profiles/enable`     — {iccid, refresh_flag?}.
+- `POST /api/esim/{com}/profiles/disable`    — {iccid, refresh_flag?}.
+- `POST /api/esim/{com}/profiles/delete`     — {iccid} (audit; no auto-confirm in UI is dangerous).
+- `POST /api/esim/{com}/profiles/nickname`   — {iccid, nickname}.
+- `GET/POST /api/esim/{com}/notifications*`  — list/process(-r)/remove (GSMA compliance).
+- `POST /api/esim/{com}/provision`           — convenience: enter → download → enable → (process
+                                               notifications) → exit, all under one gate
+                                               (mirrors the xlsx flow).
+- All mutating calls append to `esim_operations`. Non-Normal ports should be excluded from the
+  normal /api/sims/info "SIM removed" logic (show an "eSIM mode" state instead).
+
+--------------------------------------------------------------------------------
+## 8. Frontend (frontend/src/pages/EsimManager.svelte + i18n)
+
+- New page/tab "eSIM Manager":
+  - Table of eSIM-capable ports: com_port, mode badge (Normal / eSIM mode), EID, current ICCID.
+  - Global banner showing the one-at-a-time lock (which port currently holds the eSIM session).
+  - Per-port panel (only usable while that port holds the session):
+    - Enter / Exit eSIM mode buttons (Exit also on page-leave guard).
+    - Profile list table: provider, name, ICCID, state; actions enable/disable/delete/nickname.
+    - Download form: SM-DP+ address, matching ID / activation code, confirmation code, IMEI,
+      or a single `LPA:1$...$...` activation-code / QR field.
+  - Clear warning: "This port stops receiving SMS while in eSIM mode."
+- Add i18n keys (EN + ZH) in frontend/src/js/i18n.js.
+- Remember: frontend changes require `pnpm build` (frontend) AND `cargo run` recompile
+  (RustEmbed) to appear.
+
+--------------------------------------------------------------------------------
+## 9. Concurrency, safety, and edge cases
+
+- Machine-wide single active eSIM session (gate). Queue or reject concurrent requests with 409.
+- RAII guard guarantees return-to-Normal on any error/panic; `ath0` fallback if atl7/ath6 fail.
+- Reader-appearance timeout after `ath7` -> `ath0`, abort, release gate, surface error.
+- `enable` quirks: per lpac note, some eUICC need AID vs ICCID and refreshFlag 1/0 — expose the
+  flag and try fallback ordering.
+- `delete` has no secondary confirm in lpac -> require explicit UI confirmation + audit.
+- Notifications are NOT auto-sent by lpac -> process (optionally `-r`) after download/enable/delete.
+- HTTP egress: `profile download`/`discovery` need internet to the SM-DP+/SM-DS -> document
+  firewall/proxy; surface network errors distinctly from card errors.
+- Do NOT let recheck/demotion treat an eSIM-mode port as "SIM removed".
+- `+CME ERROR: 3` on AT backend is a known modem-setting issue (another reason to prefer PC/SC).
+
+--------------------------------------------------------------------------------
+## 10. Testing
+
+- Unit: lpac JSON envelope parsing (success + non-zero code + empty data); `PortMode` transitions
+  with a mocked `send_command`; gate serialization (second acquire blocks/queues).
+- Mock: extend src/modem/mock_manager.rs with an esim-capable fake port + fake profile list so the
+  UI and API can be exercised without hardware.
+- Hardware runbook (manual): follow §1.4 flow on COM1/COM2; verify smartcard appears/disappears,
+  ICCID reflects the eSIM after exit, and SMS resumes.
+
+--------------------------------------------------------------------------------
+## 11. Phased rollout / milestones
+
+- M1  Detection: `ath?` at init, `esim_capable` flag, `/api/esim/ports`, read-only UI list.
+- M2  Session state machine + gate + RAII guard (enter/exit/reset) with SMS workers gated.
+- M3  lpac wrapper (chip info + profile list, read-only) end-to-end via PC/SC.
+- M4  Mutating ops: download, enable, disable, delete, nickname + notifications + audit log.
+- M5  Full UI (download form, actions), i18n, one-at-a-time banner.
+- M6  `/api/esim/{com}/provision` one-shot flow + post-exit port re-init + polish/tests.
+
+--------------------------------------------------------------------------------
+## 12. Open questions / risks (confirm before M1)
+
+- Q1. lpac.exe distribution: bundle a pinned build alongside the app, or require operator install?
+      (lpac has its own license — verify redistribution terms.)
+- Q2. Confirm the PC/SC reader name pattern this hardware exposes in eSIM mode (for a fixed
+      `LPAC_APDU_PCSC_DRV_NAME`); single-reader-at-a-time assumption should make this optional.
+- Q3. Does entering eSIM mode on one port disturb neighbors on the same USB hub? (Serialize; test.)
+- Q4. Multi-profile eSIM (4 profiles in one eUICC) management UX — list/enable-switch expectations.
+- Q5. Whether to auto-process notifications with `-r` by default (GSMA compliance vs. audit needs).

@@ -13,8 +13,9 @@
   import PlatformStatisticsPage from "./pages/PlatformStatisticsPage.svelte";
   import MoneyPage from "./pages/MoneyPage.svelte";
   import MmsPage from "./pages/MmsPage.svelte";
+  import EsimPage from "./pages/EsimPage.svelte";
 
-  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone' | 'platform' | 'phonenumber' | 'platform-stats' | 'money' | 'mms'} */
+  /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone' | 'platform' | 'phonenumber' | 'platform-stats' | 'money' | 'mms' | 'esim'} */
   let currentPage = $state('sim');
   let filterSimId = $state(null);
 
@@ -64,6 +65,10 @@
     currentPage = 'phonenumber';
   }
 
+  function goToEsim() {
+    currentPage = 'esim';
+  }
+
   $effect(() => {
     initConversation();
     connectCallSSE();
@@ -89,6 +94,7 @@
           onNavigatePlatformStats={goToPlatformStats}
           onNavigateMoney={goToMoney}
           onNavigateMms={goToMms}
+          onNavigateEsim={goToEsim}
         />
       </div>
 
@@ -135,6 +141,11 @@
     {:else if currentPage === 'phonenumber'}
       <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
         <PhoneNumberPage onBack={goToSim} />
+      </div>
+
+    {:else if currentPage === 'esim'}
+      <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
+        <EsimPage onBack={goToSim} />
       </div>
     {/if}
 

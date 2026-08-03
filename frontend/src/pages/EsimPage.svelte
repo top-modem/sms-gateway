@@ -508,8 +508,13 @@
     <p class="mb-3 text-sm text-gray-500 dark:text-gray-400">{$t('esim_subtitle')}</p>
 
     <!-- Lock banner -->
-    <div class="mb-4 rounded-lg border px-4 py-2 text-sm {sessionPort ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-gray-500 dark:text-gray-400'}">
-      {sessionPort ? $t('esim_lock_banner', { port: sessionPort }) : $t('esim_lock_free')}
+    <div class="mb-4 flex items-center justify-between gap-3 rounded-lg border px-4 py-2 text-sm {sessionPort ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-gray-500 dark:text-gray-400'}">
+      <span>{sessionPort ? $t('esim_lock_banner', { port: sessionPort }) : $t('esim_lock_free')}</span>
+      {#if sessionPort}
+        <button class="rounded bg-slate-700 px-2 py-1 text-xs text-white hover:bg-slate-600 disabled:opacity-50" onclick={() => exit(sessionPort)} disabled={busy || batchBusy}>
+          {$t('esim_exit')}
+        </button>
+      {/if}
     </div>
 
     {#if message}
@@ -567,7 +572,6 @@
               <th class="px-4 py-2">{$t('esim_col_capable')}</th>
               <th class="px-4 py-2">{$t('esim_col_mode')}</th>
               <th class="px-4 py-2">{$t('esim_col_sim')}</th>
-              <th class="px-4 py-2 text-right">{$t('esim_col_actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -590,16 +594,6 @@
                   </span>
                 </td>
                 <td class="px-4 py-2 text-slate-500">{p.sim_id ?? '—'}</td>
-                <td class="px-4 py-2 text-right">
-                  {#if p.esim_capable}
-                    {#if p.esim_mode}
-                      <button class="rounded bg-slate-700 px-2 py-1 text-xs text-white hover:bg-slate-600 disabled:opacity-50" onclick={() => exit(p.com_port)} disabled={busy}>{$t('esim_exit')}</button>
-                      <button class="ml-1 rounded bg-red-500 px-2 py-1 text-xs text-white hover:bg-red-400 disabled:opacity-50" onclick={() => reset(p.com_port)} disabled={busy}>{$t('esim_reset')}</button>
-                    {:else}
-                      <button class="rounded bg-indigo-600 px-2 py-1 text-xs text-white hover:bg-indigo-500 disabled:opacity-50" onclick={() => enter(p.com_port)} disabled={busy || (sessionPort && sessionPort !== p.com_port)}>{$t('esim_enter')}</button>
-                    {/if}
-                  {/if}
-                </td>
               </tr>
             {/each}
           </tbody>
@@ -607,77 +601,6 @@
       </div>
 
       <p class="mt-2 text-xs text-amber-600">{$t('esim_warn_sms_paused')}</p>
-
-      <!-- Session panel -->
-      {#if activePort && sessionPort === activePort}
-        <div class="mt-6 rounded-lg border border-slate-200 bg-white p-4">
-          <div class="mb-3 flex items-center justify-between">
-            <h2 class="font-semibold text-slate-800">{activePort} — {$t('esim_profiles')}</h2>
-            <button class="rounded bg-slate-100 px-2 py-1 text-xs hover:bg-slate-200" onclick={() => refreshSession(activePort)} disabled={busy}>{$t('esim_refresh')}</button>
-          </div>
-
-          {#if chip}
-            <div class="mb-4 grid grid-cols-1 gap-1 rounded bg-slate-50 p-3 text-xs text-slate-600 md:grid-cols-2">
-              <div><span class="font-medium">{$t('esim_eid')}:</span> {chip.eidValue ?? chip.eid ?? '—'}</div>
-              <div><span class="font-medium">{$t('esim_default_smdp')}:</span> {chip?.EuiccConfiguredAddresses?.defaultDpAddress ?? chip?.default_smdp ?? '—'}</div>
-            </div>
-          {/if}
-
-          {#if profiles.length === 0}
-            <p class="text-sm text-slate-500">{$t('esim_no_profiles')}</p>
-          {:else}
-            <table class="w-full text-sm">
-              <thead class="bg-slate-100 text-left text-slate-600">
-                <tr>
-                  <th class="px-3 py-2">{$t('esim_col_provider')}</th>
-                  <th class="px-3 py-2">{$t('esim_col_name')}</th>
-                  <th class="px-3 py-2">{$t('esim_col_iccid')}</th>
-                  <th class="px-3 py-2">{$t('esim_col_state')}</th>
-                  <th class="px-3 py-2 text-right">{$t('esim_col_actions')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each profiles as p (iccidOf(p))}
-                  <tr class="border-t border-slate-100">
-                    <td class="px-3 py-2">{providerOf(p)}</td>
-                    <td class="px-3 py-2">{nameOf(p)}</td>
-                    <td class="px-3 py-2 font-mono text-xs">{iccidOf(p)}</td>
-                    <td class="px-3 py-2">
-                      <span class="rounded-full px-2 py-0.5 text-xs {stateOf(p) === 'enabled' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-600'}">
-                        {stateOf(p) === 'enabled' ? $t('esim_state_enabled') : $t('esim_state_disabled')}
-                      </span>
-                    </td>
-                    <td class="px-3 py-2 text-right whitespace-nowrap">
-                      {#if stateOf(p) === 'enabled'}
-                        <button class="rounded bg-slate-200 px-2 py-1 text-xs hover:bg-slate-300 disabled:opacity-50" onclick={() => disableProfile(activePort, iccidOf(p))} disabled={busy}>{$t('esim_disable')}</button>
-                      {:else}
-                        <button class="rounded bg-green-600 px-2 py-1 text-xs text-white hover:bg-green-500 disabled:opacity-50" onclick={() => enableProfile(activePort, iccidOf(p))} disabled={busy}>{$t('esim_enable')}</button>
-                      {/if}
-                      <button class="ml-1 rounded bg-slate-100 px-2 py-1 text-xs hover:bg-slate-200 disabled:opacity-50" onclick={() => nicknameProfile(activePort, iccidOf(p))} disabled={busy}>{$t('esim_nickname')}</button>
-                      <button class="ml-1 rounded bg-red-500 px-2 py-1 text-xs text-white hover:bg-red-400 disabled:opacity-50" onclick={() => deleteProfile(activePort, iccidOf(p))} disabled={busy}>{$t('esim_delete')}</button>
-                    </td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          {/if}
-
-          <!-- Download form -->
-          <div class="mt-6 rounded border border-slate-200 p-3">
-            <h3 class="mb-2 text-sm font-semibold text-slate-700">{$t('esim_download_title')}</h3>
-            <div class="grid grid-cols-1 gap-2 md:grid-cols-2">
-              <input class="rounded border border-slate-300 px-2 py-1 text-sm" placeholder={$t('esim_field_smdp')} bind:value={dl.smdp} />
-              <input class="rounded border border-slate-300 px-2 py-1 text-sm" placeholder={$t('esim_field_matching')} bind:value={dl.matching_id} />
-              <input class="rounded border border-slate-300 px-2 py-1 text-sm" placeholder={$t('esim_field_confirmation')} bind:value={dl.confirmation_code} />
-              <input class="rounded border border-slate-300 px-2 py-1 text-sm" placeholder={$t('esim_field_imei')} bind:value={dl.imei} />
-              <input class="rounded border border-slate-300 px-2 py-1 text-sm md:col-span-2" placeholder={$t('esim_field_activation')} bind:value={dl.activation_code} />
-            </div>
-            <div class="mt-2 flex gap-2">
-              <button class="rounded bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-50" onclick={() => download(activePort)} disabled={busy}>{$t('esim_download_btn')}</button>
-            </div>
-          </div>
-        </div>
-      {/if}
     {/if}
 
     <!-- Batch progress panel -->

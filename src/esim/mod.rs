@@ -86,6 +86,16 @@ impl EsimService {
         matches!(state.as_str(), "enabled" | "active")
     }
 
+    fn profile_is_disabled(profile: &Value) -> bool {
+        let state = profile
+            .get("profileState")
+            .or_else(|| profile.get("state"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(state.as_str(), "disabled" | "inactive")
+    }
+
     fn new_trace_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
@@ -589,18 +599,122 @@ impl EsimService {
     ) -> Result<Value, EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
-        let result = self.lpac.profile_disable(iccid, refresh).await;
-        self.audit_result(com_port, "disable", Some(iccid), &result)
-            .await;
+        let trace_id = self
+            .session_trace(com_port)
+            .await
+            .unwrap_or_else(Self::new_trace_id);
+        log::info!(
+            "[eSIM][trace={}] disable requested on {} for {}",
+            trace_id,
+            com_port,
+            iccid
+        );
+        let mut result = self.lpac.profile_disable(iccid, refresh).await;
+        if let Err(err) = &result {
+            let orig_error = err.to_string();
+            // Some modems/lpac builds return an error even when the profile state changed.
+            if let Ok(list) = self.lpac.profile_list().await {
+                let disabled = list
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().any(|p| {
+                            Self::profile_matches_iccid(p, iccid) && Self::profile_is_disabled(p)
+                        })
+                    })
+                    .unwrap_or(false);
+                if disabled {
+                    log::warn!(
+                        "[eSIM][trace={}] disable on {} for {} normalized to success after readback: {}",
+                        trace_id,
+                        com_port,
+                        iccid,
+                        orig_error
+                    );
+                    result = Ok(json!({
+                        "iccid": iccid,
+                        "state": "disabled",
+                        "normalized": true,
+                        "normalized_reason": orig_error
+                    }));
+                } else {
+                    log::warn!(
+                        "[eSIM][trace={}] disable failed on {} for {} and readback did not confirm deactivation: {}",
+                        trace_id,
+                        com_port,
+                        iccid,
+                        orig_error
+                    );
+                }
+            } else {
+                log::warn!(
+                    "[eSIM][trace={}] disable failed on {} for {} and profile readback failed: {}",
+                    trace_id,
+                    com_port,
+                    iccid,
+                    orig_error
+                );
+            }
+        }
+        self.audit_result(com_port, "disable", Some(iccid), &result).await;
         result
     }
 
     pub async fn delete(&self, com_port: &str, iccid: &str) -> Result<Value, EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
-        let result = self.lpac.profile_delete(iccid).await;
-        self.audit_result(com_port, "delete", Some(iccid), &result)
-            .await;
+        let trace_id = self
+            .session_trace(com_port)
+            .await
+            .unwrap_or_else(Self::new_trace_id);
+        log::info!(
+            "[eSIM][trace={}] delete requested on {} for {}",
+            trace_id,
+            com_port,
+            iccid
+        );
+        let mut result = self.lpac.profile_delete(iccid).await;
+        if let Err(err) = &result {
+            let orig_error = err.to_string();
+            // Some modems/lpac builds report a failure even though delete already took effect.
+            if let Ok(list) = self.lpac.profile_list().await {
+                let exists = list
+                    .as_array()
+                    .map(|arr| arr.iter().any(|p| Self::profile_matches_iccid(p, iccid)))
+                    .unwrap_or(false);
+                if !exists {
+                    log::warn!(
+                        "[eSIM][trace={}] delete on {} for {} normalized to success after readback: {}",
+                        trace_id,
+                        com_port,
+                        iccid,
+                        orig_error
+                    );
+                    result = Ok(json!({
+                        "iccid": iccid,
+                        "state": "deleted",
+                        "normalized": true,
+                        "normalized_reason": orig_error
+                    }));
+                } else {
+                    log::warn!(
+                        "[eSIM][trace={}] delete failed on {} for {} and readback still finds profile: {}",
+                        trace_id,
+                        com_port,
+                        iccid,
+                        orig_error
+                    );
+                }
+            } else {
+                log::warn!(
+                    "[eSIM][trace={}] delete failed on {} for {} and profile readback failed: {}",
+                    trace_id,
+                    com_port,
+                    iccid,
+                    orig_error
+                );
+            }
+        }
+        self.audit_result(com_port, "delete", Some(iccid), &result).await;
         result
     }
 

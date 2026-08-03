@@ -12,6 +12,7 @@
   let error = $state('');
   let message = $state('');
   let busy = $state(false);
+  let portStatus = $state({});
 
   // The port whose session panel is expanded / active.
   let activePort = $state(null);
@@ -102,16 +103,114 @@
     setTimeout(() => (error = ''), 6000);
   }
 
+  function setPortStatus(com, status, op, msg = '') {
+    portStatus = {
+      ...portStatus,
+      [com]: { status, op, msg },
+    };
+  }
+
+  function statusBadge(status) {
+    switch (status) {
+      case 'ok':
+        return 'bg-green-100 text-green-700';
+      case 'failed':
+        return 'bg-red-100 text-red-700';
+      case 'running':
+        return 'bg-amber-100 text-amber-700';
+      case 'session':
+        return 'bg-amber-100 text-amber-700';
+      case 'skipped':
+        return 'bg-slate-100 text-slate-500';
+      default:
+        return 'bg-slate-100 text-slate-500';
+    }
+  }
+
+  function actionText(op) {
+    if (!op) return '';
+    const key = 'esim_status_action_' + op;
+    const translated = $t(key);
+    return translated === key ? op : translated;
+  }
+
+  function statusMetaForPort(p) {
+    const batchItem = job?.items?.find((it) => it.com_port === p.com_port);
+    if (batchItem) {
+      return {
+        status: batchItem.status,
+        label: $t('esim_batch_item_' + batchItem.status),
+        detail: batchItem.message ?? $t('esim_batch_op_' + job.op),
+      };
+    }
+
+    const local = portStatus[p.com_port];
+    if (local) {
+      if (local.status === 'running') {
+        return {
+          status: 'running',
+          label: $t('esim_status_running'),
+          detail: actionText(local.op),
+        };
+      }
+      if (local.status === 'ok') {
+        return {
+          status: 'ok',
+          label: $t('esim_status_ok'),
+          detail: actionText(local.op),
+        };
+      }
+      return {
+        status: 'failed',
+        label: $t('esim_status_failed'),
+        detail: local.msg ? `${actionText(local.op)}: ${local.msg}` : actionText(local.op),
+      };
+    }
+
+    if (p.last_status) {
+      const st = String(p.last_status).toLowerCase() === 'ok' ? 'ok' : 'failed';
+      const detailParts = [];
+      const opText = actionText(p.last_op);
+      if (opText) detailParts.push(opText);
+      if (p.last_message && String(p.last_message).toLowerCase() !== 'ok') {
+        detailParts.push(p.last_message);
+      }
+      if (p.last_at) detailParts.push(p.last_at);
+      return {
+        status: st,
+        label: st === 'ok' ? $t('esim_status_ok') : $t('esim_status_failed'),
+        detail: detailParts.join(' | '),
+      };
+    }
+
+    if (p.session_active || p.esim_mode) {
+      return {
+        status: 'session',
+        label: $t('esim_status_session'),
+        detail: $t('esim_mode_esim'),
+      };
+    }
+
+    return {
+      status: 'idle',
+      label: $t('esim_status_idle'),
+      detail: '',
+    };
+  }
+
   async function enter(com) {
     busy = true;
     error = '';
+    setPortStatus(com, 'running', 'enter');
     try {
       await apiClient.esimEnter(com);
       activePort = com;
       await loadPorts();
       await refreshSession(com);
+      setPortStatus(com, 'ok', 'enter');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'enter', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -121,6 +220,7 @@
   async function exit(com) {
     busy = true;
     error = '';
+    setPortStatus(com, 'running', 'exit');
     try {
       await apiClient.esimExit(com);
       if (activePort === com) {
@@ -129,8 +229,10 @@
         profiles = [];
       }
       await loadPorts();
+      setPortStatus(com, 'ok', 'exit');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'exit', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -139,6 +241,7 @@
 
   async function reset(com) {
     busy = true;
+    setPortStatus(com, 'running', 'reset');
     try {
       await apiClient.esimReset(com);
       if (activePort === com) {
@@ -147,8 +250,10 @@
         profiles = [];
       }
       await loadPorts();
+      setPortStatus(com, 'ok', 'reset');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'reset', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -171,11 +276,22 @@
 
   async function enableProfile(com, iccid) {
     busy = true;
+    setPortStatus(com, 'running', 'enable');
     try {
       await apiClient.esimEnable(com, iccid, true);
       await refreshSession(com);
+      // Keep ports out of long-held management mode: auto-exit after activation.
+      await apiClient.esimExit(com);
+      if (activePort === com) {
+        activePort = null;
+        chip = null;
+        profiles = [];
+      }
+      await loadPorts();
+      setPortStatus(com, 'ok', 'exit');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'enable', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -184,11 +300,14 @@
 
   async function disableProfile(com, iccid) {
     busy = true;
+    setPortStatus(com, 'running', 'disable');
     try {
       await apiClient.esimDisable(com, iccid, true);
       await refreshSession(com);
+      setPortStatus(com, 'ok', 'disable');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'disable', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -198,11 +317,14 @@
   async function deleteProfile(com, iccid) {
     if (!confirm($t('esim_confirm_delete'))) return;
     busy = true;
+    setPortStatus(com, 'running', 'delete');
     try {
       await apiClient.esimDelete(com, iccid);
       await refreshSession(com);
+      setPortStatus(com, 'ok', 'delete');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'delete', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -213,11 +335,14 @@
     const name = prompt($t('esim_nickname_prompt'));
     if (name == null) return;
     busy = true;
+    setPortStatus(com, 'running', 'nickname');
     try {
       await apiClient.esimNickname(com, iccid, name);
       await refreshSession(com);
+      setPortStatus(com, 'ok', 'nickname');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'nickname', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -226,13 +351,16 @@
 
   async function download(com) {
     busy = true;
+    setPortStatus(com, 'running', 'download');
     try {
       const body = {};
       for (const [k, v] of Object.entries(dl)) if (v) body[k] = v;
       await apiClient.esimDownload(com, body);
       await refreshSession(com);
+      setPortStatus(com, 'ok', 'download');
       flash($t('esim_op_ok'));
     } catch (e) {
+      setPortStatus(com, 'failed', 'download', describeError(e));
       fail(e);
     } finally {
       busy = false;
@@ -571,11 +699,13 @@
               <th class="px-4 py-2">{$t('esim_col_port')}</th>
               <th class="px-4 py-2">{$t('esim_col_capable')}</th>
               <th class="px-4 py-2">{$t('esim_col_mode')}</th>
+              <th class="px-4 py-2">{$t('esim_col_status')}</th>
               <th class="px-4 py-2">{$t('esim_col_sim')}</th>
             </tr>
           </thead>
           <tbody>
             {#each filteredPorts as p (p.com_port)}
+              {@const st = statusMetaForPort(p)}
               <tr class="border-t border-slate-100 {selected.has(p.com_port) ? 'bg-indigo-50/50' : ''}">
                 <td class="px-3 py-2">
                   <input
@@ -592,6 +722,12 @@
                   <span class="rounded-full px-2 py-0.5 text-xs {p.esim_mode ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600'}">
                     {p.esim_mode ? $t('esim_mode_esim') : $t('esim_mode_normal')}
                   </span>
+                </td>
+                <td class="px-4 py-2">
+                  <span class="rounded-full px-2 py-0.5 text-xs {statusBadge(st.status)}">{st.label}</span>
+                  {#if st.detail}
+                    <div class="mt-0.5 max-w-[260px] truncate text-[11px] text-slate-500" title={st.detail}>{st.detail}</div>
+                  {/if}
                 </td>
                 <td class="px-4 py-2 text-slate-500">{p.sim_id ?? '—'}</td>
               </tr>

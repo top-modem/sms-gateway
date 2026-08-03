@@ -4,12 +4,13 @@ pub mod error;
 pub mod lpac;
 
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::config::Settings;
@@ -41,6 +42,11 @@ pub struct PortInfo {
     /// True if this port currently holds the machine-wide eSIM session.
     pub session_active: bool,
     pub sim_id: Option<String>,
+    pub last_op: Option<String>,
+    /// `ok` when the last audited operation succeeded, otherwise `failed`.
+    pub last_status: Option<String>,
+    pub last_message: Option<String>,
+    pub last_at: Option<String>,
 }
 
 /// Machine-wide eSIM management service. Only one port may be in an eSIM session
@@ -49,6 +55,8 @@ pub struct EsimService {
     manager: ModemManagerRef,
     /// COM port that currently holds the eSIM session, if any.
     active: Arc<Mutex<Option<String>>>,
+    /// Correlation IDs for active eSIM sessions, keyed by COM port.
+    session_traces: Arc<Mutex<HashMap<String, String>>>,
     lpac: Lpac,
     enabled: bool,
     default_smdp: Option<String>,
@@ -63,6 +71,48 @@ pub struct EsimService {
 }
 
 impl EsimService {
+    fn is_timeout_error(err: &dyn std::fmt::Display, markers: &[&str]) -> bool {
+        let msg = err.to_string().to_ascii_lowercase();
+        msg.contains("timed out") && markers.iter().any(|m| msg.contains(m))
+    }
+
+    fn profile_is_enabled(profile: &Value) -> bool {
+        let state = profile
+            .get("profileState")
+            .or_else(|| profile.get("state"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(state.as_str(), "enabled" | "active")
+    }
+
+    fn new_trace_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    async fn set_session_trace(&self, com_port: &str, trace_id: String) {
+        self.session_traces
+            .lock()
+            .await
+            .insert(com_port.to_string(), trace_id);
+    }
+
+    async fn session_trace(&self, com_port: &str) -> Option<String> {
+        self.session_traces.lock().await.get(com_port).cloned()
+    }
+
+    async fn clear_session_trace(&self, com_port: &str) {
+        self.session_traces.lock().await.remove(com_port);
+    }
+    fn profile_matches_iccid(profile: &Value, iccid: &str) -> bool {
+        let lhs = profile
+            .get("iccid")
+            .or_else(|| profile.get("ICCID"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        lhs.eq_ignore_ascii_case(iccid)
+    }
+
     pub fn new(manager: ModemManagerRef, settings: &Settings) -> Self {
         let lpac_exe = settings
             .lpac_exe
@@ -90,6 +140,7 @@ impl EsimService {
         Self {
             manager,
             active: Arc::new(Mutex::new(None)),
+            session_traces: Arc::new(Mutex::new(HashMap::new())),
             lpac,
             enabled: settings.esim_enabled.unwrap_or(false),
             default_smdp: settings.esim_default_smdp.clone(),
@@ -157,16 +208,43 @@ impl EsimService {
     pub async fn list_ports(&self) -> Result<Vec<PortInfo>, EsimError> {
         self.ensure_enabled()?;
         let active = self.active.lock().await.clone();
+        let modems = self.manager.all_modems().await;
+        let latest_by_port = crate::db::get_latest_esim_operations_by_ports(
+            &modems
+                .iter()
+                .map(|m| m.com_port.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap_or_default();
         let mut out = Vec::new();
-        for modem in self.manager.all_modems().await {
+        for modem in modems {
             let capable = modem.detect_esim_capability().await;
             let sim_id = modem.sim_id.read().await.clone();
+            let latest = latest_by_port.get(&modem.com_port);
+            let last_status = latest.map(|op| {
+                if op.result_code == Some(0)
+                    || op
+                        .message
+                        .as_deref()
+                        .map(|m| m.eq_ignore_ascii_case("ok"))
+                        .unwrap_or(false)
+                {
+                    "ok".to_string()
+                } else {
+                    "failed".to_string()
+                }
+            });
             out.push(PortInfo {
                 com_port: modem.com_port.clone(),
                 esim_capable: capable,
                 esim_mode: modem.is_esim_mode().await,
                 session_active: active.as_deref() == Some(modem.com_port.as_str()),
                 sim_id,
+                last_op: latest.map(|op| op.op_type.clone()),
+                last_status,
+                last_message: latest.and_then(|op| op.message.clone()),
+                last_at: latest.map(|op| op.created_at.clone()),
             });
         }
         out.sort_by(|a, b| {
@@ -191,20 +269,42 @@ impl EsimService {
             return Err(EsimError::NotCapable(com_port.to_string()));
         }
 
+        let mut already_active = false;
         {
             let mut active = self.active.lock().await;
             match active.as_deref() {
-                Some(p) if p == com_port => {} // already ours; idempotent
+                Some(p) if p == com_port => {
+                    already_active = true;
+                } // already ours; idempotent
                 Some(p) => return Err(EsimError::Busy(p.to_string())),
                 None => *active = Some(com_port.to_string()),
             }
         }
 
-        // Perform the serial mode switch. If ath7 times out, reset and retry once.
+        let trace_id = if already_active {
+            self.session_trace(com_port)
+                .await
+                .unwrap_or_else(Self::new_trace_id)
+        } else {
+            Self::new_trace_id()
+        };
+        log::info!(
+            "[eSIM][trace={}] enter requested on {}{}",
+            trace_id,
+            com_port,
+            if already_active { " (idempotent)" } else { "" }
+        );
+
+        // Perform the serial mode switch. If the transition times out, reset and retry once.
         let mut enter_result = modem.esim_enter().await;
         if let Err(e) = &enter_result {
-            let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("ath7") && msg.contains("timed out") {
+            if Self::is_timeout_error(e, &["atl6", "ath7"]) {
+                log::warn!(
+                    "[eSIM][trace={}] enter timeout on {}; reset and retry once: {}",
+                    trace_id,
+                    com_port,
+                    e
+                );
                 let _ = modem.esim_reset().await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 enter_result = modem.esim_enter().await;
@@ -213,15 +313,27 @@ impl EsimService {
 
         // On failure, reset back to normal mode and release the gate.
         if let Err(e) = enter_result {
-            let _ = modem.esim_reset().await;
+            let reset_result = modem.esim_reset().await;
             *self.active.lock().await = None;
+            self.clear_session_trace(com_port).await;
+            if let Err(re) = reset_result {
+                log::warn!(
+                    "[eSIM][trace={}] enter failed on {}; fallback reset also failed: {}",
+                    trace_id,
+                    com_port,
+                    re
+                );
+            }
             let _ = self.audit(com_port, "enter", None, Some(&e.to_string())).await;
+            log::warn!("[eSIM][trace={}] enter failed on {}: {}", trace_id, com_port, e);
             return Err(EsimError::At(e.to_string()));
         }
 
         // Let the Windows smart-card reader appear before lpac is used.
         tokio::time::sleep(Duration::from_millis(self.reader_settle_ms)).await;
+        self.set_session_trace(com_port, trace_id.clone()).await;
         let _ = self.audit(com_port, "enter", Some(0), Some("ok")).await;
+        log::info!("[eSIM][trace={}] enter success on {}", trace_id, com_port);
         Ok(())
     }
 
@@ -230,29 +342,97 @@ impl EsimService {
     pub async fn exit(&self, com_port: &str) -> Result<(), EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
+        let trace_id = self
+            .session_trace(com_port)
+            .await
+            .unwrap_or_else(Self::new_trace_id);
+        log::info!("[eSIM][trace={}] exit requested on {}", trace_id, com_port);
         let modem = match self.get_modem(com_port).await {
             Ok(m) => m,
             Err(e) => {
                 // If the modem vanished while holding the gate, unblock future sessions.
                 self.clear_active_if_matches(com_port).await;
+                self.clear_session_trace(com_port).await;
                 let _ = self
                     .audit(com_port, "exit", None, Some("modem missing; gate released"))
                     .await;
                 return Err(e);
             }
         };
-        let result = modem.esim_exit().await;
+        let mut result = modem.esim_exit().await;
+        if let Err(e) = &result {
+            if Self::is_timeout_error(e, &["atl7", "ath7"]) {
+                log::warn!(
+                    "[eSIM][trace={}] exit timeout on {}; retrying once: {}",
+                    trace_id,
+                    com_port,
+                    e
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                result = modem.esim_exit().await;
+            }
+        }
+
+        let mut recovered_by_reset = false;
         if result.is_err() {
-            let _ = modem.esim_reset().await;
+            match modem.esim_reset().await {
+                Ok(_) => {
+                    if !modem.is_esim_mode().await {
+                        log::warn!(
+                            "[eSIM][trace={}] exit failed on {}, but reset restored normal mode; normalizing success",
+                            trace_id,
+                            com_port
+                        );
+                        result = Ok(());
+                        recovered_by_reset = true;
+                    } else {
+                        log::warn!(
+                            "[eSIM][trace={}] exit failed on {}; reset succeeded but modem still reports eSIM mode",
+                            trace_id,
+                            com_port
+                        );
+                    }
+                }
+                Err(re) => {
+                    log::warn!(
+                        "[eSIM][trace={}] exit failed on {}; reset failed: {}",
+                        trace_id,
+                        com_port,
+                        re
+                    );
+                }
+            }
         }
         self.clear_active_if_matches(com_port).await;
+        self.clear_session_trace(com_port).await;
 
         match &result {
             Ok(_) => {
-                let _ = self.audit(com_port, "exit", Some(0), Some("ok")).await;
+                let success_msg = if recovered_by_reset {
+                    "ok (recovered by reset)"
+                } else {
+                    "ok"
+                };
+                let _ = self.audit(com_port, "exit", Some(0), Some(success_msg)).await;
+                log::info!(
+                    "[eSIM][trace={}] exit success on {}{}",
+                    trace_id,
+                    com_port,
+                    if recovered_by_reset {
+                        " (recovered by reset)"
+                    } else {
+                        ""
+                    }
+                );
             }
             Err(e) => {
                 let _ = self.audit(com_port, "exit", None, Some(&e.to_string())).await;
+                log::warn!(
+                    "[eSIM][trace={}] exit failed on {}: {}",
+                    trace_id,
+                    com_port,
+                    e
+                );
             }
         }
 
@@ -264,6 +444,11 @@ impl EsimService {
     /// Abnormal-state recovery (`ath0`). Releases the gate if held by this port.
     pub async fn reset(&self, com_port: &str) -> Result<(), EsimError> {
         self.ensure_enabled()?;
+        let trace_id = self
+            .session_trace(com_port)
+            .await
+            .unwrap_or_else(Self::new_trace_id);
+        log::info!("[eSIM][trace={}] reset requested on {}", trace_id, com_port);
         let modem = self.get_modem(com_port).await?;
         let result = modem.esim_reset().await;
         {
@@ -272,6 +457,7 @@ impl EsimService {
                 *active = None;
             }
         }
+        self.clear_session_trace(com_port).await;
         match &result {
             Ok(_) => {
                 let _ = self.audit(com_port, "reset", Some(0), Some("ok")).await;
@@ -335,9 +521,63 @@ impl EsimService {
     ) -> Result<Value, EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
-        let result = self.lpac.profile_enable(iccid, refresh).await;
-        self.audit_result(com_port, "enable", Some(iccid), &result)
-            .await;
+        let trace_id = self
+            .session_trace(com_port)
+            .await
+            .unwrap_or_else(Self::new_trace_id);
+        log::info!(
+            "[eSIM][trace={}] enable requested on {} for {}",
+            trace_id,
+            com_port,
+            iccid
+        );
+        let mut result = self.lpac.profile_enable(iccid, refresh).await;
+        if let Err(err) = &result {
+            let orig_error = err.to_string();
+            // Some modems/lpac builds return an error even when the profile has already switched.
+            if let Ok(list) = self.lpac.profile_list().await {
+                let enabled = list
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().any(|p| {
+                            Self::profile_matches_iccid(p, iccid) && Self::profile_is_enabled(p)
+                        })
+                    })
+                    .unwrap_or(false);
+                if enabled {
+                    log::warn!(
+                        "[eSIM][trace={}] enable on {} for {} normalized to success after readback: {}",
+                        trace_id,
+                        com_port,
+                        iccid,
+                        orig_error
+                    );
+                    result = Ok(json!({
+                        "iccid": iccid,
+                        "state": "enabled",
+                        "normalized": true,
+                        "normalized_reason": orig_error
+                    }));
+                } else {
+                    log::warn!(
+                        "[eSIM][trace={}] enable failed on {} for {} and readback did not confirm activation: {}",
+                        trace_id,
+                        com_port,
+                        iccid,
+                        orig_error
+                    );
+                }
+            } else {
+                log::warn!(
+                    "[eSIM][trace={}] enable failed on {} for {} and profile readback failed: {}",
+                    trace_id,
+                    com_port,
+                    iccid,
+                    orig_error
+                );
+            }
+        }
+        self.audit_result(com_port, "enable", Some(iccid), &result).await;
         result
     }
 
@@ -499,6 +739,31 @@ impl EsimService {
         params: Option<&str>,
         result: &Result<Value, EsimError>,
     ) {
+        let trace_id = self
+            .session_trace(com_port)
+            .await
+            .unwrap_or_else(Self::new_trace_id);
+        match result {
+            Ok(_) => {
+                log::info!(
+                    "[eSIM][trace={}] op={} port={} success (params_present={})",
+                    trace_id,
+                    op,
+                    com_port,
+                    params.is_some()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[eSIM][trace={}] op={} port={} failed: {} (params_present={})",
+                    trace_id,
+                    op,
+                    com_port,
+                    e,
+                    params.is_some()
+                );
+            }
+        }
         let (code, message) = match result {
             Ok(_) => (Some(0i64), "ok".to_string()),
             Err(EsimError::Lpac { code, message }) => (Some(*code), message.clone()),

@@ -2528,6 +2528,56 @@ pub async fn log_esim_operation(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct EsimLatestOperation {
+    pub com_port: String,
+    pub op_type: String,
+    pub result_code: Option<i64>,
+    pub message: Option<String>,
+    pub created_at: String,
+}
+
+/// Return the most recent eSIM audit row per requested port.
+pub async fn get_latest_esim_operations_by_ports(
+    com_ports: &[String],
+) -> Result<HashMap<String, EsimLatestOperation>> {
+    if com_ports.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let pool = get_pool()?;
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT o.com_port, o.op_type, o.result_code, o.message, o.created_at \
+         FROM esim_operations o \
+         WHERE o.id IN (\
+            SELECT MAX(id) FROM esim_operations WHERE com_port IN (",
+    );
+
+    {
+        let mut separated = qb.separated(", ");
+        for com in com_ports {
+            separated.push_bind(com);
+        }
+    }
+
+    qb.push(") GROUP BY com_port) \
+             ORDER BY o.id DESC");
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let item = EsimLatestOperation {
+            com_port: row.get("com_port"),
+            op_type: row.get("op_type"),
+            result_code: row.get("result_code"),
+            message: row.get("message"),
+            created_at: row.get("created_at"),
+        };
+        out.insert(item.com_port.clone(), item);
+    }
+    Ok(out)
+}
+
 pub async fn db_init() -> Result<()> {
     #[cfg(debug_assertions)]
     let db_path = "sqlite://./data/data.db";

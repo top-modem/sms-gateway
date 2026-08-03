@@ -2,7 +2,7 @@
 use log::{debug, error, info, warn};
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -245,13 +245,38 @@ impl Modem {
 
     /// Send a single mode-switch command (e.g. `atl6`) and require an `OK` reply.
     async fn send_switch_command(&self, cmd: &str) -> io::Result<()> {
+        const SWITCH_TIMEOUT_SECS: u64 = 10;
+        let started = Instant::now();
         let full = format!("{}\r\n", cmd);
-        let resp = tokio::time::timeout(Duration::from_secs(10), self.send_command(&full))
+        let resp = tokio::time::timeout(Duration::from_secs(SWITCH_TIMEOUT_SECS), self.send_command(&full))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{} timed out", cmd)))??;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{} timed out after {} ms",
+                        cmd,
+                        started.elapsed().as_millis()
+                    ),
+                )
+            })??;
         if resp.contains("OK") {
+            debug!(
+                "[{}] switch {} ok in {} ms: {}",
+                self.com_port,
+                cmd,
+                started.elapsed().as_millis(),
+                Self::format_log(&resp)
+            );
             Ok(())
         } else {
+            warn!(
+                "[{}] switch {} non-ok in {} ms: {}",
+                self.com_port,
+                cmd,
+                started.elapsed().as_millis(),
+                Self::format_log(&resp)
+            );
             Err(io::Error::other(format!(
                 "{} did not return OK: {}",
                 cmd,
@@ -286,9 +311,26 @@ impl Modem {
         let r1 = self.send_switch_command("atl7").await;
         let r2 = self.send_switch_command("ath6").await;
         self.set_esim_mode(false).await;
-        r1?;
-        r2?;
-        Ok(())
+        match (r1, r2) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(e1), Ok(_)) => {
+                let msg = e1.to_string().to_ascii_lowercase();
+                if msg.contains("atl7") && msg.contains("timed out") {
+                    log::warn!(
+                        "[{}] atl7 timed out but ath6 succeeded; treating exit as recovered",
+                        self.com_port
+                    );
+                    Ok(())
+                } else {
+                    Err(e1)
+                }
+            }
+            (Ok(_), Err(e2)) => Err(e2),
+            (Err(e1), Err(e2)) => Err(io::Error::other(format!(
+                "exit failed (atl7: {}; ath6: {})",
+                e1, e2
+            ))),
+        }
     }
 
     /// Abnormal-state recovery: `ath0` restores factory defaults. Clears `esim_mode`.

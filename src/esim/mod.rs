@@ -130,6 +130,29 @@ impl EsimService {
             .ok_or_else(|| EsimError::PortNotFound(com_port.to_string()))
     }
 
+    async fn clear_active_if_matches(&self, com_port: &str) {
+        let mut active = self.active.lock().await;
+        if active.as_deref() == Some(com_port) {
+            *active = None;
+        }
+    }
+
+    /// If the remembered active session port no longer exists, clear the gate.
+    /// This prevents stale "session busy" locks after abrupt hardware disappearance.
+    async fn clear_stale_active_session(&self) {
+        let active_port = { self.active.lock().await.clone() };
+        if let Some(port) = active_port {
+            let still_present = self.manager.get_modem_by_com_port(&port).await.is_some();
+            if !still_present {
+                log::warn!(
+                    "[eSIM] clearing stale active session gate for missing port {}",
+                    port
+                );
+                self.clear_active_if_matches(&port).await;
+            }
+        }
+    }
+
     /// List every tracked port, probing eSIM capability (cached after first probe).
     pub async fn list_ports(&self) -> Result<Vec<PortInfo>, EsimError> {
         self.ensure_enabled()?;
@@ -162,6 +185,7 @@ impl EsimService {
     /// Acquire the machine-wide gate for `com_port` and switch it into eSIM mode.
     pub async fn enter(&self, com_port: &str) -> Result<(), EsimError> {
         self.ensure_enabled()?;
+        self.clear_stale_active_session().await;
         let modem = self.get_modem(com_port).await?;
         if !modem.detect_esim_capability().await {
             return Err(EsimError::NotCapable(com_port.to_string()));
@@ -205,9 +229,19 @@ impl EsimService {
     pub async fn exit(&self, com_port: &str) -> Result<(), EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
-        let modem = self.get_modem(com_port).await?;
+        let modem = match self.get_modem(com_port).await {
+            Ok(m) => m,
+            Err(e) => {
+                // If the modem vanished while holding the gate, unblock future sessions.
+                self.clear_active_if_matches(com_port).await;
+                let _ = self
+                    .audit(com_port, "exit", None, Some("modem missing; gate released"))
+                    .await;
+                return Err(e);
+            }
+        };
         let result = modem.esim_exit().await;
-        *self.active.lock().await = None;
+        self.clear_active_if_matches(com_port).await;
 
         match &result {
             Ok(_) => {
@@ -393,10 +427,11 @@ impl EsimService {
         let downloaded = self.download(com_port, req).await?;
 
         // Best-effort: enable the freshly-downloaded profile if we can find its ICCID.
-        if let Some(iccid) = downloaded
-            .get("iccid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        // Some lpac builds return success without an ICCID field, so fall back to
+        // querying current profile list in-session.
+        if let Some(iccid) = self
+            .resolve_downloaded_iccid(com_port, &downloaded)
+            .await
         {
             let _ = self.enable(com_port, &iccid, true).await;
         }
@@ -417,6 +452,14 @@ impl EsimService {
         }
 
         Ok(downloaded)
+    }
+
+    async fn resolve_downloaded_iccid(&self, com_port: &str, downloaded: &Value) -> Option<String> {
+        downloaded
+            .get("iccid")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or(self.current_iccid(com_port).await.ok().flatten())
     }
 
     async fn audit(
@@ -736,11 +779,7 @@ impl EsimService {
                     activation_code: item.activation_code.clone(),
                 };
                 let downloaded = self.download(com, &req).await?;
-                let iccid = downloaded
-                    .get("iccid")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or(self.current_iccid(com).await.ok().flatten());
+                let iccid = self.resolve_downloaded_iccid(com, &downloaded).await;
                 if auto_enable {
                     if let Some(ic) = &iccid {
                         let _ = self.enable(com, ic, true).await;

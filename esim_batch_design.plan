@@ -1,0 +1,256 @@
+================================================================================
+eSIM BATCH MANAGEMENT — DESIGN PLAN (planning only, no implementation yet)
+================================================================================
+Scope of this plan (from user request):
+  1. Add a checkbox before each COM port row.
+  2. Filter the port list and operate eSIM on the *selected* ports (batch).
+  3. Support various download source types: QR-code image, text-string code
+     (activation codes), sourced from the `esim/` folder.
+  4. Design a flow for BATCH download / delete / activate / deactivate.
+  5. Hardware reality: each eUICC holds exactly ONE profile (single-profile,
+     not multi-profile). The design must respect this.
+
+================================================================================
+0. Ground truth gathered
+================================================================================
+- Activation sources found in `esim/com_port/`:
+    - esim_list.txt  -> lines containing `LPA:1$<smdp>$<matchingId>` (sometimes
+      with extra tokens/phone numbers on the same line, whitespace separated).
+    - 1.jpg, 2.jpg, 3.jpg, 4.png -> QR images encoding an `LPA:1$...` string
+      (plus human-readable SM-DP+ address text in the image).
+- Canonical activation-code format: `LPA:1$<smdp-domain>$<matchingId>[$<confirmationCode>]`.
+  lpac already accepts this via `profile download -a "<LPA string>"` OR the split
+  `-s <smdp> -m <matchingId> [-c <conf>]`. Our `DownloadRequest` already has both
+  `activation_code` and the split fields.
+- HARD CONSTRAINT #1 (machine-wide gate): `EsimService.active: Mutex<Option<String>>`
+  allows only ONE port in eSIM mode at a time. => ALL batch operations are
+  strictly SEQUENTIAL (enter -> op -> exit -> next port). No parallelism.
+- HARD CONSTRAINT #2 (single profile per eUICC): a download onto a port that
+  already has a profile must first remove/replace it. Enable/disable/delete can
+  resolve "the one profile" automatically (no ICCID picker needed).
+- Existing per-port endpoints (all under /api/esim, admin-auth):
+  ports, {com}/session/enter, {com}/session/exit, {com}/reset, {com}/chip,
+  {com}/profiles, {com}/profiles/download|enable|disable|delete|nickname,
+  {com}/notifications*, {com}/provision.
+- Existing envelope: every endpoint returns { success, data }. Frontend now
+  unwraps this (EsimPage.unwrapPayload).
+
+================================================================================
+1. Activation-source model (new)
+================================================================================
+Introduce a normalized "ActivationCode":
+    struct ActivationCode {
+        raw_lpa: String,          // "LPA:1$smdp$matchingId[$conf]"
+        smdp: String,
+        matching_id: String,
+        confirmation_code: Option<String>,
+        source: String,           // "text:esim_list.txt#L2" | "qr:2.jpg" | "manual"
+        label: Option<String>,    // e.g. trailing phone number token, for display
+    }
+
+Parsers (new module `src/esim/activation.rs`):
+  - parse_lpa_line(&str) -> Vec<ActivationCode>
+      Tokenize a text line on whitespace; for each token starting with "LPA:1$",
+      split on '$' into (smdp, matchingId, conf?). Non-LPA tokens on the line
+      become `label` (e.g. the "0493913181" phone number).
+  - parse_text_file(path) -> Vec<ActivationCode>   (one file, many lines)
+  - decode_qr_image(bytes) -> Vec<ActivationCode>  (decode QR, then parse_lpa_line)
+  - scan_source_dir(dir) -> Vec<ActivationCode>    (walk `esim_source_dir`: parse
+      *.txt as text, *.jpg/*.jpeg/*.png as QR; skip unreadable; keep source tag)
+
+QR decode decision: do it in the BACKEND (Rust) so both the server-side folder
+and browser uploads share one implementation.
+  - New deps: `rqrr` (pure-Rust QR detect/decode) + `image` (load jpg/png).
+  - Rejected alt: frontend jsQR — would duplicate parsing and can't read the
+    server `esim/` folder. (Could still be added later for pure client convenience.)
+
+================================================================================
+2. Config additions (src/config.rs Settings, all optional/back-compat)
+================================================================================
+- esim_source_dir: Option<String>          (default "./esim/com_port")
+- esim_batch_auto_enable: Option<bool>      (default true; DECIDED: auto-enable
+                                             immediately after download)
+- esim_batch_replace_existing: Option<bool> (default true; DECIDED: auto-replace
+                                             an existing profile before download)
+- esim_batch_stop_on_error: Option<bool>    (default false: continue to next port)
+- lpac_exe already resolves to ./lpac/lpac.exe (CONFIRMED: bundled lpac folder).
+Document all in config.toml.example.
+
+================================================================================
+3. Single-profile-aware service helpers (new, src/esim/mod.rs)
+================================================================================
+Because each eUICC has one profile, add helpers that resolve it internally so the
+UI never needs an ICCID for the common case:
+  - current_profile(com) -> Option<ProfileInfo>   (profile_list -> first/only)
+  - enable_current(com)   -> enable the one profile (refresh=true)
+  - disable_current(com)  -> disable the one profile
+  - delete_current(com)   -> delete the one profile
+  - replace_download(com, code, auto_enable):
+        list -> if a profile exists: (disable if enabled) + delete -> download ->
+        optional enable -> process notifications.
+Each helper is still called INSIDE an enter/exit span (see batch runner).
+
+================================================================================
+4. Batch job orchestrator (new, backend)  — PRIMARY design
+================================================================================
+Why backend (not a frontend loop): the sequential gate + enter/exit + lpac steps
+are long-running and must survive tab focus changes; a server job is atomic and
+auditable.
+
+Model:
+  enum BatchOp { Download, Delete, Activate, Deactivate }
+  struct BatchItem {
+      com_port: String,
+      activation: Option<ActivationCode>,   // required for Download only
+  }
+  struct BatchJob {
+      id: String,                 // uuid
+      op: BatchOp,
+      items: Vec<BatchItem>,
+      options: { auto_enable, replace_existing, stop_on_error },
+      created_at,
+  }
+  struct BatchItemResult { com_port, status: pending|running|ok|failed|skipped,
+                           message, iccid?, started_at, finished_at }
+
+Runner (`src/esim/batch.rs`):
+  - A single global tokio task queue (Mutex<Option<RunningJob>>) — only ONE batch
+    job at a time (mirrors the hardware gate). Reject a 2nd job with 409.
+  - For each item, sequentially:
+        acquire gate via existing enter(com)  (RAII-ish: always exit(com))
+        match op:
+          Download   -> replace_download(com, code, auto_enable)
+          Delete     -> delete_current(com)
+          Activate   -> enable_current(com)
+          Deactivate -> disable_current(com)
+        record BatchItemResult; append to esim_operations audit.
+        exit(com); on error: if stop_on_error -> abort remaining as "skipped".
+  - Cancellation: a cancel flag checked BETWEEN items (never mid-lpac). Current
+    item finishes, remaining -> "skipped(cancelled)".
+  - Progress: push events to SSE (reuse SseManager with a new event kind
+    "esim_batch") OR a dedicated broadcast channel keyed by job id.
+
+Endpoints (new):
+  - GET  /api/esim/sources                 -> scan esim_source_dir; return the
+                                              pool of ActivationCode (preview).
+  - POST /api/esim/sources/upload          -> multipart: images/txt; returns parsed
+                                              ActivationCode[] (no persistence).
+  - POST /api/esim/batch                   -> body { op, items[], options }; starts
+                                              a job; returns { job_id }.
+  - GET  /api/esim/batch/{job_id}          -> current job snapshot (all item results).
+  - POST /api/esim/batch/{job_id}/cancel   -> request cancel.
+  - GET  /api/esim/batch/{job_id}/events   -> SSE stream of progress (optional;
+                                              can also poll the snapshot every 1s).
+
+================================================================================
+5. Code<->Port pairing (Download only)  [DECIDED]
+================================================================================
+Single profile per port => Download needs a 1:1 mapping of activation code to
+selected port. UI builds `items[]`:
+  - PRIMARY pairing = FILENAME -> PORT (CONFIRMED). The numeric stem of a source
+    file maps to the COM port: `2.jpg` -> COM2, `4.png` -> COM4, `10.jpg` -> COM10.
+    `esim_list.txt` lines (no numeric stem) fall back to sequential pairing over
+    any selected ports still unpaired after filename mapping.
+    - scan_source_dir must therefore attach a `port_hint: Option<u32>` derived
+      from the numeric filename stem (strip leading zeros; ignore non-numeric
+      stems). Multiple codes for the same port -> flag conflict, last-wins unless
+      user resolves.
+  - Manual override: user can still reassign any code to any port (dropdown/row).
+  - Validation: warn if a selected port has no mapped code (excluded); warn if a
+    mapped port isn't in the current selection (included only if user opts in);
+    warn on duplicate code reuse across ports.
+
+================================================================================
+6. Frontend (EsimPage.svelte) changes
+================================================================================
+Selection + filter:
+  - New leading checkbox column; header "select all" respects the active filter.
+  - Filter bar: free-text (matches com_port or current SIM/ICCID) + quick toggles
+    (eSIM-capable only, has-SIM, in eSIM mode). `filteredPorts` derived state.
+  - `selected: Set<com_port>` state; selecting is independent of the single-port
+    session panel (which stays for one-off manual work).
+
+Batch toolbar (visible when selected.size > 0):
+  - Buttons: Batch Download, Activate, Deactivate, Delete, Clear selection.
+  - Guards: disabled while a manual session or another batch job is active.
+
+Batch Download dialog:
+  - Source picker: (a) "From server folder" -> GET /sources preview list;
+    (b) "Upload files" -> drag/drop images or .txt -> POST /sources/upload;
+    (c) "Paste codes" -> textarea of LPA lines.
+  - Pairing table: selected ports x assigned code (auto-filled, editable).
+  - Options: auto-enable, replace existing profile, stop-on-error.
+  - Start -> POST /batch -> open Progress panel.
+
+Progress panel (all batch ops):
+  - Per-port rows: status badge (pending/running/ok/failed/skipped) + message +
+    resolved ICCID. Live via SSE or 1s poll of the job snapshot.
+  - Actions: Cancel (between items), Retry failed (new job with failed items),
+    Close when done.
+
+Destructive confirm: Batch Delete / Deactivate require a typed/explicit confirm
+listing affected ports.
+
+api.js additions: esimScanSources(), esimUploadSources(files),
+esimStartBatch(payload), esimGetBatch(id), esimCancelBatch(id),
+esimBatchEvents(id) (EventSource).
+
+i18n: EN + ZH keys for all new labels, statuses, dialogs, warnings.
+
+================================================================================
+7. Concurrency, safety, edge cases
+================================================================================
+- Only one batch job machine-wide (mirrors the single eSIM session). 409 otherwise.
+- Manual single-port session and batch are mutually exclusive.
+- Always exit()/return-to-Normal per port even on failure (reuse existing exit()
+  which clears esim_mode and lets the recheck worker re-read ICCID).
+- eSIM-mode ports are already skipped by SMS/recheck workers — batch inherits this.
+- Download onto occupied eUICC: only proceed if replace_existing, else fail item.
+- Notifications processed after download/enable/delete (GSMA), best-effort.
+- Network vs card errors surfaced distinctly in item message.
+- Audit every mutating item to esim_operations.
+
+================================================================================
+8. Testing
+================================================================================
+- Unit: parse_lpa_line (single/multi token, conf code, trailing label), QR decode
+  of the sample images in esim/com_port/, source-dir scan.
+- Unit: batch runner state machine with a mocked EsimService (ok/fail/cancel,
+  stop_on_error true/false, skipped propagation).
+- Manual hardware runbook: select 2-3 ports, batch download from folder, verify
+  sequential enter/exit, per-port ICCID after enable, SMS resumes after exit.
+
+================================================================================
+9. Milestones
+================================================================================
+- M1 UI selection: checkbox column + filter + select-all + selection toolbar,
+  wired to EXISTING single-port endpoints via a temporary frontend sequential
+  loop (quick, no backend changes) — validates UX.
+- M2 Activation sources: activation.rs (text+QR), rqrr/image deps,
+  GET /sources + POST /sources/upload, source preview UI.
+- M3 Single-profile helpers (current_profile/enable/disable/delete/replace_download).
+- M4 Backend batch orchestrator + endpoints + SSE progress; move UI off the
+  temporary loop onto real jobs.
+- M5 Batch delete/activate/deactivate + cancel + retry-failed + confirms + i18n.
+- M6 Tests, config.toml.example docs, polish.
+
+================================================================================
+10. Open questions (need user decision before build)
+================================================================================
+Q1. [DECIDED] Filename implies port: 2.jpg -> COM2. Text lines fall back to
+    sequential pairing over remaining selected ports. User-editable override kept.
+Q2. [DECIDED] Auto-enable profile immediately after batch download = YES.
+Q3. [DECIDED] Existing profile on a port during download = AUTO-REPLACE
+    (disable if enabled -> delete -> download -> enable).
+Q4. lpac location [DECIDED] = ./lpac/lpac.exe (bundled lpac folder).
+
+Still open (proceeding with proposed defaults unless you object):
+Q5. Progress transport: SSE stream vs 1s polling of the job snapshot?
+    (Proposed: SSE, reuse SseManager; polling as fallback.)
+Q6. Persist batch jobs (new esim_batch_jobs table) vs in-memory job + per-item
+    audit only? (Proposed: in-memory + per-item audit for v1.)
+Q7. QR decode in backend (rqrr+image) vs frontend (jsQR)?
+    (Proposed: backend, so the server-side esim/ folder and uploads share code.)
+Q8. If a selected port has NO matching source file/code, skip it silently or
+    report it as "skipped (no code)"? (Proposed: report as skipped.)
+================================================================================

@@ -63,6 +63,15 @@ pub struct Settings {
     pub esim_default_smdp: Option<String>,
     /// Milliseconds to wait after `ath7` for the smart-card reader to appear (default 1500).
     pub esim_reader_settle_ms: Option<u64>,
+    /// Directory scanned for batch activation sources (QR images + text lists).
+    /// Numeric filename stems map to COM ports (e.g. `2.jpg` -> COM2). Default "./esim/com_port".
+    pub esim_source_dir: Option<String>,
+    /// Enable the freshly-downloaded profile automatically during batch download (default true).
+    pub esim_batch_auto_enable: Option<bool>,
+    /// Delete any existing profile before a batch download (single-profile eUICC) (default true).
+    pub esim_batch_replace_existing: Option<bool>,
+    /// Abort the remaining ports if one port fails during a batch job (default false).
+    pub esim_batch_stop_on_error: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

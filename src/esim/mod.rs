@@ -1,6 +1,10 @@
+pub mod activation;
+pub mod batch;
 pub mod error;
 pub mod lpac;
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +15,10 @@ use tokio::sync::Mutex;
 use crate::config::Settings;
 use crate::ModemManagerRef;
 
+pub use activation::ActivationCode;
+pub use batch::{BatchManager, BatchOp, BatchReqItem, BatchRequest, JobSnapshot};
 pub use error::EsimError;
+use batch::BatchItemResult;
 use lpac::Lpac;
 
 /// A downloadable-profile request coming from the API layer.
@@ -46,15 +53,30 @@ pub struct EsimService {
     enabled: bool,
     default_smdp: Option<String>,
     reader_settle_ms: u64,
+    /// Directory scanned for batch activation sources (QR images + text lists).
+    source_dir: PathBuf,
+    /// Machine-wide batch job state + progress broadcast.
+    batch: Arc<BatchManager>,
+    batch_auto_enable: bool,
+    batch_replace_existing: bool,
+    batch_stop_on_error: bool,
 }
 
 impl EsimService {
     pub fn new(manager: ModemManagerRef, settings: &Settings) -> Self {
+        let lpac_exe = settings
+            .lpac_exe
+            .clone()
+            .unwrap_or_else(|| {
+                if Path::new("./lpac/lpac.exe").exists() {
+                    "./lpac/lpac.exe".to_string()
+                } else {
+                    "lpac".to_string()
+                }
+            });
+
         let lpac = Lpac::new(
-            settings
-                .lpac_exe
-                .clone()
-                .unwrap_or_else(|| "lpac".to_string()),
+            lpac_exe,
             settings
                 .lpac_apdu_backend
                 .clone()
@@ -72,6 +94,16 @@ impl EsimService {
             enabled: settings.esim_enabled.unwrap_or(false),
             default_smdp: settings.esim_default_smdp.clone(),
             reader_settle_ms: settings.esim_reader_settle_ms.unwrap_or(1500),
+            source_dir: PathBuf::from(
+                settings
+                    .esim_source_dir
+                    .clone()
+                    .unwrap_or_else(|| "./esim/com_port".to_string()),
+            ),
+            batch: Arc::new(BatchManager::new()),
+            batch_auto_enable: settings.esim_batch_auto_enable.unwrap_or(true),
+            batch_replace_existing: settings.esim_batch_replace_existing.unwrap_or(true),
+            batch_stop_on_error: settings.esim_batch_stop_on_error.unwrap_or(false),
         }
     }
 
@@ -81,6 +113,11 @@ impl EsimService {
         } else {
             Err(EsimError::Disabled)
         }
+    }
+
+    /// Public enablement check for endpoints that do not touch the modem gate.
+    pub fn ready(&self) -> Result<(), EsimError> {
+        self.ensure_enabled()
     }
 
     async fn get_modem(
@@ -393,6 +430,284 @@ impl EsimService {
             crate::db::log_esim_operation(com_port, None, op, params, code, Some(&message)).await
         {
             log::warn!("[eSIM] failed to write audit log for {}: {}", op, e);
+        }
+    }
+
+    // ---- Activation sources ------------------------------------------------
+
+    /// Scan the configured source directory for QR-image / text activation codes.
+    pub fn scan_sources(&self) -> Vec<ActivationCode> {
+        activation::scan_source_dir(&self.source_dir)
+    }
+
+    // ---- Single-profile helpers (one profile per eUICC) --------------------
+
+    /// ICCIDs of every profile currently on the active eUICC.
+    async fn list_profile_iccids(&self, com_port: &str) -> Result<Vec<String>, EsimError> {
+        let list = self.profiles(com_port).await?;
+        Ok(list
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("iccid").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// ICCID of the single profile on the eUICC, if any.
+    async fn current_iccid(&self, com_port: &str) -> Result<Option<String>, EsimError> {
+        Ok(self.list_profile_iccids(com_port).await?.into_iter().next())
+    }
+
+    /// Enable the one profile present on the eUICC.
+    async fn enable_current(&self, com_port: &str) -> Result<Option<String>, EsimError> {
+        match self.current_iccid(com_port).await? {
+            Some(iccid) => {
+                self.enable(com_port, &iccid, true).await?;
+                Ok(Some(iccid))
+            }
+            None => Err(EsimError::Lpac {
+                code: -1,
+                message: "no profile on eUICC".to_string(),
+            }),
+        }
+    }
+
+    /// Disable the one profile present on the eUICC.
+    async fn disable_current(&self, com_port: &str) -> Result<Option<String>, EsimError> {
+        match self.current_iccid(com_port).await? {
+            Some(iccid) => {
+                self.disable(com_port, &iccid, true).await?;
+                Ok(Some(iccid))
+            }
+            None => Err(EsimError::Lpac {
+                code: -1,
+                message: "no profile on eUICC".to_string(),
+            }),
+        }
+    }
+
+    /// Delete the one profile present on the eUICC.
+    async fn delete_current(&self, com_port: &str) -> Result<Option<String>, EsimError> {
+        match self.current_iccid(com_port).await? {
+            Some(iccid) => {
+                // A profile must be disabled before it can be deleted.
+                let _ = self.disable(com_port, &iccid, true).await;
+                self.delete(com_port, &iccid).await?;
+                Ok(Some(iccid))
+            }
+            None => Err(EsimError::Lpac {
+                code: -1,
+                message: "no profile to delete".to_string(),
+            }),
+        }
+    }
+
+    /// Remove every profile from the eUICC (used before a replace-download).
+    async fn delete_all_profiles(&self, com_port: &str) {
+        if let Ok(iccids) = self.list_profile_iccids(com_port).await {
+            for iccid in iccids {
+                let _ = self.disable(com_port, &iccid, true).await;
+                let _ = self.delete(com_port, &iccid).await;
+            }
+        }
+    }
+
+    /// Send + remove all pending notifications (best-effort GSMA compliance).
+    async fn process_all_notifications(&self, com_port: &str) {
+        if let Ok(list) = self.notification_list(com_port).await {
+            if let Some(items) = list.as_array() {
+                for item in items {
+                    if let Some(seq) = item
+                        .get("seqNumber")
+                        .and_then(|v| v.as_i64())
+                        .map(|n| n.to_string())
+                    {
+                        let _ = self.notification_process(com_port, &seq, true).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Batch orchestration ----------------------------------------------
+
+    /// Current or last batch job snapshot.
+    pub async fn batch_snapshot(&self) -> Option<JobSnapshot> {
+        self.batch.snapshot().await
+    }
+
+    /// Subscribe to batch progress events (SSE).
+    pub fn subscribe_batch(&self) -> tokio::sync::broadcast::Receiver<JobSnapshot> {
+        self.batch.subscribe()
+    }
+
+    /// Request cancellation of the running batch job (checked between ports).
+    pub fn cancel_batch(&self) {
+        self.batch.request_cancel();
+    }
+
+    /// Start a sequential batch job. Returns the job id. Only one job may run
+    /// machine-wide; a second request is rejected while one is in flight.
+    pub async fn start_batch(self: Arc<Self>, req: BatchRequest) -> Result<String, EsimError> {
+        self.ensure_enabled()?;
+        {
+            let active = self.active.lock().await;
+            if let Some(p) = active.as_deref() {
+                return Err(EsimError::Busy(format!("port {} in eSIM session", p)));
+            }
+        }
+        if self
+            .batch
+            .running
+            .swap(true, Ordering::SeqCst)
+        {
+            return Err(EsimError::Busy("batch job already running".to_string()));
+        }
+        self.batch.cancel.store(false, Ordering::SeqCst);
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let items: Vec<BatchItemResult> = req
+            .items
+            .iter()
+            .map(|it| BatchItemResult {
+                com_port: it.com_port.clone(),
+                status: "pending".to_string(),
+                message: None,
+                iccid: None,
+            })
+            .collect();
+        let snap = JobSnapshot {
+            id: id.clone(),
+            op: req.op,
+            status: "running".to_string(),
+            items,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        self.batch.publish(snap.clone()).await;
+
+        let svc = self.clone();
+        tokio::spawn(async move {
+            svc.run_batch(req, snap).await;
+        });
+        Ok(id)
+    }
+
+    async fn run_batch(self: Arc<Self>, req: BatchRequest, mut snap: JobSnapshot) {
+        let auto_enable = req.auto_enable.unwrap_or(self.batch_auto_enable);
+        let replace = req.replace_existing.unwrap_or(self.batch_replace_existing);
+        let stop_on_error = req.stop_on_error.unwrap_or(self.batch_stop_on_error);
+        let mut aborted = false;
+
+        for i in 0..req.items.len() {
+            if aborted || self.batch.is_cancelled() {
+                snap.items[i].status = "skipped".to_string();
+                snap.items[i].message = Some("cancelled".to_string());
+                self.batch.publish(snap.clone()).await;
+                continue;
+            }
+
+            let item = req.items[i].clone();
+
+            // A download needs an activation source; skip ports without one.
+            if req.op == BatchOp::Download
+                && item.activation_code.is_none()
+                && item.matching_id.is_none()
+            {
+                snap.items[i].status = "skipped".to_string();
+                snap.items[i].message = Some("no activation code".to_string());
+                self.batch.publish(snap.clone()).await;
+                continue;
+            }
+
+            snap.items[i].status = "running".to_string();
+            self.batch.publish(snap.clone()).await;
+
+            match self
+                .run_batch_item(req.op, &item, auto_enable, replace)
+                .await
+            {
+                Ok(iccid) => {
+                    snap.items[i].status = "ok".to_string();
+                    snap.items[i].iccid = iccid;
+                    snap.items[i].message = Some("ok".to_string());
+                }
+                Err(e) => {
+                    snap.items[i].status = "failed".to_string();
+                    snap.items[i].message = Some(e.to_string());
+                    if stop_on_error {
+                        aborted = true;
+                    }
+                }
+            }
+            self.batch.publish(snap.clone()).await;
+        }
+
+        snap.status = if self.batch.is_cancelled() {
+            "cancelled".to_string()
+        } else {
+            "done".to_string()
+        };
+        snap.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        self.batch.publish(snap).await;
+        self.batch.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Enter the port's eSIM session, run one operation, and always exit.
+    async fn run_batch_item(
+        &self,
+        op: BatchOp,
+        item: &BatchReqItem,
+        auto_enable: bool,
+        replace: bool,
+    ) -> Result<Option<String>, EsimError> {
+        self.enter(&item.com_port).await?;
+        let result = self
+            .batch_item_inner(op, item, auto_enable, replace)
+            .await;
+        let _ = self.exit(&item.com_port).await;
+        result
+    }
+
+    async fn batch_item_inner(
+        &self,
+        op: BatchOp,
+        item: &BatchReqItem,
+        auto_enable: bool,
+        replace: bool,
+    ) -> Result<Option<String>, EsimError> {
+        let com = &item.com_port;
+        match op {
+            BatchOp::Download => {
+                if replace {
+                    self.delete_all_profiles(com).await;
+                }
+                let req = DownloadRequest {
+                    smdp: item.smdp.clone(),
+                    matching_id: item.matching_id.clone(),
+                    confirmation_code: item.confirmation_code.clone(),
+                    imei: item.imei.clone(),
+                    activation_code: item.activation_code.clone(),
+                };
+                let downloaded = self.download(com, &req).await?;
+                let iccid = downloaded
+                    .get("iccid")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or(self.current_iccid(com).await.ok().flatten());
+                if auto_enable {
+                    if let Some(ic) = &iccid {
+                        let _ = self.enable(com, ic, true).await;
+                    }
+                }
+                self.process_all_notifications(com).await;
+                Ok(iccid)
+            }
+            BatchOp::Delete => self.delete_current(com).await,
+            BatchOp::Activate => self.enable_current(com).await,
+            BatchOp::Deactivate => self.disable_current(com).await,
         }
     }
 }

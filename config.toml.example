@@ -37,6 +37,10 @@ read_sms_frequency = 30          # How often to check for new SMS messages
 # lpac_pcsc_reader_name = ""               # Optional fixed PC/SC reader name (LPAC_APDU_PCSC_DRV_NAME)
 # esim_default_smdp = ""                   # Fallback SM-DP+ server used when a download omits it
 # esim_reader_settle_ms = 1500             # Wait after ath7 for the smart-card reader to appear (ms)
+# esim_source_dir = "./esim/com_port"      # Folder scanned for batch sources (QR images + text lists); numeric filename -> COM port (2.jpg -> COM2)
+# esim_batch_auto_enable = true            # Enable the freshly-downloaded profile automatically during batch download
+# esim_batch_replace_existing = true       # Delete any existing profile before a batch download (single-profile eUICC)
+# esim_batch_stop_on_error = false         # Abort remaining ports if one port fails during a batch job
 
 # Webhook configuration
 webhooks_max_concurrent = 10     # Maximum concurrent webhook requests

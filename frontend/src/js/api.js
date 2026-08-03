@@ -501,6 +501,40 @@ class ApiClient {
     async esimProvision(com, body) {
         return FetchApi.post(`/api/esim/${com}/provision`, body);
     }
+
+    /** Scan the server's eSIM source folder for QR/text activation codes. */
+    async esimScanSources() {
+        return FetchApi.get('/api/esim/sources');
+    }
+
+    /** Upload QR images / text files and get back parsed activation codes. */
+    async esimUploadSources(files) {
+        const form = new FormData();
+        for (const f of files) form.append('files', f, f.name);
+        const res = await fetch('/api/esim/sources/upload', {
+            method: 'POST',
+            headers: buildBasicAuthHeader(),
+            body: form,
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw { status: res.status, data };
+        return { data };
+    }
+
+    /** Start a sequential batch job (op = download|delete|activate|deactivate). */
+    async esimStartBatch(payload) {
+        return FetchApi.post('/api/esim/batch', payload);
+    }
+
+    /** Current/last batch job snapshot. */
+    async esimGetBatch() {
+        return FetchApi.get('/api/esim/batch');
+    }
+
+    /** Request cancellation of the running batch job. */
+    async esimCancelBatch() {
+        return FetchApi.post('/api/esim/batch/cancel');
+    }
 }
 
 // Export as a singleton

@@ -472,7 +472,10 @@ impl ModemManager {
         index: usize,
         force_uk_mcc_to_46001: bool,
     ) -> anyhow::Result<(String, Modem, bool)> {
-        const INIT_TIMEOUT_SECS: u64 = 10;
+        // Full modem initialization includes multiple AT probes and can exceed
+        // 10s on busy ports (observed on COM17), which causes false
+        // unavailable flapping despite quick probe success.
+        const INIT_TIMEOUT_SECS: u64 = 20;
 
         // Some serial stack failures on Windows can panic internally while opening a COM port.
         // Catch unwind here so one bad port cannot terminate the whole process.

@@ -263,9 +263,20 @@ impl Modem {
     /// Enter eSIM-management mode: `atl6` then `ath7`. A Windows smart-card
     /// device appears after `ath7`. Sets `esim_mode` on success.
     pub async fn esim_enter(&self) -> io::Result<()> {
-        self.send_switch_command("atl6").await?;
-        self.send_switch_command("ath7").await?;
+        // Mark as eSIM-busy before switching so periodic SIM probes skip this port
+        // while atl6/ath7 are in flight.
         self.set_esim_mode(true).await;
+
+        if let Err(e) = self.send_switch_command("atl6").await {
+            self.set_esim_mode(false).await;
+            return Err(e);
+        }
+
+        if let Err(e) = self.send_switch_command("ath7").await {
+            self.set_esim_mode(false).await;
+            return Err(e);
+        }
+
         Ok(())
     }
 

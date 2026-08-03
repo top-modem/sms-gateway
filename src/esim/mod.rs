@@ -211,8 +211,9 @@ impl EsimService {
             }
         }
 
-        // On failure, release the gate.
+        // On failure, reset back to normal mode and release the gate.
         if let Err(e) = enter_result {
+            let _ = modem.esim_reset().await;
             *self.active.lock().await = None;
             let _ = self.audit(com_port, "enter", None, Some(&e.to_string())).await;
             return Err(EsimError::At(e.to_string()));
@@ -241,6 +242,9 @@ impl EsimService {
             }
         };
         let result = modem.esim_exit().await;
+        if result.is_err() {
+            let _ = modem.esim_reset().await;
+        }
         self.clear_active_if_matches(com_port).await;
 
         match &result {
@@ -415,8 +419,19 @@ impl EsimService {
         let outcome = self.provision_inner(com_port, req).await;
 
         // Always return the port to Normal mode regardless of the result.
-        let _ = self.exit(com_port).await;
+        self.cleanup_session(com_port).await;
         outcome
+    }
+
+    async fn cleanup_session(&self, com_port: &str) {
+        if let Err(e) = self.exit(com_port).await {
+            log::warn!(
+                "[eSIM] exit failed on {}: {}. Falling back to ath0 reset.",
+                com_port,
+                e
+            );
+            let _ = self.reset(com_port).await;
+        }
     }
 
     async fn provision_inner(
@@ -738,7 +753,7 @@ impl EsimService {
                 .batch_item_inner(op, item, auto_enable, replace)
                 .await;
         }
-        let _ = self.exit(&item.com_port).await;
+        self.cleanup_session(&item.com_port).await;
         result
     }
 

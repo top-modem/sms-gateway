@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::config::Settings;
+use crate::phone_number::normalize_msisdn;
 use crate::ModemManagerRef;
 
 pub use activation::ActivationCode;
@@ -29,6 +30,8 @@ pub struct DownloadRequest {
     pub matching_id: Option<String>,
     pub confirmation_code: Option<String>,
     pub imei: Option<String>,
+    /// Optional MSISDN associated with the activation source.
+    pub phone_number: Option<String>,
     /// A single `LPA:1$smdp$matchingId` activation string (alternative to the fields above).
     pub activation_code: Option<String>,
 }
@@ -520,6 +523,13 @@ impl EsimService {
         let params = serde_json::to_string(req).ok();
         self.audit_result(com_port, "download", params.as_deref(), &result)
             .await;
+        if let Ok(downloaded) = &result {
+            if let Some(iccid) = self.resolve_downloaded_iccid(com_port, downloaded).await {
+                let _ = self
+                    .persist_download_phone_number(&iccid, req.phone_number.as_deref(), com_port)
+                    .await;
+            }
+        }
         result
     }
 
@@ -802,6 +812,9 @@ impl EsimService {
             .resolve_downloaded_iccid(com_port, &downloaded)
             .await
         {
+            let _ = self
+                .persist_download_phone_number(&iccid, req.phone_number.as_deref(), com_port)
+                .await;
             let _ = self.enable(com_port, &iccid, true).await;
         }
 
@@ -829,6 +842,54 @@ impl EsimService {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or(self.current_iccid(com_port).await.ok().flatten())
+    }
+
+    fn normalized_phone_number(raw: Option<&str>) -> Option<String> {
+        raw.map(normalize_msisdn).filter(|p| !p.is_empty())
+    }
+
+    async fn persist_download_phone_number(
+        &self,
+        iccid: &str,
+        raw_phone_number: Option<&str>,
+        com_port: &str,
+    ) -> Result<(), EsimError> {
+        let Some(phone_number) = Self::normalized_phone_number(raw_phone_number) else {
+            return Ok(());
+        };
+
+        match crate::db::SimCard::find_by_id(iccid).await {
+            Ok(Some(mut card)) => {
+                if card.phone_number.as_deref() != Some(phone_number.as_str()) {
+                    card.update_phone_number(Some(phone_number.clone()))
+                        .await
+                        .map_err(|e| EsimError::Spawn(e.to_string()))?;
+                    log::info!(
+                        "[eSIM] persisted downloaded phone number for {} on {}: {}",
+                        iccid,
+                        com_port,
+                        phone_number
+                    );
+                }
+            }
+            Ok(None) => {
+                log::warn!(
+                    "[eSIM] download on {} resolved ICCID {} but no sim_cards row was found for phone number persistence",
+                    com_port,
+                    iccid
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[eSIM] failed to look up sim_cards row for {} on {}: {}",
+                    iccid,
+                    com_port,
+                    e
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn audit(
@@ -1170,6 +1231,7 @@ impl EsimService {
                     matching_id: item.matching_id.clone(),
                     confirmation_code: item.confirmation_code.clone(),
                     imei: item.imei.clone(),
+                    phone_number: item.phone_number.clone(),
                     activation_code: item.activation_code.clone(),
                 };
                 let downloaded = self.download(com, &req).await?;

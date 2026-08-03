@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::phone_number::normalize_msisdn;
+
 /// A normalized eSIM activation code from any source (text line, QR image, manual).
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivationCode {
@@ -37,6 +39,7 @@ pub fn parse_lpa_line(line: &str, source: &str, port_hint: Option<u32>) -> Vec<A
     }
     if !label_tokens.is_empty() {
         let label = label_tokens.join(" ");
+        let label = normalize_label(&label);
         for c in out.iter_mut() {
             if c.label.is_none() {
                 c.label = Some(label.clone());
@@ -44,6 +47,15 @@ pub fn parse_lpa_line(line: &str, source: &str, port_hint: Option<u32>) -> Vec<A
         }
     }
     out
+}
+
+fn normalize_label(label: &str) -> String {
+    let cleaned = normalize_msisdn(label);
+    if !cleaned.is_empty() {
+        cleaned
+    } else {
+        label.trim().to_string()
+    }
 }
 
 /// Parse one whitespace-delimited token into an `ActivationCode`, if it is an LPA string.
@@ -183,7 +195,7 @@ mod tests {
         );
         assert_eq!(codes.len(), 1);
         assert_eq!(codes[0].matching_id, "ABC123");
-        assert_eq!(codes[0].label.as_deref(), Some("0493913181"));
+        assert_eq!(codes[0].label.as_deref(), Some("493913181"));
     }
 
     #[test]

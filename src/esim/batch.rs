@@ -27,6 +27,8 @@ pub struct BatchReqItem {
     #[serde(default)]
     pub activation_code: Option<String>,
     #[serde(default)]
+    pub phone_number: Option<String>,
+    #[serde(default)]
     pub smdp: Option<String>,
     #[serde(default)]
     pub matching_id: Option<String>,

@@ -33,6 +33,7 @@
   let sources = $state([]); // ActivationCode[]
   let pairing = $state({}); // com_port -> index into `sources`
   let pasteText = $state('');
+  let batchPhoneNumber = $state('');
   let batchOptions = $state({ auto_enable: true, replace_existing: true, stop_on_error: false });
   let job = $state(null); // JobSnapshot
   let batchBusy = $state(false);
@@ -355,6 +356,11 @@
     try {
       const body = {};
       for (const [k, v] of Object.entries(dl)) if (v) body[k] = v;
+      if (!body.phone_number && body.activation_code) {
+        const matched = sources.find((c) => c.raw_lpa === body.activation_code);
+        const phone = normalizePhoneLabel(matched?.label ?? null);
+        if (phone) body.phone_number = phone;
+      }
       await apiClient.esimDownload(com, body);
       await refreshSession(com);
       setPortStatus(com, 'ok', 'download');
@@ -484,6 +490,12 @@
     return `${c.smdp} / ${c.matching_id}${c.label ? ' (' + c.label + ')' : ''}`;
   }
 
+  function normalizePhoneLabel(label) {
+    if (!label) return null;
+    const digits = String(label).replace(/\D/g, '').replace(/^0+/, '');
+    return digits || null;
+  }
+
   // ── Batch dialog + run ───────────────────────────────────────────────────
   async function openBatch(op) {
     if (sessionPort) {
@@ -501,13 +513,18 @@
   function closeBatch() {
     batchMode = null;
     pasteText = '';
+    batchPhoneNumber = '';
   }
 
   async function startDownload() {
     const items = selectedList.map((com) => {
       const idx = pairing[com];
       const code = idx != null && sources[idx] ? sources[idx] : null;
-      return { com_port: com, activation_code: code?.raw_lpa ?? null };
+      return {
+        com_port: com,
+        activation_code: code?.raw_lpa ?? null,
+        phone_number: normalizePhoneLabel(code?.label ?? batchPhoneNumber),
+      };
     });
     await runBatch('download', items);
   }
@@ -805,6 +822,13 @@
             <input type="file" class="hidden" multiple accept="image/*,.txt,.csv" onchange={uploadSources} />
           </label>
           <span class="text-xs text-slate-500">{$t('esim_src_count', { n: sources.length })}</span>
+        </div>
+        <div class="mb-2">
+          <input
+            class="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+            placeholder="Optional fallback phone number (used when source label is missing)"
+            bind:value={batchPhoneNumber}
+          />
         </div>
         <div class="flex gap-2">
           <textarea class="h-16 flex-1 rounded border border-slate-300 px-2 py-1 text-xs font-mono" placeholder={$t('esim_src_paste_placeholder')} bind:value={pasteText}></textarea>

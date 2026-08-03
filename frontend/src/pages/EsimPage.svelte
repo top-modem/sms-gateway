@@ -22,6 +22,11 @@
 
   const sessionPort = $derived(ports.find((p) => p.session_active)?.com_port ?? null);
 
+  /** FetchApi rejects with {status, data} (not an Error), so pull the message out of the response body. */
+  function describeError(e) {
+    return e?.data?.error ?? e?.message ?? (e?.status ? `HTTP ${e.status}` : String(e));
+  }
+
   async function loadPorts() {
     loading = true;
     error = '';
@@ -29,7 +34,7 @@
       const res = await apiClient.esimListPorts();
       ports = res?.data ?? [];
     } catch (e) {
-      error = e?.message ?? 'load failed';
+      error = describeError(e);
     } finally {
       loading = false;
     }
@@ -41,7 +46,7 @@
   }
 
   function fail(e) {
-    error = $t('esim_op_failed', { msg: e?.message ?? String(e) });
+    error = $t('esim_op_failed', { msg: describeError(e) });
     setTimeout(() => (error = ''), 6000);
   }
 

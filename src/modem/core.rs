@@ -31,6 +31,7 @@ const TERMINATORS: &[&[u8]] = &[
     b"\r\n> ",
     b"\r\n+CME ERROR",
     b"\r\n+CMS ERROR",
+    b"\r\nESIM\r\n",
     // AT+QFUPL "ready to receive binary data" prompt (used for MMS attachment upload).
     b"CONNECT\r\n",
 ];

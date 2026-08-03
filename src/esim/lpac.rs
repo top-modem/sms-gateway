@@ -33,10 +33,29 @@ impl Lpac {
 
     /// Run an lpac subcommand and return its `payload.data` on success.
     async fn run(&self, args: &[&str]) -> Result<Value, EsimError> {
+        let primary = self.run_with_http_backend(args, &self.http_backend).await;
+        if !Self::is_http_driver_missing(&primary) {
+            return primary;
+        }
+
+        // Some lpac builds only include one HTTP backend. Retry with the common fallback.
+        let fallback = if self.http_backend.eq_ignore_ascii_case("winhttp") {
+            "curl"
+        } else {
+            "winhttp"
+        };
+        self.run_with_http_backend(args, fallback).await
+    }
+
+    async fn run_with_http_backend(
+        &self,
+        args: &[&str],
+        http_backend: &str,
+    ) -> Result<Value, EsimError> {
         let mut cmd = Command::new(&self.exe);
         cmd.args(args);
         cmd.env("LPAC_APDU", &self.apdu_backend);
-        cmd.env("LPAC_HTTP", &self.http_backend);
+        cmd.env("LPAC_HTTP", http_backend);
         if let Some(name) = &self.reader_name {
             if !name.is_empty() {
                 cmd.env("LPAC_APDU_PCSC_DRV_NAME", name);
@@ -81,6 +100,16 @@ impl Lpac {
             return Err(EsimError::Lpac { code, message });
         }
         Ok(payload.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    fn is_http_driver_missing(result: &Result<Value, EsimError>) -> bool {
+        let msg = match result {
+            Err(EsimError::Lpac { message, .. }) => message.to_ascii_lowercase(),
+            _ => return false,
+        };
+        msg.contains("no http driver found")
+            || msg.contains("unknown http driver")
+            || msg.contains("http driver")
     }
 
     /// `lpac chip info` — EID and default SM-DP+/SM-DS.

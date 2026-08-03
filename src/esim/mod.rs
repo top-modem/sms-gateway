@@ -176,8 +176,19 @@ impl EsimService {
             }
         }
 
-        // Perform the serial mode switch. On failure, release the gate.
-        if let Err(e) = modem.esim_enter().await {
+        // Perform the serial mode switch. If ath7 times out, reset and retry once.
+        let mut enter_result = modem.esim_enter().await;
+        if let Err(e) = &enter_result {
+            let msg = e.to_string().to_ascii_lowercase();
+            if msg.contains("ath7") && msg.contains("timed out") {
+                let _ = modem.esim_reset().await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                enter_result = modem.esim_enter().await;
+            }
+        }
+
+        // On failure, release the gate.
+        if let Err(e) = enter_result {
             *self.active.lock().await = None;
             let _ = self.audit(com_port, "enter", None, Some(&e.to_string())).await;
             return Err(EsimError::At(e.to_string()));
@@ -673,11 +684,35 @@ impl EsimService {
         replace: bool,
     ) -> Result<Option<String>, EsimError> {
         self.enter(&item.com_port).await?;
-        let result = self
+        let mut result = self
             .batch_item_inner(op, item, auto_enable, replace)
             .await;
+        if Self::is_transient_lpac_readiness_error(&result) {
+            // Some readers appear a little late after mode switch; retry once before exiting.
+            let retry_wait_ms = self.reader_settle_ms.saturating_mul(2).max(5000);
+            tokio::time::sleep(Duration::from_millis(retry_wait_ms)).await;
+            result = self
+                .batch_item_inner(op, item, auto_enable, replace)
+                .await;
+        }
         let _ = self.exit(&item.com_port).await;
         result
+    }
+
+    fn is_transient_lpac_readiness_error(result: &Result<Option<String>, EsimError>) -> bool {
+        let msg = match result {
+            Err(EsimError::Spawn(m)) => m.to_ascii_lowercase(),
+            Err(EsimError::Lpac { message, .. }) => message.to_ascii_lowercase(),
+            _ => return false,
+        };
+        msg.contains("reader")
+            || msg.contains("smart card")
+            || msg.contains("pc/sc")
+            || msg.contains("pcsc")
+            || msg.contains("card not present")
+            || msg.contains("no card")
+            || msg.contains("euicc_init")
+            || msg.contains("timeout")
     }
 
     async fn batch_item_inner(

@@ -59,7 +59,7 @@ pub struct ModemManager {
     /// Semaphore shared by unavailable-port quick probes to limit concurrent
     /// serial port opens (especially important on large USB hubs).
     probe_semaphore: Arc<Semaphore>,
-    /// Background URC tasks keyed by SIM ID so they can be cancelled on demotion.
+    /// Background URC tasks keyed by COM port so duplicate ICCIDs stay independent.
     urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
@@ -73,9 +73,9 @@ pub struct ModemManager {
     max_concurrent_modem_init: usize,
     /// Default SMS storage location if not overridden per-device.
     default_sms_storage: Option<SmsStorage>,
-    /// Transient AT+CCID probe failures before a modem is considered truly unavailable.
+    /// Transient AT+CCID probe failures keyed by COM port.
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
-    /// Cooldown window after a demotion to avoid immediate re-demotion loops.
+    /// Cooldown window keyed by COM port to avoid immediate re-demotion loops.
     sim_probe_cooldown_until: RwLock<HashMap<String, Instant>>,
     /// True once the initial background modem initialization has completed.
     initialization_complete: RwLock<bool>,
@@ -198,7 +198,6 @@ impl ModemManager {
 
     async fn set_last_known_sim_port(&self, com_port: &str, sim_id: &str) {
         let mut last_known = self.last_known_sim_ids_by_port.write().await;
-        last_known.retain(|port, id| id != sim_id || port == com_port);
         last_known.insert(com_port.to_string(), sim_id.to_string());
     }
 
@@ -383,42 +382,14 @@ impl ModemManager {
                         com_port, sim_id
                     );
 
-                    // The modems map is keyed by physical COM port. If this same
-                    // SIM currently maps to a different port (it was physically
-                    // moved), release that stale port so its identity does not
-                    // linger; the recheck supervisor will re-probe and re-init it.
-                    let stale_ports: Vec<String> = {
-                        let modems = self.modems.read().await;
-                        let mut v = Vec::new();
-                        for (p, m) in modems.iter() {
-                            if p != &com_port
-                                && m.sim_id.read().await.as_deref() == Some(sim_id.as_str())
-                            {
-                                v.push(p.clone());
-                            }
-                        }
-                        v
-                    };
-                    for stale_port in stale_ports {
-                        info!(
-                            "SIM {} moved to {}; releasing stale port {}.",
-                            sim_id, com_port, stale_port
-                        );
-                        self.modems.write().await.remove(&stale_port);
-                        self.mark_port_unavailable(&stale_port, Some(&sim_id)).await;
-                        let stale_baud = self
-                            .devices
-                            .iter()
-                            .find(|d| d.com_port == stale_port)
-                            .map(|d| d.baud_rate)
-                            .unwrap_or(baud_rate);
-                        let mut ports = self.unavailable_ports.write().await;
-                        if !ports.iter().any(|(pp, _)| pp == &stale_port) {
-                            ports.push((stale_port, stale_baud));
-                        }
-                    }
+                    // Keep each COM port independent even when multiple ports
+                    // report the same ICCID in this deployment.
                     // Key the modem by its physical COM port, not by SIM id.
-                    self.modems.write().await.insert(com_port.clone(), modem_arc);
+                    self
+                        .modems
+                        .write()
+                        .await
+                        .insert(com_port.clone(), modem_arc.clone());
 
                     if is_new {
                         self.init_new_sim_sms_data(vec![sim_id.clone()]).await;
@@ -449,17 +420,20 @@ impl ModemManager {
                         }
                     }
 
-                    // Start the URC handler for the reconnected modem.
-                    if let Some(modem) = self.get_modem(&sim_id).await {
-                        let handle = tokio::spawn(Self::run_urc_handler(
-                            sim_id.clone(),
-                            modem,
-                            sse_manager.clone(),
-                            transcribe_cfg.clone(),
-                        ));
-                        if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
-                            old.abort();
-                        }
+                    // Start/replace the URC handler for this specific COM port.
+                    let handle = tokio::spawn(Self::run_urc_handler(
+                        sim_id.clone(),
+                        modem_arc.clone(),
+                        sse_manager.clone(),
+                        transcribe_cfg.clone(),
+                    ));
+                    if let Some(old) = self
+                        .urc_tasks
+                        .write()
+                        .await
+                        .insert(com_port.clone(), handle)
+                    {
+                        old.abort();
                     }
 
                     // Remove the port from the unavailable list and stop this worker.
@@ -1052,7 +1026,6 @@ impl ModemManager {
             let mut last_known = self.last_known_sim_ids_by_port.write().await;
             last_known.clear();
             for (sim_id, modem) in sim_modems.iter() {
-                last_known.retain(|port, id| id != sim_id || port == &modem.com_port);
                 last_known.insert(modem.com_port.clone(), sim_id.clone());
             }
         }
@@ -1498,8 +1471,9 @@ impl ModemManager {
         while let Some(result) = demotion_futs.next().await {
             match result {
                 ProbeOutcome::Healthy { iccid, modem } => {
-                    self.sim_probe_fail_counts.write().await.remove(&iccid);
-                    self.sim_probe_cooldown_until.write().await.remove(&iccid);
+                    let port_key = modem.com_port.clone();
+                    self.sim_probe_fail_counts.write().await.remove(&port_key);
+                    self.sim_probe_cooldown_until.write().await.remove(&port_key);
 
                     // Ensure the sim_cards DB row exists and has the current IMSI.
                     // A transient demotion may have deleted the row while the modem
@@ -1552,7 +1526,7 @@ impl ModemManager {
                     }
                 }
                 ProbeOutcome::Swap { iccid, com_port, modem } => {
-                    self.sim_probe_fail_counts.write().await.remove(&iccid);
+                    self.sim_probe_fail_counts.write().await.remove(&com_port);
                     demotions.push((iccid, com_port, modem));
                 }
                 ProbeOutcome::ConfirmedAbsent { iccid, com_port, modem } => {
@@ -1560,7 +1534,7 @@ impl ModemManager {
                         .sim_probe_cooldown_until
                         .read()
                         .await
-                        .get(&iccid)
+                        .get(&com_port)
                         .copied()
                         .map(|until| until > Instant::now())
                         .unwrap_or(false);
@@ -1574,7 +1548,7 @@ impl ModemManager {
 
                     let failures = {
                         let mut fail_counts = self.sim_probe_fail_counts.write().await;
-                        let count = fail_counts.entry(iccid.clone()).or_insert(0);
+                        let count = fail_counts.entry(com_port.clone()).or_insert(0);
                         *count = count.saturating_add(1);
                         *count
                     };
@@ -1584,13 +1558,13 @@ impl ModemManager {
                             "SIM probe failed {} times on {} (was {}). Marking port as unavailable.",
                             failures, com_port, iccid
                         );
-                        self.sim_probe_fail_counts.write().await.remove(&iccid);
+                        self.sim_probe_fail_counts.write().await.remove(&com_port);
                         self
                             .sim_probe_cooldown_until
                             .write()
                             .await
                             .insert(
-                                iccid.clone(),
+                                com_port.clone(),
                                 Instant::now() + Duration::from_secs(SIM_DEMOTION_COOLDOWN_SECS),
                             );
                         demotions.push((iccid, com_port, modem));
@@ -1648,7 +1622,7 @@ impl ModemManager {
             };
 
             if removed {
-                if let Some(task) = self.urc_tasks.write().await.remove(&iccid) {
+                if let Some(task) = self.urc_tasks.write().await.remove(&com_port) {
                     task.abort();
                 }
                 self.mark_port_unavailable(&com_port, Some(&iccid)).await;
@@ -2277,19 +2251,19 @@ impl ModemManager {
 
     // ─── URC handler tasks ────────────────────────────────────────────────────
 
-    /// Spawn one URC handler task per modem.  Must be called once after
+    /// Spawn one URC handler task per modem. Must be called once after
     /// initialization.  Each task owns the modem's `urc_rx` and processes
     /// RING / +CLIP: / NO CARRIER / VOICE CALL: END messages forever.
     pub async fn start_urc_handlers(&self,
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
-        let entries: Vec<(String, Arc<Modem>)> = {
+        let entries: Vec<(String, String, Arc<Modem>)> = {
             let modems = self.modems.read().await;
             let mut v = Vec::with_capacity(modems.len());
             for modem in modems.values() {
                 if let Some(sid) = modem.sim_id.read().await.clone() {
-                    v.push((sid, modem.clone()));
+                    v.push((modem.com_port.clone(), sid, modem.clone()));
                 }
             }
             v
@@ -2298,14 +2272,14 @@ impl ModemManager {
             log::info!("No active modems; skipping URC handler startup");
             return;
         }
-        for (sim_id, modem) in entries {
+        for (com_port, sim_id, modem) in entries {
             let sse = sse_manager.clone();
             let cfg = transcribe_cfg.clone();
             let sim_id_for_task = sim_id.clone();
             let handle = tokio::spawn(async move {
                 Self::run_urc_handler(sim_id_for_task, modem, sse, cfg).await;
             });
-            if let Some(old) = self.urc_tasks.write().await.insert(sim_id.clone(), handle) {
+            if let Some(old) = self.urc_tasks.write().await.insert(com_port, handle) {
                 old.abort();
             }
         }

@@ -478,38 +478,45 @@
   });
 </script>
 
-<div class="h-dvh w-screen overflow-y-auto bg-slate-50 p-4 md:p-6">
-  <div class="mx-auto max-w-5xl">
-    <div class="mb-4 flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <button class="rounded-lg p-2 hover:bg-slate-200" onclick={onBack} aria-label="back">
-          <Icon icon="mdi:arrow-left" width="22" />
-        </button>
-        <div>
-          <h1 class="text-xl font-semibold text-slate-800">{$t('esim_title')}</h1>
-          <p class="text-sm text-slate-500">{$t('esim_subtitle')}</p>
-        </div>
-      </div>
+<div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-zinc-950 text-sm font-sans">
+  <header class="flex items-center justify-between gap-3 px-4 py-3 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800 shadow-sm shrink-0">
+    <div class="flex items-center gap-3">
       <button
-        class="flex items-center gap-1 rounded-lg bg-slate-800 px-3 py-2 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
-        onclick={loadPorts}
-        disabled={loading || busy}
+        onclick={onBack}
+        class="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-full bg-blue-600 text-white shadow-sm shadow-blue-600/30 hover:bg-blue-700 transition"
+        aria-label="Back"
       >
-        <Icon icon="mdi:refresh" width="18" />
-        {$t('esim_refresh')}
+        <Icon icon="carbon:arrow-left" class="w-4 h-4" />
+        <span class="text-xs font-semibold">{$t('btn_back')}</span>
       </button>
+      <div class="flex items-center gap-2">
+        <Icon icon="carbon:sim-card" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+        <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('esim_title')}</h1>
+      </div>
     </div>
+    <button
+      class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-zinc-800 transition disabled:opacity-50"
+      onclick={loadPorts}
+      disabled={loading || busy}
+    >
+      <Icon icon="carbon:renew" class="w-4 h-4" />
+      {$t('esim_refresh')}
+    </button>
+  </header>
+
+  <div class="flex-1 overflow-auto p-4 sm:p-6">
+    <p class="mb-3 text-sm text-gray-500 dark:text-gray-400">{$t('esim_subtitle')}</p>
 
     <!-- Lock banner -->
-    <div class="mb-4 rounded-lg border px-4 py-2 text-sm {sessionPort ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-500'}">
+    <div class="mb-4 rounded-lg border px-4 py-2 text-sm {sessionPort ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-gray-500 dark:text-gray-400'}">
       {sessionPort ? $t('esim_lock_banner', { port: sessionPort }) : $t('esim_lock_free')}
     </div>
 
     {#if message}
-      <div class="mb-3 rounded-lg bg-green-50 px-4 py-2 text-sm text-green-700">{message}</div>
+      <div class="mb-3 rounded-lg bg-green-50 dark:bg-green-900/20 px-4 py-2 text-sm text-green-700 dark:text-green-300">{message}</div>
     {/if}
     {#if error}
-      <div class="mb-3 rounded-lg bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div>
+      <div class="mb-3 rounded-lg bg-red-50 dark:bg-red-900/20 px-4 py-2 text-sm text-red-700 dark:text-red-300">{error}</div>
     {/if}
 
     <!-- Filter + batch toolbar -->

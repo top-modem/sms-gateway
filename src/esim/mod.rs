@@ -146,7 +146,16 @@ impl EsimService {
                 sim_id,
             });
         }
-        out.sort_by(|a, b| a.com_port.cmp(&b.com_port));
+        out.sort_by(|a, b| {
+            fn com_num(s: &str) -> Option<u32> {
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u32>().ok()
+            }
+            match (com_num(&a.com_port), com_num(&b.com_port)) {
+                (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.com_port.cmp(&b.com_port)),
+                _ => a.com_port.cmp(&b.com_port),
+            }
+        });
         Ok(out)
     }
 

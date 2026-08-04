@@ -82,6 +82,21 @@ copy /y "%ROOT%\assets\icons\xiaoniu-zhika.ico" "%NEWDIR%\icon\xiaoniu-zhika.ico
   exit /b 1
 )
 
+rem sound/ (SMS notification wav) and lpac/ (eSIM LPA tool) are read at
+rem runtime via relative paths, so they must ship alongside the exe.
+if exist "%ROOT%\sound" (
+  xcopy /y /i /e /q "%ROOT%\sound" "%NEWDIR%\sound" >nul || (
+    echo Failed to copy sound folder.
+    exit /b 1
+  )
+)
+if exist "%ROOT%\lpac" (
+  xcopy /y /i /e /q "%ROOT%\lpac" "%NEWDIR%\lpac" >nul || (
+    echo Failed to copy lpac folder.
+    exit /b 1
+  )
+)
+
 for %%F in (
   config.toml
   config.toml.example

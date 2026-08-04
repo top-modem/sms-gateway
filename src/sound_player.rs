@@ -11,8 +11,11 @@ pub fn play_sms_upload_success_sound() {
         }
 
         let escaped = wav_path.to_string_lossy().replace('"', "\"\"");
+        // PlaySync (not Play) is required: Play() starts playback on a background
+        // thread and returns immediately, so the spawned powershell process would
+        // exit and kill that thread before the sound finished (or even started).
         let ps_script = format!(
-            "try {{ $p='{}'; $player = New-Object System.Media.SoundPlayer($p); $player.Play(); }} catch {{ }}",
+            "try {{ $p='{}'; $player = New-Object System.Media.SoundPlayer($p); $player.PlaySync(); }} catch {{ }}",
             escaped
         );
 

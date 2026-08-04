@@ -1624,6 +1624,40 @@ impl FirefoxMoneyStat {
         Ok(rows)
     }
 
+    /// Updates the price for an existing item, or inserts a new price row if none exists yet.
+    pub async fn update_money_item_price(item_id: &str, item_uprice: f64) -> Result<()> {
+        let pool = get_pool()?;
+        let updated = sqlx::query(
+            "UPDATE firefox_item_prices SET item_uprice = ?, updated_at = datetime('now') WHERE item_id = ?",
+        )
+        .bind(item_uprice)
+        .bind(item_id)
+        .execute(pool)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            let item_name: Option<String> =
+                sqlx::query_scalar("SELECT item_name FROM firefox_item_names WHERE item_id = ?")
+                    .bind(item_id)
+                    .fetch_optional(pool)
+                    .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO firefox_item_prices (item_id, country_id, item_name, item_uprice, updated_at)
+                VALUES (?, NULL, ?, ?, datetime('now'))
+                "#,
+            )
+            .bind(item_id)
+            .bind(item_name.unwrap_or_else(|| item_id.to_string()))
+            .bind(item_uprice)
+            .execute(pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn query_successful_uploaded_count_for_item(item_id: &str) -> Result<i64> {
         let pool = get_pool()?;
         let count: i64 = sqlx::query_scalar(

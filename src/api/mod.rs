@@ -286,6 +286,7 @@ pub async fn run_api(
         )
         .route("/firefox/money-items", get(firefox_money_items))
         .route("/firefox/money-item-earning", get(firefox_money_item_earning))
+        .route("/firefox/money-item-price", post(firefox_update_money_item_price))
         .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
         // ── Firefox upload retry queue routes ────────────────────────────
         .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
@@ -1501,11 +1502,20 @@ async fn calls_sse_events(State(sse_manager): State<Arc<SseManager>>) -> Sse<imp
 async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
+    // Vite fingerprints filenames under assets/, so those can be cached forever.
+    // index.html (and the SPA fallback) must always be revalidated, otherwise
+    // browsers can keep serving a stale build after a server restart.
     match Asset::get(path) {
         Some(content) => {
             let mime = from_path(path).first_or_octet_stream();
+            let cache_control = if path.starts_with("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache, must-revalidate"
+            };
             Response::builder()
                 .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, cache_control)
                 .body(content.data.into())
                 .unwrap()
         }
@@ -1513,6 +1523,7 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
             if let Some(index) = Asset::get("index.html") {
                 Response::builder()
                     .header(header::CONTENT_TYPE, "text/html")
+                    .header(header::CACHE_CONTROL, "no-cache, must-revalidate")
                     .body(index.data.into())
                     .unwrap()
             } else {
@@ -2639,6 +2650,12 @@ struct MoneyItemEarningQuery {
     item_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MoneyItemPriceUpdate {
+    item_id: String,
+    item_uprice: f64,
+}
+
 fn normalize_phone_for_match(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_digit())
@@ -2851,6 +2868,37 @@ async fn firefox_money_item_earning(Query(query): Query<MoneyItemEarningQuery>) 
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to query selected item earning stats: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn firefox_update_money_item_price(Json(payload): Json<MoneyItemPriceUpdate>) -> Response {
+    let item_id = payload.item_id.trim();
+    if item_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_id is required"})),
+        )
+            .into_response();
+    }
+    if !payload.item_uprice.is_finite() || payload.item_uprice < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_uprice must be a non-negative number"})),
+        )
+            .into_response();
+    }
+
+    match crate::db::FirefoxMoneyStat::update_money_item_price(item_id, payload.item_uprice).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({"item_id": item_id, "item_uprice": payload.item_uprice})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to save item price: {}", e)})),
         )
             .into_response(),
     }

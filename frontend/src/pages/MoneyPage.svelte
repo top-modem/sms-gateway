@@ -8,14 +8,22 @@
 
   let rows = $state([]);
   let loading = $state(true);
+  let refreshing = $state(false);
   let error = $state('');
   let itemOptions = $state([]);
-  let itemKeyword = $state('');
+  let itemSearchKeyword = $state('');
+  let isItemDropdownOpen = $state(false);
+  let itemBoxEl; // plain DOM ref for click-outside detection, not reactive state
+  let itemOptionsRequestId = 0;
   let selectedItemId = $state('');
   let selectedItemName = $state('');
   let unitPriceInput = $state('');
   let selectedSuccessCount = $state(0);
   let selectedEarningLoading = $state(false);
+  let priceSaving = $state(false);
+  let priceSaveError = $state('');
+  let priceSaved = $state(false);
+  let priceSavedTimer;
 
   let pollTimer;
 
@@ -48,11 +56,24 @@
     }
   }
 
+  async function handleRefresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      await fetchData();
+    } finally {
+      refreshing = false;
+    }
+  }
+
   async function fetchItemOptions(keyword = '') {
+    const requestId = ++itemOptionsRequestId;
     try {
       const data = await apiClient.getFirefoxMoneyItems(keyword, 300);
+      if (requestId !== itemOptionsRequestId) return; // a newer request superseded this one
       itemOptions = Array.isArray(data) ? data : (data?.data ?? []);
     } catch (e) {
+      if (requestId !== itemOptionsRequestId) return;
       console.warn('Failed to load money item options:', e);
       itemOptions = [];
     }
@@ -78,31 +99,103 @@
     }
   }
 
-  function onChooseItem(event) {
-    const itemId = event.currentTarget?.value || '';
-    selectedItemId = itemId;
-    const item = itemOptions.find((opt) => opt.item_id === itemId);
-    selectedItemName = item?.item_name || '';
-    if (!unitPriceInput && item?.item_uprice != null) {
-      unitPriceInput = String(item.item_uprice);
+  function selectItem(opt) {
+    selectedItemId = opt.item_id;
+    selectedItemName = opt.item_name || '';
+    if (opt.item_uprice != null) {
+      unitPriceInput = String(opt.item_uprice);
     }
     fetchSelectedItemEarning();
   }
 
-  function onItemKeywordInput(event) {
-    itemKeyword = event.currentTarget?.value || '';
-    fetchItemOptions(itemKeyword);
+  function onChooseItem(opt) {
+    selectItem(opt);
+    isItemDropdownOpen = false;
+  }
+
+  function toggleItemDropdown() {
+    if (isItemDropdownOpen) {
+      isItemDropdownOpen = false;
+      return;
+    }
+    isItemDropdownOpen = true;
+    itemSearchKeyword = '';
+    fetchItemOptions('');
+  }
+
+  function onItemSearchInput(event) {
+    itemSearchKeyword = event.currentTarget?.value || '';
+    fetchItemOptions(itemSearchKeyword);
+  }
+
+  function onDocumentClick(event) {
+    if (isItemDropdownOpen && itemBoxEl && !itemBoxEl.contains(event.target)) {
+      isItemDropdownOpen = false;
+    }
+  }
+
+  function onUnitPriceInput(event) {
+    const raw = event.currentTarget?.value || '';
+    const cleaned = raw.replace(/[^\d.]/g, '');
+    const firstDotIndex = cleaned.indexOf('.');
+    unitPriceInput = firstDotIndex === -1
+      ? cleaned
+      : cleaned.slice(0, firstDotIndex + 1) + cleaned.slice(firstDotIndex + 1).replace(/\./g, '');
+    if (raw !== unitPriceInput) {
+      event.currentTarget.value = unitPriceInput;
+    }
+  }
+
+  async function saveUnitPrice() {
+    if (!selectedItemId) return;
+    const price = parseUnitPrice(unitPriceInput);
+    if (price == null) return;
+
+    priceSaving = true;
+    priceSaveError = '';
+    try {
+      await apiClient.updateFirefoxMoneyItemPrice(selectedItemId, price);
+      await Promise.all([fetchData(), fetchSelectedItemEarning()]);
+      priceSaved = true;
+      clearTimeout(priceSavedTimer);
+      priceSavedTimer = setTimeout(() => {
+        priceSaved = false;
+      }, 2000);
+    } catch (e) {
+      priceSaveError = e?.message ?? $t('err_save_item_price');
+    } finally {
+      priceSaving = false;
+    }
+  }
+
+  function onUnitPriceKeydown(event) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveUnitPrice();
+    }
+  }
+
+  function focusOnMount(node) {
+    node.focus();
   }
 
   onMount(async () => {
-    await Promise.all([fetchData(), fetchItemOptions('')]);
+    const [, defaultOptions] = await Promise.all([fetchData(), apiClient.getFirefoxMoneyItems('', 300)]);
+    const list = Array.isArray(defaultOptions) ? defaultOptions : (defaultOptions?.data ?? []);
+    if (list.length > 0) {
+      selectItem(list[0]);
+    }
     pollTimer = setInterval(fetchData, 5000);
   });
 
   onDestroy(() => {
     if (pollTimer) clearInterval(pollTimer);
+    clearTimeout(priceSavedTimer);
   });
 </script>
+
+<svelte:window onclick={onDocumentClick} />
+
 
 <div class="flex h-dvh w-screen flex-col bg-[#f2f2f2] text-gray-900 dark:bg-zinc-900 dark:text-gray-100">
   <header class="flex items-center justify-between border-b border-gray-200 bg-white px-3 py-2 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
@@ -118,10 +211,11 @@
     </div>
 
     <button
-      onclick={fetchData}
-      class="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700 transition"
+      onclick={handleRefresh}
+      disabled={refreshing}
+      class="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700 transition disabled:opacity-60"
     >
-      <Icon icon="carbon:renew" class="h-3.5 w-3.5" />
+      <Icon icon="carbon:renew" class="h-3.5 w-3.5 {refreshing ? 'animate-spin' : ''}" />
       {$t('btn_refresh')}
     </button>
   </header>
@@ -138,51 +232,93 @@
       </div>
     {:else}
       <section class="border-b border-gray-300 bg-white px-3 py-3 dark:border-zinc-700 dark:bg-zinc-800">
-        <div class="max-w-xl overflow-hidden rounded border border-gray-300 dark:border-zinc-600">
-          <div class="grid grid-cols-[88px,1fr] border-b border-gray-300 dark:border-zinc-600">
-            <label for="money-item-select" class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
+        <div class="max-w-3xl rounded border border-gray-300 dark:border-zinc-600">
+          <div class="flex flex-wrap items-stretch">
+            <label for="money-item-input" class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
               {$t('money_item_label')}
             </label>
-            <div class="p-2">
-              <input
-                type="text"
-                class="mb-2 w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
-                placeholder={$t('money_item_search_placeholder')}
-                value={itemKeyword}
-                oninput={onItemKeywordInput}
-              />
-              <select
-                id="money-item-select"
-                class="w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
-                value={selectedItemId}
-                onchange={onChooseItem}
+            <div class="relative min-w-[220px] flex-1 p-2" bind:this={itemBoxEl}>
+              <button
+                id="money-item-toggle"
+                type="button"
+                onclick={toggleItemDropdown}
+                class="flex w-full items-center justify-between rounded border border-gray-300 px-2 py-1.5 text-left text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
               >
-                <option value="">{$t('money_item_select_placeholder')}</option>
-                {#each itemOptions as opt}
-                  <option value={opt.item_id}>
-                    {opt.item_id} | {opt.item_name}
-                  </option>
-                {/each}
-              </select>
+                <span class="truncate">
+                  {selectedItemId ? `${selectedItemId} | ${selectedItemName}` : $t('money_item_no_selection')}
+                </span>
+                <Icon
+                  icon="carbon:chevron-down"
+                  class="h-4 w-4 shrink-0 text-gray-500 transition-transform dark:text-gray-400 {isItemDropdownOpen ? 'rotate-180' : ''}"
+                />
+              </button>
+              {#if isItemDropdownOpen}
+                <div class="absolute left-2 right-2 top-full z-20 mt-1 rounded border border-gray-300 bg-white shadow-lg dark:border-zinc-600 dark:bg-zinc-800">
+                  <div class="border-b border-gray-200 p-2 dark:border-zinc-700">
+                    <input
+                      id="money-item-search"
+                      type="text"
+                      autocomplete="off"
+                      use:focusOnMount
+                      class="w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                      placeholder={$t('money_item_search_placeholder')}
+                      value={itemSearchKeyword}
+                      oninput={onItemSearchInput}
+                    />
+                  </div>
+                  <div class="max-h-56 overflow-y-auto">
+                    {#each itemOptions as opt (opt.item_id)}
+                      <button
+                        type="button"
+                        onclick={() => onChooseItem(opt)}
+                        class="block w-full px-3 py-1.5 text-left text-sm transition
+                               {selectedItemId === opt.item_id
+                                 ? 'bg-blue-600 text-white'
+                                 : 'text-gray-700 hover:bg-blue-50 dark:text-gray-200 dark:hover:bg-zinc-700'}"
+                      >
+                        {opt.item_id} | {opt.item_name}
+                      </button>
+                    {:else}
+                      <div class="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">
+                        {$t('money_item_select_placeholder')}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
             </div>
-          </div>
-          <div class="grid grid-cols-[88px,1fr]">
-            <label for="money-unit-price" class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
+            <label for="money-unit-price" class="flex items-center border-l border-gray-300 bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:border-zinc-600 dark:bg-zinc-700 dark:text-gray-200">
               {$t('money_unit_price_label')}
             </label>
-            <div class="p-2">
+            <div class="flex items-center gap-2 border-l border-gray-300 p-2 dark:border-zinc-600">
               <input
                 id="money-unit-price"
-                type="number"
-                min="0"
-                step="0.01"
-                class="w-full rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                type="text"
+                inputmode="decimal"
+                class="w-24 rounded border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
                 placeholder={$t('money_unit_price_placeholder')}
-                bind:value={unitPriceInput}
+                value={unitPriceInput}
+                oninput={onUnitPriceInput}
+                onkeydown={onUnitPriceKeydown}
               />
+              <button
+                type="button"
+                onclick={saveUnitPrice}
+                class="inline-flex items-center rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 transition"
+              >
+                {$t('btn_confirm')}
+              </button>
             </div>
           </div>
         </div>
+
+        {#if priceSaving}
+          <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">{$t('saving')}</div>
+        {:else if priceSaveError}
+          <div class="mt-1 text-xs text-red-600 dark:text-red-400">{priceSaveError}</div>
+        {:else if priceSaved}
+          <div class="mt-1 text-xs text-[#10a248] dark:text-green-300">{$t('money_price_saved')}</div>
+        {/if}
 
         {#if selectedItemId}
           <div class="mt-3 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-700 dark:bg-blue-900/25 dark:text-blue-200">

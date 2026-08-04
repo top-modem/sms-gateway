@@ -345,6 +345,20 @@ class ApiClient {
     }
 
     /**
+     * Persist the unit price for a money-page item and recount its earning.
+     * @param {string} itemId
+     * @param {number} itemUprice
+     */
+    async updateFirefoxMoneyItemPrice(itemId, itemUprice) {
+        return FetchApi.post(
+            '/api/firefox/money-item-price',
+            { item_id: itemId, item_uprice: itemUprice },
+            {},
+            'application/json'
+        );
+    }
+
+    /**
      * Get grouped platform rejection reasons from failed SMS attempts.
      */
     async getFirefoxPlatformRejectionReasons() {

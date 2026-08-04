@@ -20,6 +20,8 @@
   let unitPriceInput = $state('');
   let selectedSuccessCount = $state(0);
   let selectedEarningLoading = $state(false);
+  let platformPrices = $state([]);
+  let platformPriceIndex = $state(0);
   let priceSaving = $state(false);
   let priceSaveError = $state('');
   let priceSaved = $state(false);
@@ -99,13 +101,25 @@
     }
   }
 
+  async function fetchPlatformPrices(itemId) {
+    platformPrices = [];
+    platformPriceIndex = 0;
+    if (!itemId) return;
+    try {
+      const data = await apiClient.getFirefoxMoneyItemPlatformPrices(itemId);
+      platformPrices = Array.isArray(data) ? data : (data?.data ?? []);
+    } catch (e) {
+      console.warn('Failed to load platform reference prices:', e);
+      platformPrices = [];
+    }
+  }
+
   function selectItem(opt) {
     selectedItemId = opt.item_id;
     selectedItemName = opt.item_name || '';
-    if (opt.item_uprice != null) {
-      unitPriceInput = String(opt.item_uprice);
-    }
+    unitPriceInput = String(opt.seller_item_price ?? 0);
     fetchSelectedItemEarning();
+    fetchPlatformPrices(opt.item_id);
   }
 
   function onChooseItem(opt) {
@@ -309,6 +323,28 @@
                 {$t('btn_confirm')}
               </button>
             </div>
+            {#if selectedItemId}
+              <span class="flex items-center border-l border-gray-300 bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:border-zinc-600 dark:bg-zinc-700 dark:text-gray-200">
+                {$t('money_platform_price_label')}
+              </span>
+              <div class="flex items-center gap-2 border-l border-gray-300 p-2 text-xs dark:border-zinc-600">
+                {#if platformPrices.length === 0}
+                  <span class="text-gray-400 dark:text-gray-500">{$t('money_platform_price_none')}</span>
+                {:else}
+                  <select
+                    class="rounded border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                    bind:value={platformPriceIndex}
+                  >
+                    {#each platformPrices as p, i (p.country_id ?? p.country_title)}
+                      <option value={i}>{p.country_title || p.country_id || '-'}</option>
+                    {/each}
+                  </select>
+                  <span class="font-semibold text-gray-700 dark:text-gray-200">
+                    {formatMoney(platformPrices[platformPriceIndex]?.item_uprice)}
+                  </span>
+                {/if}
+              </div>
+            {/if}
           </div>
         </div>
 

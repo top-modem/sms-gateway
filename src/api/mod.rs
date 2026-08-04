@@ -286,6 +286,7 @@ pub async fn run_api(
         )
         .route("/firefox/money-items", get(firefox_money_items))
         .route("/firefox/money-item-earning", get(firefox_money_item_earning))
+        .route("/firefox/money-item-platform-prices", get(firefox_money_item_platform_prices))
         .route("/firefox/money-item-price", post(firefox_update_money_item_price))
         .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
         // ── Firefox upload retry queue routes ────────────────────────────
@@ -2868,6 +2869,26 @@ async fn firefox_money_item_earning(Query(query): Query<MoneyItemEarningQuery>) 
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to query selected item earning stats: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn firefox_money_item_platform_prices(Query(query): Query<MoneyItemEarningQuery>) -> Response {
+    let item_id = query.item_id.trim();
+    if item_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_id is required"})),
+        )
+            .into_response();
+    }
+
+    match crate::db::FirefoxMoneyStat::query_platform_item_prices(item_id).await {
+        Ok(prices) => (StatusCode::OK, Json(json!(prices))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query platform item prices: {}", e)})),
         )
             .into_response(),
     }

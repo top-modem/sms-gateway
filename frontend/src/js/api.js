@@ -345,6 +345,14 @@ class ApiClient {
     }
 
     /**
+     * Get the platform (大厅) reference price breakdown by country for an item.
+     * @param {string} itemId
+     */
+    async getFirefoxMoneyItemPlatformPrices(itemId) {
+        return FetchApi.get('/api/firefox/money-item-platform-prices', { item_id: itemId });
+    }
+
+    /**
      * Persist the unit price for a money-page item and recount its earning.
      * @param {string} itemId
      * @param {number} itemUprice

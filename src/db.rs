@@ -1523,8 +1523,15 @@ pub struct FirefoxMoneyStat {
 pub struct MoneyItemOption {
     pub item_id: String,
     pub item_name: String,
+    pub seller_item_price: f64,
+}
+
+/// One platform ("大厅") price row for an item, scoped to a country.
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct PlatformItemPrice {
     pub country_id: Option<String>,
-    pub item_uprice: Option<f64>,
+    pub country_title: Option<String>,
+    pub item_uprice: f64,
 }
 
 impl FirefoxMoneyStat {
@@ -1542,7 +1549,7 @@ impl FirefoxMoneyStat {
                     SUM(
                         CASE
                             WHEN s.send = 0 AND s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1
-                                THEN COALESCE(fp.item_uprice, 0.0)
+                                THEN COALESCE(fin.seller_item_price, 0.0)
                             ELSE 0.0
                         END
                     ),
@@ -1557,12 +1564,6 @@ impl FirefoxMoneyStat {
             FROM sms s
             LEFT JOIN sim_cards sc
                 ON sc.id = s.sim_id
-            LEFT JOIN (
-                SELECT item_id, MAX(item_uprice) AS item_uprice
-                FROM firefox_item_prices
-                GROUP BY item_id
-            ) fp
-                ON fp.item_id = s.platform_item_id
             LEFT JOIN firefox_item_names fin
                 ON fin.item_id = s.platform_item_id
             GROUP BY s.sim_id
@@ -1590,23 +1591,18 @@ impl FirefoxMoneyStat {
                 UNION
                 SELECT DISTINCT item_id FROM firefox_item_prices
                 UNION
+                SELECT DISTINCT item_id FROM firefox_item_names
+                UNION
                 SELECT DISTINCT platform_item_id AS item_id
                 FROM sms
                 WHERE platform_item_id IS NOT NULL AND TRIM(platform_item_id) <> ''
-            ),
-            price_agg AS (
-                SELECT item_id, MAX(country_id) AS country_id, MAX(item_uprice) AS item_uprice
-                FROM firefox_item_prices
-                GROUP BY item_id
             )
             SELECT
                 i.item_id AS item_id,
                 COALESCE(fin.item_name, i.item_id) AS item_name,
-                p.country_id AS country_id,
-                p.item_uprice AS item_uprice
+                COALESCE(fin.seller_item_price, 0.0) AS seller_item_price
             FROM ids i
             LEFT JOIN firefox_item_names fin ON fin.item_id = i.item_id
-            LEFT JOIN price_agg p ON p.item_id = i.item_id
             WHERE (
                 ?1 IS NULL
                 OR i.item_id LIKE ?1
@@ -1624,33 +1620,37 @@ impl FirefoxMoneyStat {
         Ok(rows)
     }
 
-    /// Updates the price for an existing item, or inserts a new price row if none exists yet.
-    pub async fn update_money_item_price(item_id: &str, item_uprice: f64) -> Result<()> {
+    /// Returns the platform ("大厅") reference price for an item, broken down by country.
+    pub async fn query_platform_item_prices(item_id: &str) -> Result<Vec<PlatformItemPrice>> {
+        let pool = get_pool()?;
+        let rows = sqlx::query_as::<_, PlatformItemPrice>(
+            "SELECT country_id, country_title, item_uprice FROM firefox_item_prices WHERE item_id = ? ORDER BY country_id",
+        )
+        .bind(item_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Updates the seller's own price for an existing item, or inserts a new item row if none exists yet.
+    pub async fn update_money_item_price(item_id: &str, seller_item_price: f64) -> Result<()> {
         let pool = get_pool()?;
         let updated = sqlx::query(
-            "UPDATE firefox_item_prices SET item_uprice = ?, updated_at = datetime('now') WHERE item_id = ?",
+            "UPDATE firefox_item_names SET seller_item_price = ? WHERE item_id = ?",
         )
-        .bind(item_uprice)
+        .bind(seller_item_price)
         .bind(item_id)
         .execute(pool)
         .await?;
 
         if updated.rows_affected() == 0 {
-            let item_name: Option<String> =
-                sqlx::query_scalar("SELECT item_name FROM firefox_item_names WHERE item_id = ?")
-                    .bind(item_id)
-                    .fetch_optional(pool)
-                    .await?;
-
             sqlx::query(
-                r#"
-                INSERT INTO firefox_item_prices (item_id, country_id, item_name, item_uprice, updated_at)
-                VALUES (?, NULL, ?, ?, datetime('now'))
-                "#,
+                "INSERT INTO firefox_item_names (item_id, item_name, seller_item_price) VALUES (?, ?, ?)",
             )
             .bind(item_id)
-            .bind(item_name.unwrap_or_else(|| item_id.to_string()))
-            .bind(item_uprice)
+            .bind(item_id)
+            .bind(seller_item_price)
             .execute(pool)
             .await?;
         }

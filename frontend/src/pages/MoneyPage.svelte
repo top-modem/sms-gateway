@@ -246,6 +246,7 @@
       </div>
     {:else}
       <section class="border-b border-gray-300 bg-white px-3 py-3 dark:border-zinc-700 dark:bg-zinc-800">
+        <div class="flex flex-wrap items-start gap-4">
         <div class="max-w-3xl rounded border border-gray-300 dark:border-zinc-600">
           <div class="flex flex-wrap items-stretch">
             <label for="money-item-input" class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
@@ -323,8 +324,13 @@
                 {$t('btn_confirm')}
               </button>
             </div>
-            {#if selectedItemId}
-              <span class="flex items-center border-l border-gray-300 bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:border-zinc-600 dark:bg-zinc-700 dark:text-gray-200">
+          </div>
+        </div>
+
+        {#if selectedItemId}
+          <div class="rounded border border-gray-300 dark:border-zinc-600">
+            <div class="flex items-stretch">
+              <span class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
                 {$t('money_platform_price_label')}
               </span>
               <div class="flex items-center gap-2 border-l border-gray-300 p-2 text-xs dark:border-zinc-600">
@@ -344,8 +350,9 @@
                   </span>
                 {/if}
               </div>
-            {/if}
+            </div>
           </div>
+        {/if}
         </div>
 
         {#if priceSaving}

@@ -858,8 +858,9 @@ impl EsimService {
             return Ok(());
         };
 
-        match crate::db::SimCard::find_by_id(iccid).await {
-            Ok(Some(mut card)) => {
+        match crate::db::SimCard::find_by_conditions(Some(iccid), None, None, None).await {
+            Ok(mut cards) if !cards.is_empty() => {
+                let mut card = cards.remove(0);
                 if card.phone_number.as_deref() != Some(phone_number.as_str()) {
                     card.update_phone_number(Some(phone_number.clone()))
                         .await
@@ -872,7 +873,7 @@ impl EsimService {
                     );
                 }
             }
-            Ok(None) => {
+            Ok(_) => {
                 log::warn!(
                     "[eSIM] download on {} resolved ICCID {} but no sim_cards row was found for phone number persistence",
                     com_port,

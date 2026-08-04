@@ -1,6 +1,7 @@
 ﻿use chrono::{Timelike, Utc};
 use log::{debug, error, info, warn};
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -117,6 +118,15 @@ pub struct Modem {
     pub esim_capable: RwLock<Option<bool>>,
     /// True while this port is in eSIM-management mode (SMS/recheck suspended).
     pub esim_mode: RwLock<bool>,
+    /// Number of commands currently queued or in-flight in `command_processor`.
+    /// Used by `send_command_priority` to fail fast (instead of piling on more
+    /// queued commands) when a modem's single-lane queue is already backlogged --
+    /// e.g. by a slow/unresponsive modem or overlapping status-refresh requests.
+    /// Without this, a caller's outer `tokio::time::timeout` giving up does NOT
+    /// cancel the already-queued command; it still runs to completion (with its
+    /// own internal retries), so repeated polling can pile up an ever-growing
+    /// backlog that never drains.
+    pending_commands: Arc<AtomicUsize>,
 }
 
 impl Modem {
@@ -164,12 +174,14 @@ impl Modem {
         });
 
         // Spawn sequential command processor
+        let pending_commands = Arc::new(AtomicUsize::new(0));
         let command_task = tokio::spawn({
             let write_half = write_half.clone();
             let reader_state = reader_state.clone();
             let name_c = name.to_string();
+            let pending_commands = pending_commands.clone();
             async move {
-                Self::command_processor(command_rx, write_half, reader_state, name_c).await;
+                Self::command_processor(command_rx, write_half, reader_state, name_c, pending_commands).await;
             }
         });
 
@@ -198,6 +210,7 @@ impl Modem {
             pending_http_readfile: Arc::new(tokio::sync::Mutex::new(None)),
             esim_capable: RwLock::new(None),
             esim_mode: RwLock::new(false),
+            pending_commands,
         })
     }
 }
@@ -229,17 +242,22 @@ impl Modem {
     }
 
     /// Detect eSIM capability by sending `ath?`; the reply of an eSIM machine
-    /// contains "ESIM". The result is cached so the probe only runs once.
+    /// contains "ESIM". A positive result is cached permanently; a negative
+    /// result (including a timed-out/failed probe, e.g. port busy during
+    /// startup) is NOT cached so a later call can retry and pick up the
+    /// correct capability instead of getting stuck as "not capable" forever.
     pub async fn detect_esim_capability(&self) -> bool {
-        if let Some(v) = *self.esim_capable.read().await {
-            return v;
+        if let Some(true) = *self.esim_capable.read().await {
+            return true;
         }
         let capable =
             match tokio::time::timeout(Duration::from_secs(5), self.send_command("ath?\r\n")).await {
                 Ok(Ok(resp)) => resp.to_ascii_uppercase().contains("ESIM"),
                 _ => false,
             };
-        *self.esim_capable.write().await = Some(capable);
+        if capable {
+            *self.esim_capable.write().await = Some(true);
+        }
         capable
     }
 
@@ -666,6 +684,7 @@ impl Modem {
         write_half: Arc<Mutex<Option<WriteHalf<SerialStream>>>>,
         reader_state: Arc<Mutex<ReaderState>>,
         name: String,
+        pending_commands: Arc<AtomicUsize>,
     ) {
         while let Some(mut at_command) = command_rx.recv().await {
             loop {
@@ -680,6 +699,9 @@ impl Modem {
                 {
                     Ok(response) => {
                         let _ = at_command.response_tx.send(Ok(response));
+                        if at_command.counted {
+                            pending_commands.fetch_sub(1, Ordering::SeqCst);
+                        }
                         break;
                     }
                     Err(_e) if at_command.retries < MAX_RETRIES => {
@@ -688,6 +710,9 @@ impl Modem {
                     }
                     Err(e) => {
                         let _ = at_command.response_tx.send(Err(e));
+                        if at_command.counted {
+                            pending_commands.fetch_sub(1, Ordering::SeqCst);
+                        }
                         break;
                     }
                 }
@@ -838,7 +863,10 @@ impl Modem {
         }
     }
 
-    async fn init_sim_info(&self) -> anyhow::Result<()> {
+    /// Re-probe ICCID/IMSI/phone and refresh the cached `sim_id`. Exposed so callers
+    /// (e.g. the eSIM module) can force a refresh after switching profiles, instead
+    /// of waiting for the next hot-swap detection cycle.
+    pub(crate) async fn init_sim_info(&self) -> anyhow::Result<()> {
         let (iccid_result, imsi_result, phone_result) = tokio::join!(
             self.get_sim_iccid(),
             self.get_sim_imsi(),
@@ -914,6 +942,7 @@ impl Modem {
             response_tx: tx,
             _priority: 5,
             retries: 0,
+            counted: false,
         };
 
         self.command_tx
@@ -944,6 +973,7 @@ impl Modem {
             response_tx: tx,
             _priority: 5,
             retries: 0,
+            counted: false,
         };
 
         self.command_tx
@@ -1014,6 +1044,28 @@ impl Modem {
     }
 
     async fn send_command_priority(&self, command: &str, priority: u8) -> io::Result<String> {
+        // Fail fast instead of piling onto an already-backlogged queue. A caller's
+        // outer timeout (e.g. in the /api/sims/info handler) does not cancel a
+        // command once it's been pushed to `command_tx` -- command_processor still
+        // runs it to completion. Under repeated polling of an unresponsive modem,
+        // that means orphaned commands would otherwise accumulate forever. Rejecting
+        // new commands here once the backlog is already deep keeps that bounded and
+        // lets the caller get an immediate error instead of waiting on a queue that
+        // won't drain in time anyway.
+        //
+        // NOTE: a single /api/sims/info request legitimately fires 8 concurrent AT
+        // commands per modem (see get_all_sim_info's tokio::join! of signal/network/
+        // operator/model/sms_center/sim_status/memory_status/imei futures), so the
+        // threshold must comfortably exceed that to avoid self-rejecting a normal,
+        // isolated request (which would otherwise also starve modem initialization).
+        const MAX_QUEUED_COMMANDS: usize = 16;
+        if self.pending_commands.load(Ordering::SeqCst) >= MAX_QUEUED_COMMANDS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("Command queue backlogged for device {}", self.name),
+            ));
+        }
+
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         let at_command = ATCommand {
@@ -1021,11 +1073,14 @@ impl Modem {
             response_tx,
             _priority: priority,
             retries: 0,
+            counted: true,
         };
 
-        self.command_tx
-            .send(at_command)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Command queue closed"))?;
+        self.pending_commands.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.command_tx.send(at_command) {
+            self.pending_commands.fetch_sub(1, Ordering::SeqCst);
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, format!("Command queue closed: {}", e)));
+        }
 
         response_rx
             .await
@@ -1786,6 +1841,7 @@ impl Modem {
                 // Start at MAX_RETRIES so command_processor performs a single
                 // quick probe attempt instead of 4 long timeout retries.
                 retries: MAX_RETRIES,
+                counted: false,
             };
             if self.command_tx.send(command).is_err() {
                 return false;
@@ -1836,7 +1892,7 @@ impl Modem {
     }
 
     pub async fn get_modem_model(&self) -> io::Result<Option<ModemInfo>> {
-        self.get_modem_info("AT+CGMM\r\n", ModemInfo::from_response)
+        self.get_modem_info("ATI\r\n", ModemInfo::from_response)
             .await
     }
 

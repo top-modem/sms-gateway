@@ -516,6 +516,8 @@ async fn get_all_sim_info(
     use futures::future::join_all;
     use tokio::time::{timeout, Duration};
 
+    let handler_start = std::time::Instant::now();
+
     fn to_data_error<T, E: ToString>(result: Result<T, E>) -> (Option<T>, Option<String>) {
         match result {
             Ok(data) => (Some(data), None),
@@ -524,6 +526,10 @@ async fn get_all_sim_info(
     }
 
     let port_snapshots = modem_manager.get_port_runtime_snapshots().await;
+    log::warn!(
+        "[sims/info] snapshots fetched after {}ms",
+        handler_start.elapsed().as_millis()
+    );
     let modem_futures: Vec<_> = port_snapshots
         .iter()
         .filter(|snapshot| snapshot.active_sim_id.is_some())
@@ -534,40 +540,21 @@ async fn get_all_sim_info(
             let modem_manager = modem_manager.clone();
             async move {
                 log::debug!("Getting SIM details for: {} on {}", sim_id, com_port);
+                let port_start = std::time::Instant::now();
 
-                // 并发执行所有AT命令，每个都有超时保护
-                let signal_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_signal_quality(&sim_id),
-                );
-                let network_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.check_network_registration(&sim_id),
-                );
-                let operator_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.check_operator(&sim_id),
-                );
-                let model_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_modem_model(&sim_id),
-                );
-                let sms_center_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_sms_center(&sim_id),
-                );
-                let sim_status_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_sim_status(&sim_id),
-                );
-                let memory_status_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_memory_status(&sim_id),
-                );
-                let imei_future = timeout(
-                    Duration::from_secs(5),
-                    modem_manager.get_imei(&sim_id),
-                );
+                // Skip AT queries entirely while the port is in eSIM-management mode:
+                // normal AT commands (CSQ/CREG/COPS/etc.) can't succeed there, and would
+                // otherwise each block for the full 5s timeout, stalling this endpoint
+                // (and every page that calls it) for as long as any port has an eSIM
+                // session open.
+                let esim_active = match modem_manager.get_modem_by_com_port(&com_port).await {
+                    Some(modem) => modem.is_esim_mode().await,
+                    None => false,
+                };
+
+                fn skip<T>() -> Result<anyhow::Result<T>, tokio::time::error::Elapsed> {
+                    Ok(Err(anyhow::anyhow!("eSIM session active")))
+                }
 
                 let (
                     signal_result,
@@ -578,16 +565,67 @@ async fn get_all_sim_info(
                     sim_status_result,
                     memory_status_result,
                     imei_result,
-                ) = tokio::join!(
-                    signal_future,
-                    network_future,
-                    operator_future,
-                    model_future,
-                    sms_center_future,
-                    sim_status_future,
-                    memory_status_future,
-                    imei_future
-                );
+                ) = if esim_active {
+                    (
+                        skip(), skip(), skip(), skip(),
+                        skip(), skip(), skip(), skip(),
+                    )
+                } else {
+                    // 并发执行所有AT命令，每个都有超时保护
+                    //
+                    // NOTE: This handler shares each modem's single-lane AT command
+                    // queue with background workers (SMS-read poll, SIM-presence
+                    // recheck). If a background command is already in flight when
+                    // this request arrives, these futures queue behind it. Using a
+                    // short timeout here means a queued/contended port fails fast
+                    // (returns nulls for that field) instead of blocking the whole
+                    // HTTP response for seconds — the frontend re-polls periodically
+                    // so the data fills in on the next cycle.
+                    const LIVE_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
+                    let signal_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_signal_quality(&sim_id),
+                    );
+                    let network_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.check_network_registration(&sim_id),
+                    );
+                    let operator_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.check_operator(&sim_id),
+                    );
+                    let model_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_modem_model(&sim_id),
+                    );
+                    let sms_center_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_sms_center(&sim_id),
+                    );
+                    let sim_status_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_sim_status(&sim_id),
+                    );
+                    let memory_status_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_memory_status(&sim_id),
+                    );
+                    let imei_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_imei(&sim_id),
+                    );
+
+                    tokio::join!(
+                        signal_future,
+                        network_future,
+                        operator_future,
+                        model_future,
+                        sms_center_future,
+                        sim_status_future,
+                        memory_status_future,
+                        imei_future
+                    )
+                };
 
                 let (signal_data, signal_error) = to_data_error(
                     signal_result
@@ -622,7 +660,17 @@ async fn get_all_sim_info(
 
                 let sim_data = modem_manager.get_sim_card_cached(&sim_id).await;
 
-                log::debug!("All AT commands completed for {}", sim_id);
+                let elapsed_ms = port_start.elapsed().as_millis();
+                if elapsed_ms > 500 {
+                    log::warn!(
+                        "[sims/info][{}][{}] slow: {}ms esim_active={} errs: signal={:?} network={:?} operator={:?} model={:?} sms_center={:?} sim_status={:?} memory_status={:?}",
+                        com_port, sim_id, elapsed_ms, esim_active,
+                        signal_error, network_error, operator_error, model_error,
+                        sms_center_error, sim_status_error, memory_status_error
+                    );
+                } else {
+                    log::debug!("All AT commands completed for {} in {}ms", sim_id, elapsed_ms);
+                }
 
                 (
                     sim_id,
@@ -650,6 +698,10 @@ async fn get_all_sim_info(
         .collect();
 
     let modem_results = join_all(modem_futures).await;
+    log::warn!(
+        "[sims/info] join_all completed after {}ms",
+        handler_start.elapsed().as_millis()
+    );
 
     // 构建响应数据
     let mut details = Vec::new();
@@ -756,6 +808,10 @@ async fn get_all_sim_info(
             .unwrap_or(u32::MAX)
     });
 
+    log::warn!(
+        "[sims/info] handler total {}ms",
+        handler_start.elapsed().as_millis()
+    );
     (StatusCode::OK, Json(details)).into_response()
 }
 

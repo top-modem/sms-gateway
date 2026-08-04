@@ -718,6 +718,7 @@
               <th class="px-4 py-2">{$t('esim_col_mode')}</th>
               <th class="px-4 py-2">{$t('esim_col_status')}</th>
               <th class="px-4 py-2">{$t('esim_col_sim')}</th>
+              <th class="px-4 py-2">{$t('esim_col_actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -747,6 +748,15 @@
                   {/if}
                 </td>
                 <td class="px-4 py-2 text-slate-500">{p.sim_id ?? '—'}</td>
+                <td class="px-4 py-2">
+                  <button
+                    class="rounded bg-slate-500 px-2 py-1 text-xs text-white hover:bg-slate-400 disabled:opacity-50"
+                    onclick={() => reset(p.com_port)}
+                    disabled={!p.esim_capable || busy || batchBusy}
+                  >
+                    {$t('esim_status_action_reset')}
+                  </button>
+                </td>
               </tr>
             {/each}
           </tbody>

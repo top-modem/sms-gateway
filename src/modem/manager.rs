@@ -1481,22 +1481,31 @@ impl ModemManager {
                     // Ensure the sim_cards DB row exists and has the current IMSI.
                     // A transient demotion may have deleted the row while the modem
                     // stayed active, which leaves the dashboard IMSI column blank.
-                    // Only query AT+CNUM when the stored phone number is missing,
-                    // so healthy modems are not hit with an extra AT command each cycle.
-                    let needs_phone = self
-                        .sim_cards_cache
-                        .read()
-                        .await
-                        .get(&iccid)
+                    // Only query AT+CNUM/AT+CIMI when the cached row is actually missing
+                    // that field, so healthy modems aren't hit with extra AT commands
+                    // (contending with foreground requests on the same serial port)
+                    // every 5s recheck cycle when nothing has changed.
+                    let cached_card = self.sim_cards_cache.read().await.get(&iccid).cloned();
+                    let cached_imsi = cached_card
+                        .as_ref()
+                        .and_then(|c| c.imsi.clone())
+                        .filter(|v| !v.is_empty());
+                    let needs_phone = cached_card
+                        .as_ref()
                         .and_then(|c| c.phone_number.as_deref())
                         .map(|p| p.is_empty())
                         .unwrap_or(true);
+                    let needs_imsi = cached_imsi.is_none();
 
-                    let imsi = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_imsi())
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .flatten();
+                    let imsi = if needs_imsi {
+                        tokio::time::timeout(Duration::from_secs(5), modem.get_sim_imsi())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten()
+                    } else {
+                        cached_imsi
+                    };
                     let phone_number = if needs_phone {
                         tokio::time::timeout(Duration::from_secs(5), modem.get_phone_number())
                             .await
@@ -1509,7 +1518,9 @@ impl ModemManager {
                         None
                     };
 
-                    if let Some(imsi) = imsi {
+                    if !needs_imsi && !needs_phone {
+                        // Nothing missing in the cache/DB -- skip the write entirely.
+                    } else if let Some(imsi) = imsi {
                         match SimCard::find_or_create_with_phone(&iccid, Some(imsi), phone_number)
                             .await
                         {

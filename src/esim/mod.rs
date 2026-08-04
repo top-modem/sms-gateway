@@ -449,8 +449,28 @@ impl EsimService {
             }
         }
 
-        // The periodic recheck worker will re-read the (possibly new) ICCID/IMSI
-        // on this port now that it is back in Normal mode.
+        // Refresh the cached sim_id/ICCID now that the port is back in Normal
+        // mode, instead of waiting for the next hot-swap detection cycle, so the
+        // port list reflects a profile switch made during this eSIM session.
+        if result.is_ok() {
+            if let Some(modem) = self.manager.get_modem_by_com_port(com_port).await {
+                if let Err(e) = modem.init_sim_info().await {
+                    log::warn!(
+                        "[eSIM][trace={}] failed to refresh SIM info on {} after exit: {}",
+                        trace_id,
+                        com_port,
+                        e
+                    );
+                } else if let Some(new_sim_id) = modem.sim_id.read().await.clone() {
+                    // init_sim_info() only writes to the DB; also refresh the
+                    // ModemManager's in-memory sim_cards_cache (used by the SIM
+                    // dashboard), otherwise it keeps serving the pre-switch
+                    // ICCID/IMSI until the next full cache rebuild/restart.
+                    self.manager.refresh_sim_cache(&[new_sim_id]).await;
+                }
+            }
+        }
+
         result.map_err(|e| EsimError::At(e.to_string()))
     }
 

@@ -4,7 +4,7 @@
   import { apiClient } from '../js/api.js';
   import { t } from '../js/i18n.js';
 
-  let { onBack = () => {} } = $props();
+  let { onBack = () => {}, onNavigateEsim = () => {} } = $props();
 
   // ── State ──────────────────────────────────────────────────────────────────
   let activeTab = $state('barcode'); // 'barcode' | 'import' | 'call' | 'sms' | 'ussd'
@@ -379,6 +379,27 @@
         { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },
         { id: 'call', label: $t('phone_tab_call'), icon: 'carbon:phone-outgoing' },
         { id: 'sms', label: $t('phone_tab_sms'), icon: 'carbon:send-alt' },
+      ] as tab}
+        <button
+          onclick={() => setActiveTab(tab.id)}
+          class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 transition
+                 {activeTab === tab.id
+                   ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                   : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'}"
+        >
+          <Icon icon={tab.icon} class="w-4 h-4" />
+          {tab.label}
+        </button>
+      {/each}
+      <button
+        onclick={() => onNavigateEsim()}
+        class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 border-transparent
+               text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 transition"
+      >
+        <Icon icon="carbon:sim-card" class="w-4 h-4" />
+        {$t('esim_title')}
+      </button>
+      {#each [
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
       ] as tab}
         <button

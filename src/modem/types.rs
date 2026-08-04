@@ -37,6 +37,13 @@ pub struct ATCommand {
     pub response_tx: tokio::sync::oneshot::Sender<Result<String, io::Error>>,
     pub _priority: u8,
     pub retries: u32,
+    /// True if this command's dispatch incremented the owning `Modem`'s
+    /// `pending_commands` backlog counter (via `send_command_priority`), meaning
+    /// `command_processor` must decrement it once this command finishes. Commands
+    /// constructed directly elsewhere (e.g. `is_responsive`, `send_cops_command`,
+    /// `send_command_outer_timeout`) never increment the counter, so this is
+    /// `false` for those and they must NOT trigger a decrement.
+    pub counted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -172,19 +179,38 @@ pub struct ModemInfo {
 }
 
 impl ModemInfo {
+    /// Parse an `ATI` reply, e.g.:
+    /// ```text
+    /// Quectel
+    /// EC25
+    /// Revision: EC25EFAR06A06M4G
+    /// OK
+    /// ```
+    /// The model is the informative line immediately before the `Revision:` line;
+    /// falls back to the first informative line for single-line replies (e.g. mock data).
     pub fn from_response(response: &str) -> Option<Self> {
-        let model = response
+        let lines: Vec<&str> = response
             .lines()
             .map(|l| l.trim())
-            .find(|l| {
+            .filter(|l| {
                 !l.is_empty()
                     && !l.starts_with("AT+")
+                    && !l.starts_with("ATI")
                     && !l.starts_with("OK")
                     && !l.starts_with("ERROR")
                     && !l.contains("+CME ERROR")
                     && !l.contains("+CMS ERROR")
-            })?
+            })
+            .collect();
+
+        let model = lines
+            .iter()
+            .position(|l| l.to_ascii_uppercase().starts_with("REVISION"))
+            .and_then(|idx| idx.checked_sub(1))
+            .and_then(|idx| lines.get(idx))
+            .or_else(|| lines.first())?
             .to_string();
+
         if !model.is_empty() {
             Some(ModemInfo { model })
         } else {

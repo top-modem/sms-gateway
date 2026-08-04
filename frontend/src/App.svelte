@@ -69,6 +69,10 @@
     currentPage = 'esim';
   }
 
+  function backFromEsim() {
+    currentPage = 'phonenumber';
+  }
+
   $effect(() => {
     initConversation();
     connectCallSSE();
@@ -94,7 +98,6 @@
           onNavigatePlatformStats={goToPlatformStats}
           onNavigateMoney={goToMoney}
           onNavigateMms={goToMms}
-          onNavigateEsim={goToEsim}
         />
       </div>
 
@@ -140,12 +143,12 @@
 
     {:else if currentPage === 'phonenumber'}
       <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
-        <PhoneNumberPage onBack={goToSim} />
+        <PhoneNumberPage onBack={goToSim} onNavigateEsim={goToEsim} />
       </div>
 
     {:else if currentPage === 'esim'}
       <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
-        <EsimPage onBack={goToSim} />
+        <EsimPage onBack={backFromEsim} />
       </div>
     {/if}
 

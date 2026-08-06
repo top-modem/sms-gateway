@@ -503,7 +503,7 @@
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
       <div
-        class="flex max-h-[80vh] w-full max-w-3xl flex-col rounded-lg bg-white shadow-xl dark:bg-zinc-800"
+        class="flex max-h-[80vh] w-full max-w-5xl flex-col rounded-lg bg-white shadow-xl dark:bg-zinc-800"
         onclick={(e) => e.stopPropagation()}
         role="document"
       >
@@ -559,8 +559,8 @@
                         {sms.success ? $t('status_success') : $t('status_failed')}
                       </span>
                     </td>
-                    <td class="max-w-xs break-words px-4 py-3">{sms.message}</td>
-                    <td class="max-w-xs break-words px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
+                    <td class="max-w-[16rem] break-words px-4 py-3">{sms.message}</td>
+                    <td class="max-w-[16rem] whitespace-pre-wrap break-words px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
                       {sms.platform_response || '-'}
                     </td>
                     <td class="px-4 py-3 text-right font-semibold text-[#10a248] dark:text-green-300">

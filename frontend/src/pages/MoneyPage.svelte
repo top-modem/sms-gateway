@@ -23,6 +23,9 @@
   let selectedEarningLoading = $state(false);
   let platformPrices = $state([]);
   let platformPriceIndex = $state(0);
+  let platformPriceSearchKeyword = $state('');
+  let isPlatformPriceDropdownOpen = $state(false);
+  let platformPriceBoxEl = $state(); // DOM ref for click-outside detection
   let priceSaving = $state(false);
   let priceSaveError = $state('');
   let priceSaved = $state(false);
@@ -62,6 +65,16 @@
       ? platformPrices
       : platformPrices.filter((p) => usedCountryCodes.has(p.country_id))
   );
+  const platformPriceOptions = $derived(
+    (() => {
+      const keyword = platformPriceSearchKeyword.trim().toLowerCase();
+      if (!keyword) return filteredPlatformPrices;
+      return filteredPlatformPrices.filter((p) =>
+        `${p.country_id ?? ''} ${p.country_title ?? ''}`.toLowerCase().includes(keyword)
+      );
+    })()
+  );
+  const selectedPlatformPrice = $derived(filteredPlatformPrices[platformPriceIndex]);
 
   async function fetchData() {
     try {
@@ -159,9 +172,31 @@
     fetchItemOptions(itemSearchKeyword);
   }
 
+  function onChoosePlatformPrice(opt) {
+    const idx = filteredPlatformPrices.findIndex((p) => p.country_id === opt.country_id);
+    platformPriceIndex = idx === -1 ? 0 : idx;
+    isPlatformPriceDropdownOpen = false;
+  }
+
+  function togglePlatformPriceDropdown() {
+    if (isPlatformPriceDropdownOpen) {
+      isPlatformPriceDropdownOpen = false;
+      return;
+    }
+    isPlatformPriceDropdownOpen = true;
+    platformPriceSearchKeyword = '';
+  }
+
+  function onPlatformPriceSearchInput(event) {
+    platformPriceSearchKeyword = event.currentTarget?.value || '';
+  }
+
   function onDocumentClick(event) {
     if (isItemDropdownOpen && itemBoxEl && !itemBoxEl.contains(event.target)) {
       isItemDropdownOpen = false;
+    }
+    if (isPlatformPriceDropdownOpen && platformPriceBoxEl && !platformPriceBoxEl.contains(event.target)) {
+      isPlatformPriceDropdownOpen = false;
     }
   }
 
@@ -404,16 +439,56 @@
                 {#if filteredPlatformPrices.length === 0}
                   <span class="text-gray-400 dark:text-gray-500">{$t('money_platform_price_none')}</span>
                 {:else}
-                  <select
-                    class="rounded border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
-                    bind:value={platformPriceIndex}
-                  >
-                    {#each filteredPlatformPrices as p, i (p.country_id ?? p.country_title)}
-                      <option value={i}>{p.country_title || p.country_id || '-'}</option>
-                    {/each}
-                  </select>
+                  <div class="relative min-w-[180px]" bind:this={platformPriceBoxEl}>
+                    <button
+                      type="button"
+                      onclick={togglePlatformPriceDropdown}
+                      class="flex w-full items-center justify-between rounded border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                    >
+                      <span class="truncate">
+                        {selectedPlatformPrice?.country_title || selectedPlatformPrice?.country_id || '-'}
+                      </span>
+                      <Icon
+                        icon="carbon:chevron-down"
+                        class="h-4 w-4 shrink-0 text-gray-500 transition-transform dark:text-gray-400 {isPlatformPriceDropdownOpen ? 'rotate-180' : ''}"
+                      />
+                    </button>
+                    {#if isPlatformPriceDropdownOpen}
+                      <div class="absolute left-0 right-0 top-full z-20 mt-1 rounded border border-gray-300 bg-white shadow-lg dark:border-zinc-600 dark:bg-zinc-800">
+                        <div class="border-b border-gray-200 p-2 dark:border-zinc-700">
+                          <input
+                            type="text"
+                            autocomplete="off"
+                            use:focusOnMount
+                            class="w-full rounded border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                            placeholder={$t('money_platform_price_search_placeholder')}
+                            value={platformPriceSearchKeyword}
+                            oninput={onPlatformPriceSearchInput}
+                          />
+                        </div>
+                        <div class="max-h-56 overflow-y-auto">
+                          {#each platformPriceOptions as p (p.country_id ?? p.country_title)}
+                            <button
+                              type="button"
+                              onclick={() => onChoosePlatformPrice(p)}
+                              class="block w-full px-3 py-1.5 text-left text-xs transition
+                                     {selectedPlatformPrice?.country_id === p.country_id
+                                       ? 'bg-blue-600 text-white'
+                                       : 'text-gray-700 hover:bg-blue-50 dark:text-gray-200 dark:hover:bg-zinc-700'}"
+                            >
+                              {p.country_title || p.country_id || '-'}
+                            </button>
+                          {:else}
+                            <div class="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
+                              {$t('money_platform_price_no_match')}
+                            </div>
+                          {/each}
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
                   <span class="font-semibold text-gray-700 dark:text-gray-200">
-                    {formatMoney(filteredPlatformPrices[platformPriceIndex]?.item_uprice)}
+                    {formatMoney(selectedPlatformPrice?.item_uprice)}
                   </span>
                 {/if}
               </div>

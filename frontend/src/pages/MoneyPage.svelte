@@ -14,7 +14,7 @@
   let itemOptions = $state([]);
   let itemSearchKeyword = $state('');
   let isItemDropdownOpen = $state(false);
-  let itemBoxEl; // plain DOM ref for click-outside detection, not reactive state
+  let itemBoxEl = $state(); // DOM ref for click-outside detection
   let itemOptionsRequestId = 0;
   let selectedItemId = $state('');
   let selectedItemName = $state('');

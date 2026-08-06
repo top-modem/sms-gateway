@@ -409,17 +409,17 @@
         {/if}
 
         {#if selectedItemId}
-          <div class="mt-3 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-700 dark:bg-blue-900/25 dark:text-blue-200">
+          <div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-700 dark:bg-blue-900/25 dark:text-blue-200">
             <div class="font-semibold">
               {$t('money_selected_item_result_title')}
             </div>
-            <div class="mt-1 text-xs">
+            <div class="text-xs">
               {$t('money_selected_item_result_item')}: {selectedItemId}{selectedItemName ? ` | ${selectedItemName}` : ''}
             </div>
-            <div class="mt-1 text-xs">
+            <div class="text-xs">
               {$t('money_selected_item_result_upload_count')}: {selectedEarningLoading ? '...' : selectedSuccessCount}
             </div>
-            <div class="mt-1 text-sm font-bold text-[#10a248] dark:text-green-300">
+            <div class="text-sm font-bold text-[#10a248] dark:text-green-300">
               {$t('money_selected_item_result_earning')}: {formatMoney(selectedEarning)}
             </div>
           </div>
@@ -512,7 +512,7 @@
             <div class="font-semibold">{$t('money_sms_detail_title')}</div>
             <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
               {$t('money_sms_detail_subtitle', {
-                phone: detailRow.phone_number || '—',
+                item: selectedItemId ? `${selectedItemId}${selectedItemName ? ` | ${selectedItemName}` : ''}` : '—',
                 attempts: detailSms.length,
                 success: detailSuccessCount,
                 failed: detailFailedCount,

@@ -47,6 +47,16 @@
     selectedUnitPrice == null ? 0 : selectedSuccessCount * selectedUnitPrice
   );
 
+  // Countries actually present in the stats table (from each SIM's platform country_code)
+  const usedCountryCodes = $derived(
+    new Set(rows.map((r) => r.country_code).filter((c) => c))
+  );
+  const filteredPlatformPrices = $derived(
+    usedCountryCodes.size === 0
+      ? platformPrices
+      : platformPrices.filter((p) => usedCountryCodes.has(p.country_id))
+  );
+
   async function fetchData() {
     try {
       error = '';
@@ -335,19 +345,19 @@
                 {$t('money_platform_price_label')}
               </span>
               <div class="flex items-center gap-2 border-l border-gray-300 p-2 text-xs dark:border-zinc-600">
-                {#if platformPrices.length === 0}
+                {#if filteredPlatformPrices.length === 0}
                   <span class="text-gray-400 dark:text-gray-500">{$t('money_platform_price_none')}</span>
                 {:else}
                   <select
                     class="rounded border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
                     bind:value={platformPriceIndex}
                   >
-                    {#each platformPrices as p, i (p.country_id ?? p.country_title)}
+                    {#each filteredPlatformPrices as p, i (p.country_id ?? p.country_title)}
                       <option value={i}>{p.country_title || p.country_id || '-'}</option>
                     {/each}
                   </select>
                   <span class="font-semibold text-gray-700 dark:text-gray-200">
-                    {formatMoney(platformPrices[platformPriceIndex]?.item_uprice)}
+                    {formatMoney(filteredPlatformPrices[platformPriceIndex]?.item_uprice)}
                   </span>
                 {/if}
               </div>

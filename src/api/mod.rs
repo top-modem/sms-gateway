@@ -2633,6 +2633,7 @@ struct FirefoxMoneyStatsRow {
     com_port: String,
     phone_number: String,
     imsi: Option<String>,
+    country_code: Option<String>,
     platform_connected: bool,
     waiting_sms_count: i64,
     received_sms_count: i64,
@@ -2783,9 +2784,10 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
             .and_then(|id| aggregate_by_sim.get(id));
         let sim_card = sim_id.as_ref().and_then(|id| sim_card_by_id.get(id));
         let imsi = sim_card.and_then(|c| c.imsi.clone());
-        let platform_connected = sim_card
-            .and_then(|c| c.country_code.as_ref())
-            .is_some_and(|code| !code.trim().is_empty());
+        let country_code = sim_card
+            .and_then(|c| c.country_code.clone())
+            .filter(|code| !code.trim().is_empty());
+        let platform_connected = country_code.is_some();
 
         let normalized_phone = normalize_phone_for_match(&phone_number);
         let waiting_by_sim = sim_id
@@ -2819,6 +2821,7 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
             com_port,
             phone_number,
             imsi,
+            country_code,
             platform_connected,
             waiting_sms_count,
             received_sms_count: agg.map(|a| a.received_sms_count).unwrap_or(0),

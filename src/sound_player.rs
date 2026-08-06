@@ -1,9 +1,14 @@
 use std::path::Path;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Best-effort success sound playback. Failures are logged and ignored.
 pub fn play_sms_upload_success_sound() {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+
         let wav_path = Path::new("sound").join("sms.wav");
         if !wav_path.exists() {
             log::warn!("[Sound] SMS success sound file not found: {}", wav_path.display());
@@ -27,6 +32,7 @@ pub fn play_sms_upload_success_sound() {
                 "-Command",
                 &ps_script,
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();

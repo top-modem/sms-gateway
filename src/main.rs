@@ -351,9 +351,24 @@ fn run_windows_tray(url: String) -> anyhow::Result<()> {
 #[cfg(target_os = "windows")]
 fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         LoadIconW, LoadImageW, HICON, IDI_APPLICATION, IMAGE_ICON, LR_LOADFROMFILE,
     };
+
+    // The exe embeds the cow icon as resource id 1 (see assets/icons/sms-gateway.rc),
+    // so prefer that over filesystem lookups: it always exists regardless of cwd/exe
+    // location and avoids ever falling back to the generic Windows arrow icon.
+    fn try_load_icon_from_own_resource() -> Option<HICON> {
+        const RESOURCE_ID_1: *const u16 = 1 as *const u16;
+        let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let h = unsafe { LoadIconW(hinstance, RESOURCE_ID_1) };
+        if h != 0 {
+            Some(h)
+        } else {
+            None
+        }
+    }
 
     fn try_load_icon_from_candidates() -> Option<HICON> {
         let exe = std::env::current_exe().ok()?;
@@ -385,10 +400,12 @@ fn create_windows_tray_item() -> anyhow::Result<tray_item::TrayItem> {
         None
     }
 
-    let hicon = try_load_icon_from_candidates().unwrap_or_else(|| unsafe {
-        // Guaranteed Windows fallback so tray creation never fails on icon loading.
-        LoadIconW(0, IDI_APPLICATION as *const u16)
-    });
+    let hicon = try_load_icon_from_own_resource()
+        .or_else(try_load_icon_from_candidates)
+        .unwrap_or_else(|| unsafe {
+            // Guaranteed Windows fallback so tray creation never fails on icon loading.
+            LoadIconW(0, IDI_APPLICATION as *const u16)
+        });
 
     if hicon == 0 {
         anyhow::bail!("unable to load tray icon handle")

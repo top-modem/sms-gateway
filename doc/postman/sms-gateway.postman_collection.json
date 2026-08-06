@@ -90,6 +90,26 @@
       "key": "retry_id",
       "value": "REPLACE_WITH_RETRY_ID",
       "type": "string"
+    },
+    {
+      "key": "item_id",
+      "value": "REPLACE_WITH_ITEM_ID",
+      "type": "string"
+    },
+    {
+      "key": "com",
+      "value": "COM3",
+      "type": "string"
+    },
+    {
+      "key": "iccid",
+      "value": "REPLACE_WITH_ICCID",
+      "type": "string"
+    },
+    {
+      "key": "activation_code",
+      "value": "REPLACE_WITH_ACTIVATION_CODE",
+      "type": "string"
     }
   ],
   "item": [
@@ -2184,6 +2204,322 @@
               ]
             },
             "description": "返回二进制附件内容。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Money & Pricing (大厅计费)",
+      "item": [
+        {
+          "name": "Money Stats (Per Port Earnings)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-stats"]
+            }
+          }
+        },
+        {
+          "name": "Money Items (Search)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-items?keyword=whatsapp&limit=200",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-items"],
+              "query": [
+                { "key": "keyword", "value": "whatsapp" },
+                { "key": "limit", "value": "200" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Money Item Earning",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-item-earning?item_id={{item_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-item-earning"],
+              "query": [{ "key": "item_id", "value": "{{item_id}}" }]
+            }
+          }
+        },
+        {
+          "name": "Money Item Platform Prices",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-item-platform-prices?item_id={{item_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-item-platform-prices"],
+              "query": [{ "key": "item_id", "value": "{{item_id}}" }]
+            }
+          }
+        },
+        {
+          "name": "Update Money Item Price",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_id\": \"{{item_id}}\",\n  \"item_uprice\": 0.5\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-item-price",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-item-price"]
+            }
+          }
+        },
+        {
+          "name": "Money SMS Detail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-sms-detail?sim_id={{sim_id}}&item_id={{item_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-sms-detail"],
+              "query": [
+                { "key": "sim_id", "value": "{{sim_id}}" },
+                { "key": "item_id", "value": "{{item_id}}" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. eSIM",
+      "item": [
+        {
+          "name": "List Ports",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/ports",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "ports"]
+            }
+          }
+        },
+        {
+          "name": "Enter eSIM Session",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/session/enter",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "session", "enter"]
+            }
+          }
+        },
+        {
+          "name": "Exit eSIM Session",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/session/exit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "session", "exit"]
+            }
+          }
+        },
+        {
+          "name": "Reset eSIM",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/reset",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "reset"]
+            }
+          }
+        },
+        {
+          "name": "Get Chip Info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/chip",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "chip"]
+            }
+          }
+        },
+        {
+          "name": "List Profiles",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles"]
+            }
+          }
+        },
+        {
+          "name": "Download Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"activation_code\": \"{{activation_code}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/download",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "download"]
+            }
+          }
+        },
+        {
+          "name": "Enable Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/enable",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "enable"]
+            }
+          }
+        },
+        {
+          "name": "Disable Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/disable",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "disable"]
+            }
+          }
+        },
+        {
+          "name": "Delete Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/delete",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "delete"]
+            }
+          }
+        },
+        {
+          "name": "Set Profile Nickname",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\",\n  \"nickname\": \"My Profile\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/nickname",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "nickname"]
+            }
+          }
+        },
+        {
+          "name": "List Notifications",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/notifications",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "notifications"]
+            }
+          }
+        },
+        {
+          "name": "Process Notification",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seq\": \"1\",\n  \"remove\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/notifications/process",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "notifications", "process"]
+            }
+          }
+        },
+        {
+          "name": "List Batch Sources (QR Images)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/sources",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "sources"]
+            }
+          }
+        },
+        {
+          "name": "Start Batch",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ports\": [\"{{com}}\"],\n  \"activation_code\": \"{{activation_code}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/batch",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "batch"]
+            }
+          }
+        },
+        {
+          "name": "Get Batch Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/batch",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "batch"]
+            }
           }
         }
       ]

@@ -653,7 +653,82 @@
 ```
 
 ---
+### 3.6.1 大厅计费/收益（Money）
 
+#### GET `/api/firefox/money-stats`
+按串口统计每张 SIM 的等待/接收/成功上传/失败短信数与收益金额。
+
+**响应示例**:
+```json
+[
+  {
+    "com_port": "COM3",
+    "phone_number": "+447700000001",
+    "sim_id": "8901...",
+    "imsi": "234100123456789",
+    "country_code": "eng",
+    "platform_connected": true,
+    "waiting_sms_count": 1,
+    "received_sms_count": 20,
+    "successful_uploaded_sms_count": 18,
+    "failed_sms_count": 2,
+    "money_earning": 9.0,
+    "earning_item_names": "WhatsApp|Instagram"
+  }
+]
+```
+
+---
+
+#### GET `/api/firefox/money-items`
+按关键字搜索平台项目（用于「项目」下拉框）。
+
+**查询参数**: `keyword`（可选）、`limit`（可选，默认 200，最大 1000）
+
+---
+
+#### GET `/api/firefox/money-item-earning`
+获取指定项目的成功接码数量。
+
+**查询参数**: `item_id`
+
+**响应示例**:
+```json
+{ "item_id": "1001", "success_count": 42 }
+```
+
+---
+
+#### GET `/api/firefox/money-item-platform-prices`
+获取指定项目在各国家的大厅参考单价列表。
+
+**查询参数**: `item_id`
+
+**响应示例**:
+```json
+[
+  { "country_id": "eng", "country_title": "+44/英格兰/england", "item_uprice": 0.5 }
+]
+```
+
+---
+
+#### POST `/api/firefox/money-item-price`
+更新指定项目的本地单价（用于收益计算，不影响平台真实单价）。
+
+**请求体**:
+```json
+{ "item_id": "1001", "item_uprice": 0.5 }
+```
+
+---
+
+#### GET `/api/firefox/money-sms-detail`
+查询指定 SIM / 项目下的短信明细（用于对账）。
+
+**查询参数**: `sim_id`（可选）、`item_id`（可选）
+
+---
 ### 3.7 上传重试队列
 
 #### GET `/api/firefox/upload-retry/stats`
@@ -837,6 +912,119 @@
 
 ---
 
+### 3.10 eSIM 管理
+
+> 仅当 `config.toml` 中 `esim_enabled = true` 时启用；依赖 `lpac` 命令行工具与读卡器/PCSC。
+
+#### GET `/api/esim/ports`
+列出可用于 eSIM 操作的串口/读卡器。
+
+**响应**: `{ "success": true, "data": [PortInfo] }`
+
+---
+
+#### POST `/api/esim/{com}/session/enter` / `/session/exit`
+进入/退出指定端口的 eSIM(LPA) 会话模式。
+
+---
+
+#### POST `/api/esim/{com}/reset`
+重置指定端口的 eSIM 会话。
+
+---
+
+#### GET `/api/esim/{com}/chip`
+获取 eUICC 芯片信息（EID 等）。
+
+---
+
+#### GET `/api/esim/{com}/profiles`
+获取该端口下已安装的 eSIM Profile 列表。
+
+---
+
+#### POST `/api/esim/{com}/profiles/download`
+下载（写入）新的 eSIM Profile。
+
+**请求体**:
+```json
+{ "activation_code": "LPA:1$smdp.example.com$MATCHING-ID", "confirmation_code": "" }
+```
+
+---
+
+#### POST `/api/esim/{com}/profiles/enable` / `/profiles/disable`
+启用/停用指定 ICCID 的 Profile。
+
+**请求体**:
+```json
+{ "iccid": "8944...", "refresh_flag": true }
+```
+
+---
+
+#### POST `/api/esim/{com}/profiles/delete`
+删除指定 ICCID 的 Profile。
+
+**请求体**:
+```json
+{ "iccid": "8944..." }
+```
+
+---
+
+#### POST `/api/esim/{com}/profiles/nickname`
+设置 Profile 昵称。
+
+**请求体**:
+```json
+{ "iccid": "8944...", "nickname": "My Profile" }
+```
+
+---
+
+#### GET `/api/esim/{com}/notifications`
+获取待处理的 eSIM 通知（GSMA 合规通知）。
+
+---
+
+#### POST `/api/esim/{com}/notifications/process`
+处理（发送）指定序号的通知，可选是否同时删除。
+
+**请求体**:
+```json
+{ "seq": "1", "remove": true }
+```
+
+---
+
+#### GET `/api/esim/sources`
+扫描配置目录中的二维码图片/文本，返回可用的激活码列表。
+
+---
+
+#### POST `/api/esim/sources/upload`
+上传二维码图片或文本文件（`multipart/form-data`），解析出激活码。
+
+---
+
+#### POST `/api/esim/batch`
+对多个端口批量执行下载+启用流程。
+
+**请求体**:
+```json
+{ "ports": ["COM3", "COM4"], "activation_code": "LPA:1$smdp.example.com$MATCHING-ID" }
+```
+
+**响应**: `{ "success": true, "data": { "job_id": "..." } }`
+
+---
+
+#### GET `/api/esim/batch`
+查询当前批量任务的实时进度快照。
+
+---
+
 ## 4. 数据模型附录
 
 ### Sms
@@ -909,15 +1097,17 @@
 
 ## 5. 使用 Postman 测试
 
-项目提供完整 Postman 集合：
-- `doc/postman/sms-gateway.postman_collection.json`：通用短信/SIM/通话/MMS 接口
-- `doc/postman/sms-gateway-firefox.postman_collection.json`：火狐狸平台接口
+项目提供完整 Postman 集合（两处路径内容一致，任选其一导入即可）：
+- `doc/postman/sms-gateway.postman_collection.json`
+- `postman/sms-gateway.postman_collection.json`
+
+集合按功能分为 11 个文件夹：健康检查、短信、SIM 与 AT 指令、联系人与会话、电话号码管理（含条码扫描）、火狐狸平台集成、火狐狸上传重试队列、语音通话、MMS 彩信、大厅计费/收益、eSIM。
 
 ### 导入步骤
 1. 打开 Postman → `File` → `Import`
-2. 选择上述 JSON 文件
-3. 在集合变量中修改 `baseUrl`、`username`、`password`、`sim_id`、`phone` 等为你自己的值
-4. 由于集合已配置 `basic` 认证，请求会自动携带 `Authorization` 头
+2. 选择上述任一 JSON 文件
+3. 在集合变量（Collection → Variables）中修改 `baseUrl`、`username`、`password`、`sim_id`、`phone`、`item_id`、`com` 等为你自己的值
+4. 集合已在根级别配置 `Basic Auth`（引用 `{{username}}`/`{{password}}` 变量），子请求会自动继承，无需逐个添加 `Authorization` 头
 
 ### 变量说明
 | 变量名 | 默认值 | 说明 |
@@ -933,6 +1123,13 @@
 | `command` | `AT+CSQ` | AT 指令 |
 | `batch_id` | `REPLACE_WITH_BATCH_ID` | 火狐狸 batch ID |
 | `country_id` | `eng` | 火狐狸国家 ID |
+| `firefox_api_key` | `REPLACE_WITH_FIREFOX_API_KEY` | 火狐狸平台 API Key |
+| `mms_id` | `REPLACE_WITH_MMS_ID` | MMS 任务/通知 ID |
+| `retry_id` | `REPLACE_WITH_RETRY_ID` | 上传重试队列条目 ID |
+| `item_id` | `REPLACE_WITH_ITEM_ID` | 火狐狸平台项目 ID（大厅计费用） |
+| `com` | `COM3` | eSIM 操作的串口名 |
+| `iccid` | `REPLACE_WITH_ICCID` | eSIM Profile 的 ICCID |
+| `activation_code` | `REPLACE_WITH_ACTIVATION_CODE` | eSIM 激活码（LPA 字符串） |
 
 ---
 

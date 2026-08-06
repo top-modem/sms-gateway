@@ -22,7 +22,7 @@
   let selectedSuccessCount = $state(0);
   let selectedEarningLoading = $state(false);
   let platformPrices = $state([]);
-  let platformPriceIndex = $state(0);
+  let selectedPlatformPriceId = $state(null);
   let platformPriceSearchKeyword = $state('');
   let isPlatformPriceDropdownOpen = $state(false);
   let platformPriceBoxEl = $state(); // DOM ref for click-outside detection
@@ -51,6 +51,12 @@
     return n;
   }
 
+  const countryNameAliases = { uk: 'england' };
+  function normalizeCountryName(name) {
+    const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+    return countryNameAliases[key] ?? key;
+  }
+
   const selectedUnitPrice = $derived(parseUnitPrice(unitPriceInput));
   const selectedEarning = $derived(
     selectedUnitPrice == null ? 0 : selectedSuccessCount * selectedUnitPrice
@@ -60,21 +66,38 @@
   const usedCountryCodes = $derived(
     new Set(rows.map((r) => r.country_code).filter((c) => c))
   );
+  // Fallback for SIMs not yet platform-connected: match by the IMSI-derived country name
+  // shown in the 国家 column (e.g. UK/英国) against the platform price's country_title.
+  const usedCountryNames = $derived(
+    new Set(
+      rows
+        .filter((r) => !r.country_code)
+        .map((r) => normalizeCountryName(getMccCountry(r.imsi, 'en')))
+        .filter((name) => name)
+    )
+  );
   const filteredPlatformPrices = $derived(
-    usedCountryCodes.size === 0
-      ? platformPrices
-      : platformPrices.filter((p) => usedCountryCodes.has(p.country_id))
+    usedCountryCodes.size > 0
+      ? platformPrices.filter((p) => usedCountryCodes.has(p.country_id))
+      : usedCountryNames.size > 0
+        ? platformPrices.filter((p) => {
+            const title = normalizeCountryName(p.country_title || '');
+            return [...usedCountryNames].some((name) => title.includes(name));
+          })
+        : platformPrices
   );
   const platformPriceOptions = $derived(
     (() => {
       const keyword = platformPriceSearchKeyword.trim().toLowerCase();
-      if (!keyword) return filteredPlatformPrices;
-      return filteredPlatformPrices.filter((p) =>
+      if (!keyword) return platformPrices;
+      return platformPrices.filter((p) =>
         `${p.country_id ?? ''} ${p.country_title ?? ''}`.toLowerCase().includes(keyword)
       );
     })()
   );
-  const selectedPlatformPrice = $derived(filteredPlatformPrices[platformPriceIndex]);
+  const selectedPlatformPrice = $derived(
+    platformPrices.find((p) => p.country_id === selectedPlatformPriceId) ?? filteredPlatformPrices[0]
+  );
 
   async function fetchData() {
     try {
@@ -133,7 +156,7 @@
 
   async function fetchPlatformPrices(itemId) {
     platformPrices = [];
-    platformPriceIndex = 0;
+    selectedPlatformPriceId = null;
     if (!itemId) return;
     try {
       const data = await apiClient.getFirefoxMoneyItemPlatformPrices(itemId);
@@ -173,8 +196,7 @@
   }
 
   function onChoosePlatformPrice(opt) {
-    const idx = filteredPlatformPrices.findIndex((p) => p.country_id === opt.country_id);
-    platformPriceIndex = idx === -1 ? 0 : idx;
+    selectedPlatformPriceId = opt.country_id;
     isPlatformPriceDropdownOpen = false;
   }
 
@@ -430,7 +452,7 @@
         </div>
 
         {#if selectedItemId}
-          <div class="rounded border border-gray-300 dark:border-zinc-600">
+          <div class="ml-auto rounded border border-gray-300 dark:border-zinc-600">
             <div class="flex items-stretch">
               <span class="flex items-center bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 dark:bg-zinc-700 dark:text-gray-200">
                 {$t('money_platform_price_label')}

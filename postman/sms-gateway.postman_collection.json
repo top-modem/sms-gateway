@@ -1,132 +1,2528 @@
 {
   "info": {
-    "name": "SMS Gateway API",
-    "description": "API tests for SMS Gateway",
+    "_postman_id": "sms-gateway-api-full-v1",
+    "name": "SMS Gateway - Full API Collection",
+    "description": "SMS Gateway 完整 HTTP API 测试集合，包含短信、SIM、通话、MMS、火狐狸平台及重试队列接口。默认使用 Basic Auth（admin/123456）。",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
+  "auth": {
+    "type": "basic",
+    "basic": [
+      {
+        "key": "username",
+        "value": "{{username}}",
+        "type": "string"
+      },
+      {
+        "key": "password",
+        "value": "{{password}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8080",
+      "type": "string"
+    },
+    {
+      "key": "username",
+      "value": "admin",
+      "type": "string"
+    },
+    {
+      "key": "password",
+      "value": "123456",
+      "type": "string"
+    },
+    {
+      "key": "sim_id",
+      "value": "REPLACE_WITH_SIM_ID",
+      "type": "string"
+    },
+    {
+      "key": "phone",
+      "value": "18126101015",
+      "type": "string"
+    },
+    {
+      "key": "contact_id",
+      "value": "REPLACE_WITH_CONTACT_ID",
+      "type": "string"
+    },
+    {
+      "key": "call_id",
+      "value": "REPLACE_WITH_CALL_ID",
+      "type": "string"
+    },
+    {
+      "key": "com_port",
+      "value": "COM3",
+      "type": "string"
+    },
+    {
+      "key": "command",
+      "value": "AT+CSQ",
+      "type": "string"
+    },
+    {
+      "key": "batch_id",
+      "value": "REPLACE_WITH_BATCH_ID",
+      "type": "string"
+    },
+    {
+      "key": "country_id",
+      "value": "eng",
+      "type": "string"
+    },
+    {
+      "key": "firefox_api_key",
+      "value": "REPLACE_WITH_FIREFOX_API_KEY",
+      "type": "string"
+    },
+    {
+      "key": "mms_id",
+      "value": "REPLACE_WITH_MMS_ID",
+      "type": "string"
+    },
+    {
+      "key": "retry_id",
+      "value": "REPLACE_WITH_RETRY_ID",
+      "type": "string"
+    },
+    {
+      "key": "item_id",
+      "value": "REPLACE_WITH_ITEM_ID",
+      "type": "string"
+    },
+    {
+      "key": "com",
+      "value": "COM3",
+      "type": "string"
+    },
+    {
+      "key": "iccid",
+      "value": "REPLACE_WITH_ICCID",
+      "type": "string"
+    },
+    {
+      "key": "activation_code",
+      "value": "REPLACE_WITH_ACTIVATION_CODE",
+      "type": "string"
+    }
+  ],
   "item": [
     {
-      "name": "AT Command - Send to COM3",
-      "event": [
+      "name": "01. Health & Service",
+      "item": [
         {
-          "listen": "prerequest",
-          "script": {
-            "exec": [
-              "const req = {",
-              "  command: pm.variables.get('command') || 'AT+CSQ'",
-              "};",
-              "pm.request.body.raw = JSON.stringify(req);"
-            ]
+          "name": "Check Auth",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/check",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "check"
+              ]
+            },
+            "description": "返回 204，用于验证 Basic Auth 是否有效。"
           }
-        }
-      ],
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          },
-          {
-            "key": "Authorization",
-            "value": "Basic {{auth}}",
-            "type": "text"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"command\": \"AT+CSQ\"\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/api/at/{{com_port}}",
-          "host": ["{{base_url}}"],
-          "path": ["api", "at", "{{com_port}}"]
-        }
-      },
-      "response": [
-        {
-          "name": "Success",
-          "status": "OK",
-          "code": 200,
-          "header": [
-            { "key": "Content-Type", "value": "application/json" }
-          ],
-          "body": "{\n  \"response\": \"+CSQ: 20,0\\r\\n\\r\\nOK\\r\\n\"\n}"
         },
         {
-          "name": "Modem Not Found",
-          "status": "Bad Gateway",
-          "code": 502,
-          "header": [
-            { "key": "Content-Type", "value": "application/json" }
-          ],
-          "body": "{\n  \"error\": \"Modem not found on port: COM99\"\n}"
+          "name": "Diagnostics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/diagnostics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "diagnostics"
+              ]
+            },
+            "description": "服务器诊断信息。"
+          }
+        },
+        {
+          "name": "Service Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/service/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "service",
+                "status"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Start Service",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/service/start",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "service",
+                "start"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Stop Service",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/service/stop",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "service",
+                "stop"
+              ]
+            }
+          }
         }
       ]
     },
     {
-      "name": "AT Command - Send custom command",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          },
-          {
-            "key": "Authorization",
-            "value": "Basic {{auth}}"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"command\": \"AT+CGMM\"\n}"
-        },
-        "url": {
-          "raw": "{{base_url}}/api/at/{{com_port}}",
-          "host": ["{{base_url}}"],
-          "path": ["api", "at", "{{com_port}}"]
-        }
-      }
-    },
-    {
-      "name": "AT Command - All ports",
-      "event": [
+      "name": "02. SMS",
+      "item": [
         {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status 200', () => pm.response.to.have.status(200));"
-            ]
+          "name": "Get SMS Paginated",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sms?page=1&per_page=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sms"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get SMS By Direction",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sms?direction=inbox&page=1&per_page=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sms"
+              ],
+              "query": [
+                {
+                  "key": "direction",
+                  "value": "inbox"
+                },
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get SMS By Contact",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sms?contact_id={{phone}}&page=1&per_page=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sms"
+              ],
+              "query": [
+                {
+                  "key": "contact_id",
+                  "value": "{{phone}}"
+                },
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send SMS (by sim_id)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sms"
+              ]
+            },
+            "description": "sim_id 与 phone_number 至少提供一个。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sim_id\": \"{{sim_id}}\",\n  \"contact\": {\n    \"id\": \"{{phone}}\",\n    \"name\": \"{{phone}}\"\n  },\n  \"message\": \"hello from postman\",\n  \"new\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Send SMS (by phone_number)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sms"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"{{phone}}\",\n  \"contact\": {\n    \"id\": \"{{phone}}\",\n    \"name\": \"{{phone}}\"\n  },\n  \"message\": \"hello from postman via phone_number\",\n  \"new\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "SMS SSE",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sms/sse",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sms",
+                "sse"
+              ]
+            },
+            "description": "SSE 实时流接口，建议使用 Postman v10+ Stream 视图或浏览器 EventSource 测试。"
           }
         }
-      ],
-      "request": {
-        "method": "GET",
-        "url": {
-          "raw": "{{base_url}}/api/sims/info",
-          "host": ["{{base_url}}"],
-          "path": ["api", "sims", "info"]
+      ]
+    },
+    {
+      "name": "03. SIMs & AT",
+      "item": [
+        {
+          "name": "Get All SIM Runtime Info",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/info",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "info"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Refresh All SIM Cache",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/refresh-all",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "refresh-all"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Refresh SIM SMS",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/{{sim_id}}/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "{{sim_id}}",
+                "refresh"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send AT Command",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/at/{{com_port}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "at",
+                "{{com_port}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command\": \"{{command}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get SIM Cards",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sim-cards",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sim-cards"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get SIM Stats",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/stats",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "stats"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Enhanced SIM Info",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/{{sim_id}}/info",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "{{sim_id}}",
+                "info"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update SIM Alias",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sim-cards/{{sim_id}}/alias",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sim-cards",
+                "{{sim_id}}",
+                "alias"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"alias\": \"Office SIM\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Update SIM Phone (DB only)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sim-cards/{{sim_id}}/phone",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sim-cards",
+                "{{sim_id}}",
+                "phone"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"{{phone}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Set SIM Phone (write to SIM)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/{{sim_id}}/phone",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "{{sim_id}}",
+                "phone"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone_number\": \"{{phone}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get SMS Storage Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/{{sim_id}}/storage",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "{{sim_id}}",
+                "storage"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Set SMS Storage",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sims/{{sim_id}}/storage",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sims",
+                "{{sim_id}}",
+                "storage"
+              ]
+            },
+            "description": "可选值: SIM / ME / MT",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"storage\": \"SIM\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
         }
-      }
-    }
-  ],
-  "variable": [
-    {
-      "key": "base_url",
-      "value": "http://localhost:8080"
+      ]
     },
     {
-      "key": "auth",
-      "value": "YWRtaW46YWRtaW4="
+      "name": "04. Contacts & Conversations",
+      "item": [
+        {
+          "name": "Get Contacts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "contacts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Contact",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "contacts"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"{{phone}}\",\n  \"name\": \"Test Contact\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete Contact",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/{{contact_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "contacts",
+                "{{contact_id}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Conversations",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversation",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversation"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Conversation Unread",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{contact_id}}/unread",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{contact_id}}",
+                "unread"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
-      "key": "com_port",
-      "value": "COM3"
+      "name": "05. Phone Numbers",
+      "item": [
+        {
+          "name": "Import Phone Numbers",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/import",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "import"
+              ]
+            },
+            "description": "异步任务，返回 202。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"entries\": [\n    {\n      \"iccid\": \"8944010000000000001\",\n      \"msisdn\": \"447700000001\"\n    },\n    {\n      \"iccid\": \"8944010000000000002\",\n      \"msisdn\": \"447700000002\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Barcode Scan",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/barcode-scan",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "barcode-scan"
+              ]
+            },
+            "description": "ICCID 必须以 8944 开头且 20 位，MSISDN 为 11 位英国号段。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"8944010000000000001\",\n  \"msisdn\": \"447700000001\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get Barcode Scans",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/barcode-scans",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "barcode-scans"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Clear Barcode Scans",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/barcode-scans",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "barcode-scans"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Import Barcode Scans",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/barcode-scans/import",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "barcode-scans",
+                "import"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Call Exchange",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/call-exchange",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "call-exchange"
+              ]
+            },
+            "description": "通过互拨发现手机号。"
+          }
+        },
+        {
+          "name": "SMS Exchange",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/sms-exchange",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "sms-exchange"
+              ]
+            },
+            "description": "通过互发短信发现手机号。"
+          }
+        },
+        {
+          "name": "USSD to All",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/ussd",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "ussd"
+              ]
+            },
+            "description": "向所有无手机号的 SIM 发送 USSD。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"*#100#\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Phone Number Task Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/phone-numbers/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "phone-numbers",
+                "status"
+              ]
+            }
+          }
+        }
+      ]
     },
     {
-      "key": "command",
-      "value": "AT+CSQ"
+      "name": "06. Firefox Platform",
+      "item": [
+        {
+          "name": "Get Firefox API Key",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/settings/firefox-api-key",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "settings",
+                "firefox-api-key"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Set Firefox API Key",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/settings/firefox-api-key",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "settings",
+                "firefox-api-key"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"api_key\": \"{{firefox_api_key}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get Firefox Countries",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/countries",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "countries"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Upload Phones to Platform",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sim_ids\": [\n    \"{{sim_id}}\"\n  ],\n  \"country_id\": \"{{country_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Query Batch Status",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/batch-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "batch-status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"batch_id\": \"{{batch_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get Batch Upload History",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/batch-uploads",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "batch-uploads"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Phones by Number",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/delete-batch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "delete-batch"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"entries\": [\n    {\n      \"country_id\": \"{{country_id}}\",\n      \"phone_num\": \"447700000001\"\n    },\n    {\n      \"country_id\": \"{{country_id}}\",\n      \"phone_num\": \"447700000002\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete Phones by Batch ID",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/delete-batch-by-id",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "delete-batch-by-id"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"batch_id\": \"{{batch_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete Country",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/delete-country",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "delete-country"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"country_id\": \"{{country_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete All",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/delete-all",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "delete-all"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Wait List",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/wait-list",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "wait-list"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Result List",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/result-list?country_id={{country_id}}&phone_num=447700000001",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "result-list"
+              ],
+              "query": [
+                {
+                  "key": "country_id",
+                  "value": "{{country_id}}"
+                },
+                {
+                  "key": "phone_num",
+                  "value": "447700000001"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Upload SMS Manual",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload-sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload-sms"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"country_id\": \"{{country_id}}\",\n  \"phone_num\": \"447700000001\",\n  \"sms_content\": \"Your code is 123456\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Platform Items",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/platform-items",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "platform-items"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Platform Item Detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/platform-items/1001?sim_id={{sim_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "platform-items",
+                "1001"
+              ],
+              "query": [
+                {
+                  "key": "sim_id",
+                  "value": "{{sim_id}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Platform Statistics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/platform-statistics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "platform-statistics"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Platform Rejection Reasons",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/platform-rejection-reasons",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "platform-rejection-reasons"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "07. Firefox Retry Queue",
+      "item": [
+        {
+          "name": "Retry Stats",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload-retry/stats",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload-retry",
+                "stats"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Retry Queue",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload-retry/queue",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload-retry",
+                "queue"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Dead Letter Queue",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload-retry/dead-letter",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload-retry",
+                "dead-letter"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Manual Retry",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload-retry/{{retry_id}}/retry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload-retry",
+                "{{retry_id}}",
+                "retry"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete Retry Item",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/upload-retry/{{retry_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firefox",
+                "upload-retry",
+                "{{retry_id}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "08. Calls",
+      "item": [
+        {
+          "name": "Get Calls",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls?limit=50&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Calls By SIM",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls?sim_id={{sim_id}}&limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls"
+              ],
+              "query": [
+                {
+                  "key": "sim_id",
+                  "value": "{{sim_id}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Make Call",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls/make",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls",
+                "make"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sim_id\": \"{{sim_id}}\",\n  \"phone\": \"{{phone}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Answer Call",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls/answer",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls",
+                "answer"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sim_id\": \"{{sim_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Hangup Call",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls/hangup",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls",
+                "hangup"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sim_id\": \"{{sim_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get Call Recording",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls/{{call_id}}/recording",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls",
+                "{{call_id}}",
+                "recording"
+              ]
+            },
+            "description": "返回 AMR 音频二进制。"
+          }
+        },
+        {
+          "name": "Get Call Transcript",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls/{{call_id}}/transcript",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls",
+                "{{call_id}}",
+                "transcript"
+              ]
+            },
+            "description": "返回纯文本转写。"
+          }
+        },
+        {
+          "name": "Calls SSE",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/calls/sse",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "calls",
+                "sse"
+              ]
+            },
+            "description": "SSE 实时流接口，建议使用 Postman v10+ Stream 视图或浏览器 EventSource 测试。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "09. MMS",
+      "item": [
+        {
+          "name": "Send MMS",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/mms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mms"
+              ]
+            },
+            "description": "异步发送，返回 202。",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sim_id\": \"{{sim_id}}\",\n  \"to\": \"{{phone}}\",\n  \"subject\": \"Hello from MMS\",\n  \"attachments\": [\n    {\n      \"filename\": \"image.jpg\",\n      \"content_type\": \"image/jpeg\",\n      \"base64\": \"REPLACE_WITH_BASE64\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get MMS Paginated",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/mms?page=1&per_page=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mms"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get MMS Detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/mms/{{mms_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mms",
+                "{{mms_id}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get MMS Profile",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sim-cards/{{sim_id}}/mms-profile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sim-cards",
+                "{{sim_id}}",
+                "mms-profile"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Set MMS Profile",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sim-cards/{{sim_id}}/mms-profile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sim-cards",
+                "{{sim_id}}",
+                "mms-profile"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"apn\": \"cmwap\",\n  \"mmsc\": \"http://mmsc.example.com\",\n  \"proxy_host\": \"10.0.0.172\",\n  \"proxy_port\": 80\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get MMS Inbox",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/mms/inbox?page=1&per_page=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mms",
+                "inbox"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get MMS Inbox Detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/mms/inbox/{{mms_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mms",
+                "inbox",
+                "{{mms_id}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get MMS Inbox Part",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/mms/inbox/{{mms_id}}/parts/1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "mms",
+                "inbox",
+                "{{mms_id}}",
+                "parts",
+                "1"
+              ]
+            },
+            "description": "返回二进制附件内容。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Money & Pricing (大厅计费)",
+      "item": [
+        {
+          "name": "Money Stats (Per Port Earnings)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-stats"]
+            }
+          }
+        },
+        {
+          "name": "Money Items (Search)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-items?keyword=whatsapp&limit=200",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-items"],
+              "query": [
+                { "key": "keyword", "value": "whatsapp" },
+                { "key": "limit", "value": "200" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Money Item Earning",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-item-earning?item_id={{item_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-item-earning"],
+              "query": [{ "key": "item_id", "value": "{{item_id}}" }]
+            }
+          }
+        },
+        {
+          "name": "Money Item Platform Prices",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-item-platform-prices?item_id={{item_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-item-platform-prices"],
+              "query": [{ "key": "item_id", "value": "{{item_id}}" }]
+            }
+          }
+        },
+        {
+          "name": "Update Money Item Price",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_id\": \"{{item_id}}\",\n  \"item_uprice\": 0.5\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-item-price",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-item-price"]
+            }
+          }
+        },
+        {
+          "name": "Money SMS Detail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/firefox/money-sms-detail?sim_id={{sim_id}}&item_id={{item_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "firefox", "money-sms-detail"],
+              "query": [
+                { "key": "sim_id", "value": "{{sim_id}}" },
+                { "key": "item_id", "value": "{{item_id}}" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. eSIM",
+      "item": [
+        {
+          "name": "List Ports",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/ports",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "ports"]
+            }
+          }
+        },
+        {
+          "name": "Enter eSIM Session",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/session/enter",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "session", "enter"]
+            }
+          }
+        },
+        {
+          "name": "Exit eSIM Session",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/session/exit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "session", "exit"]
+            }
+          }
+        },
+        {
+          "name": "Reset eSIM",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/reset",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "reset"]
+            }
+          }
+        },
+        {
+          "name": "Get Chip Info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/chip",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "chip"]
+            }
+          }
+        },
+        {
+          "name": "List Profiles",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles"]
+            }
+          }
+        },
+        {
+          "name": "Download Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"activation_code\": \"{{activation_code}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/download",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "download"]
+            }
+          }
+        },
+        {
+          "name": "Enable Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/enable",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "enable"]
+            }
+          }
+        },
+        {
+          "name": "Disable Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/disable",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "disable"]
+            }
+          }
+        },
+        {
+          "name": "Delete Profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/delete",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "delete"]
+            }
+          }
+        },
+        {
+          "name": "Set Profile Nickname",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"iccid\": \"{{iccid}}\",\n  \"nickname\": \"My Profile\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/profiles/nickname",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "profiles", "nickname"]
+            }
+          }
+        },
+        {
+          "name": "List Notifications",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/notifications",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "notifications"]
+            }
+          }
+        },
+        {
+          "name": "Process Notification",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seq\": \"1\",\n  \"remove\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/{{com}}/notifications/process",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "{{com}}", "notifications", "process"]
+            }
+          }
+        },
+        {
+          "name": "List Batch Sources (QR Images)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/sources",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "sources"]
+            }
+          }
+        },
+        {
+          "name": "Start Batch",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ports\": [\"{{com}}\"],\n  \"activation_code\": \"{{activation_code}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/batch",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "batch"]
+            }
+          }
+        },
+        {
+          "name": "Get Batch Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/esim/batch",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "esim", "batch"]
+            }
+          }
+        }
+      ]
     }
   ]
 }

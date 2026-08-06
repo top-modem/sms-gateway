@@ -49,7 +49,7 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 tray-item = "0.10"
 webbrowser = "1.0"
 native-dialog = "0.7"
-windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 wiremock = "0.5"

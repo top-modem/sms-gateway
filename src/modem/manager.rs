@@ -113,7 +113,7 @@ pub struct PortRuntimeSnapshot {
     pub last_sim_id: Option<String>,
 }
 
-const SIM_PROBE_FAILURE_THRESHOLD: u8 = 2;
+const SIM_PROBE_FAILURE_THRESHOLD: u8 = 3;
 const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
@@ -272,6 +272,11 @@ impl ModemManager {
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
         const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+        // Large fleets share bus bandwidth across many idle/empty ports; probing
+        // all of them as aggressively as a small deployment adds background AT
+        // traffic that can starve the demotion recheck on genuinely active ports.
+        let device_count = self.devices.len();
+        let probe_interval = PROBE_INTERVAL + Duration::from_secs((device_count as u64 / 48).min(7));
         let mut consecutive_init_failures: u8 = 0;
         let mut probe_miss_streak: u8 = 0;
 
@@ -292,7 +297,7 @@ impl ModemManager {
             if !present {
                 probe_miss_streak = probe_miss_streak.saturating_add(1);
                 if probe_miss_streak < 3 {
-                    tokio::time::sleep(PROBE_INTERVAL).await;
+                    tokio::time::sleep(probe_interval).await;
                     continue;
                 }
                 log::debug!(
@@ -451,9 +456,9 @@ impl ModemManager {
             }
 
             let backoff_secs = if consecutive_init_failures == 0 {
-                PROBE_INTERVAL.as_secs()
+                probe_interval.as_secs()
             } else {
-                (PROBE_INTERVAL.as_secs())
+                (probe_interval.as_secs())
                     .saturating_mul(1_u64 << consecutive_init_failures.min(4))
                     .min(30)
             };
@@ -514,11 +519,18 @@ impl ModemManager {
         let device_count = config.devices.len().max(1);
         // Quick probes are lightweight compared with full modem init. Keep probe
         // concurrency higher so hot-insert detection across many ports (e.g. 17-32)
-        // is not serialized behind a tiny init semaphore.
-        let probe_concurrency = init_concurrency
+        // is not serialized behind a tiny init semaphore. Large fleets (e.g. 96+
+        // configured ports, often multiplexed over a single USB modem-pool board)
+        // share serial/USB bus bandwidth, so raw concurrency stops helping past a
+        // point and instead increases command collisions/timeouts on genuinely
+        // active ports; halve it once the fleet is large enough for that to matter.
+        let large_fleet_divisor: usize = if device_count > 48 { 2 } else { 1 };
+        let probe_concurrency = (init_concurrency
             .saturating_mul(4)
             .clamp(8, 32)
-            .min(device_count);
+            .min(device_count)
+            / large_fleet_divisor)
+            .max(4);
         let mut port_runtime = HashMap::new();
         for device in &config.devices {
             port_runtime.insert(
@@ -1357,9 +1369,11 @@ impl ModemManager {
                 // AT+CPIN? is the most reliable indicator of physical SIM presence.
                 // If the SIM is pulled out, the modem typically reports
                 // +CPIN: SIM REMOVED, +CME ERROR, or plain ERROR.
-                // Use a short explicit timeout so a dead modem cannot stall the
-                // whole recheck cycle.
-                let status = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_status())
+                // Use a generous explicit timeout so a dead modem cannot stall the
+                // whole recheck cycle, while still tolerating shared-bus latency
+                // spikes on large fleets (e.g. COM1-96 modem-pool boards) that
+                // would otherwise be misread as SIM removal.
+                let status = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_status())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
@@ -1384,7 +1398,7 @@ impl ModemManager {
                     // (e.g. +CME ERROR: 10). Corroborate with a fresh IMSI read:
                     // a physically absent SIM cannot return a valid IMSI, while a
                     // transient CPIN glitch on a present SIM still can.
-                    let imsi_ok = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_imsi())
+                    let imsi_ok = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_imsi())
                         .await
                         .ok()
                         .and_then(|r| r.ok())

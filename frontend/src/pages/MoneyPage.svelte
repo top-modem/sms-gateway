@@ -29,6 +29,8 @@
   let priceSavedTimer;
 
   let detailRow = $state(null);
+  let detailMode = $state('item'); // 'item' | 'sim'
+  let detailPhoneNumber = $state('');
   let detailSms = $state([]);
   let detailLoading = $state(false);
 
@@ -210,12 +212,32 @@
 
   async function openSmsDetail() {
     if (!selectedItemId) return;
+    detailMode = 'item';
     detailRow = selectedItemId;
     detailSms = [];
 
     detailLoading = true;
     try {
       const data = await apiClient.getFirefoxMoneySmsDetailByItem(selectedItemId);
+      detailSms = Array.isArray(data) ? data : (data?.data ?? []);
+    } catch (e) {
+      console.warn('Failed to load SMS detail:', e);
+      detailSms = [];
+    } finally {
+      detailLoading = false;
+    }
+  }
+
+  async function openSmsDetailForRow(row) {
+    if (!row?.sim_id) return;
+    detailMode = 'sim';
+    detailRow = row.sim_id;
+    detailPhoneNumber = row.phone_number || '—';
+    detailSms = [];
+
+    detailLoading = true;
+    try {
+      const data = await apiClient.getFirefoxMoneySmsDetailBySim(row.sim_id);
       detailSms = Array.isArray(data) ? data : (data?.data ?? []);
     } catch (e) {
       console.warn('Failed to load SMS detail:', e);
@@ -464,7 +486,14 @@
             </thead>
             <tbody>
               {#each rows as row}
-                <tr class="bg-white dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700">
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <tr
+                  class="cursor-pointer bg-white border-b border-gray-200 hover:bg-blue-50 dark:bg-zinc-800 dark:border-zinc-700 dark:hover:bg-zinc-700/50"
+                  role="button"
+                  tabindex="0"
+                  ondblclick={() => openSmsDetailForRow(row)}
+                >
                   <td class="whitespace-nowrap px-3 py-2.5 font-medium">{row.com_port || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.phone_number || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.imsi ? getMccCountry(row.imsi, $lang) : '—'}</td>
@@ -515,12 +544,21 @@
           <div>
             <div class="font-semibold">{$t('money_sms_detail_title')}</div>
             <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-              {$t('money_sms_detail_subtitle', {
-                item: selectedItemId ? `${selectedItemId}${selectedItemName ? ` | ${selectedItemName}` : ''}` : '—',
-                attempts: detailSms.length,
-                success: detailSuccessCount,
-                failed: detailFailedCount,
-              })}
+              {#if detailMode === 'sim'}
+                {$t('money_sms_detail_subtitle_phone', {
+                  phone: detailPhoneNumber || '—',
+                  attempts: detailSms.length,
+                  success: detailSuccessCount,
+                  failed: detailFailedCount,
+                })}
+              {:else}
+                {$t('money_sms_detail_subtitle', {
+                  item: selectedItemId ? `${selectedItemId}${selectedItemName ? ` | ${selectedItemName}` : ''}` : '—',
+                  attempts: detailSms.length,
+                  success: detailSuccessCount,
+                  failed: detailFailedCount,
+                })}
+              {/if}
             </div>
           </div>
           <button

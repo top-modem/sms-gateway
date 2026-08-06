@@ -65,9 +65,24 @@ if errorlevel 1 (
 )
 
 echo [4/6] Recreate portable folder
+rem Preserve existing data\ and logs\ (they hold the live sqlite database and
+rem log history) across rebuilds instead of wiping them along with the folder.
+rem Backup dir must live on the same drive as NEWDIR: "move" across drives fails.
+set "DATA_BACKUP=%ROOT%\release\_data_backup_%RANDOM%"
+if exist "%NEWDIR%\data" (
+  mkdir "%DATA_BACKUP%" >nul 2>nul
+  move /y "%NEWDIR%\data" "%DATA_BACKUP%\data" >nul
+)
+if exist "%NEWDIR%\logs" (
+  if not exist "%DATA_BACKUP%" mkdir "%DATA_BACKUP%" >nul 2>nul
+  move /y "%NEWDIR%\logs" "%DATA_BACKUP%\logs" >nul
+)
 if exist "%NEWDIR%" rmdir /s /q "%NEWDIR%"
 mkdir "%NEWDIR%"
 mkdir "%NEWDIR%\icon"
+if exist "%DATA_BACKUP%\data" move /y "%DATA_BACKUP%\data" "%NEWDIR%\data" >nul
+if exist "%DATA_BACKUP%\logs" move /y "%DATA_BACKUP%\logs" "%NEWDIR%\logs" >nul
+if exist "%DATA_BACKUP%" rmdir /s /q "%DATA_BACKUP%"
 
 copy /y "%ROOT%\target\release\sms-gateway.exe" "%NEWDIR%\%APP_NAME%.exe" >nul || (
   echo Failed to copy release exe.

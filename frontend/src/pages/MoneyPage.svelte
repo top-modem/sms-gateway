@@ -2,7 +2,8 @@
   import { onMount, onDestroy } from 'svelte';
   import Icon from '@iconify/svelte';
   import { apiClient } from '../js/api.js';
-  import { t } from '../js/i18n.js';
+  import { t, lang } from '../js/i18n.js';
+  import { getMccCountry } from '../js/country.js';
 
   let { onBack = () => {} } = $props();
 
@@ -387,6 +388,8 @@
             <colgroup>
               <col class="col-port" />
               <col class="col-phone" />
+              <col class="col-country" />
+              <col class="col-platform" />
               <col class="col-wait" />
               <col class="col-recv" />
               <col class="col-up" />
@@ -398,6 +401,8 @@
               <tr>
                 <th class="px-3 py-2.5 text-left font-semibold">{$t('money_col_port')}</th>
                 <th class="px-3 py-2.5 text-left font-semibold">{$t('money_col_phone')}</th>
+                <th class="px-3 py-2.5 text-left font-semibold">{$t('money_col_country')}</th>
+                <th class="px-3 py-2.5 text-left font-semibold">{$t('money_col_platform_status')}</th>
                 <th class="px-3 py-2.5 text-center font-semibold">{$t('money_col_waiting')}</th>
                 <th class="px-3 py-2.5 text-center font-semibold">{$t('money_col_received')}</th>
                 <th class="px-3 py-2.5 text-center font-semibold">{$t('money_col_uploaded')}</th>
@@ -411,6 +416,16 @@
                 <tr class={idx % 2 === 0 ? 'bg-white dark:bg-zinc-800' : 'bg-[#ececec] dark:bg-zinc-900'}>
                   <td class="whitespace-nowrap px-3 py-2.5 font-medium">{row.com_port || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.phone_number || '—'}</td>
+                  <td class="whitespace-nowrap px-3 py-2.5">{row.imsi ? getMccCountry(row.imsi, $lang) : '—'}</td>
+                  <td class="whitespace-nowrap px-3 py-2.5">
+                    {#if row.platform_connected}
+                      <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
+                        {$t('platform_connected')}
+                      </span>
+                    {:else}
+                      <span class="text-gray-400 dark:text-gray-500 text-xs">{$t('platform_not_connected')}</span>
+                    {/if}
+                  </td>
                   <td class="px-3 py-2.5 text-center font-semibold text-[#245dff] dark:text-blue-300">{row.waiting_sms_count ?? 0}</td>
                   <td class="px-3 py-2.5 text-center font-medium">{row.received_sms_count ?? 0}</td>
                   <td class="px-3 py-2.5 text-center font-semibold text-[#245dff] dark:text-blue-300">{row.successful_uploaded_sms_count ?? 0}</td>
@@ -420,7 +435,7 @@
                 </tr>
               {:else}
                 <tr>
-                  <td colspan="8" class="px-3 py-8 text-center text-gray-500 dark:text-gray-400">{$t('money_empty')}</td>
+                  <td colspan="10" class="px-3 py-8 text-center text-gray-500 dark:text-gray-400">{$t('money_empty')}</td>
                 </tr>
               {/each}
             </tbody>
@@ -451,6 +466,14 @@
 
   .money-table .col-phone {
     width: 160px;
+  }
+
+  .money-table .col-country {
+    width: 100px;
+  }
+
+  .money-table .col-platform {
+    width: 110px;
   }
 
   .money-table .col-wait,

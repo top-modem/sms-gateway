@@ -367,6 +367,14 @@ class ApiClient {
     }
 
     /**
+     * Get recent received SMS detail (time/status/content/platform response/money) for a SIM.
+     * @param {string} simId
+     */
+    async getFirefoxMoneySmsDetail(simId) {
+        return FetchApi.get('/api/firefox/money-sms-detail', { sim_id: simId });
+    }
+
+    /**
      * Get grouped platform rejection reasons from failed SMS attempts.
      */
     async getFirefoxPlatformRejectionReasons() {

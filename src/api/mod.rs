@@ -288,6 +288,7 @@ pub async fn run_api(
         .route("/firefox/money-item-earning", get(firefox_money_item_earning))
         .route("/firefox/money-item-platform-prices", get(firefox_money_item_platform_prices))
         .route("/firefox/money-item-price", post(firefox_update_money_item_price))
+        .route("/firefox/money-sms-detail", get(firefox_money_sms_detail))
         .route("/firefox/platform-rejection-reasons", get(firefox_platform_rejection_reasons))
         // ── Firefox upload retry queue routes ────────────────────────────
         .route("/firefox/upload-retry/stats", get(firefox_upload_retry_stats))
@@ -2632,6 +2633,7 @@ async fn firefox_platform_statistics() -> Response {
 struct FirefoxMoneyStatsRow {
     com_port: String,
     phone_number: String,
+    sim_id: Option<String>,
     imsi: Option<String>,
     country_code: Option<String>,
     platform_connected: bool,
@@ -2820,6 +2822,7 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
         result.push(FirefoxMoneyStatsRow {
             com_port,
             phone_number,
+            sim_id,
             imsi,
             country_code,
             platform_connected,
@@ -2932,6 +2935,31 @@ async fn firefox_update_money_item_price(Json(payload): Json<MoneyItemPriceUpdat
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Failed to save item price: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MoneySmsDetailQuery {
+    sim_id: String,
+}
+
+async fn firefox_money_sms_detail(Query(query): Query<MoneySmsDetailQuery>) -> Response {
+    let sim_id = query.sim_id.trim();
+    if sim_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "sim_id is required"})),
+        )
+            .into_response();
+    }
+
+    match crate::db::FirefoxMoneyStat::query_sms_detail_by_sim(sim_id, 200).await {
+        Ok(rows) => (StatusCode::OK, Json(json!(rows))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to query SMS detail: {}", e)})),
         )
             .into_response(),
     }

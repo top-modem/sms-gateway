@@ -1534,6 +1534,18 @@ pub struct PlatformItemPrice {
     pub item_uprice: f64,
 }
 
+/// One received SMS row for the Money page's per-SIM detail panel.
+#[derive(Debug, FromRow, Deserialize, Serialize, Default, Clone)]
+pub struct MoneySmsDetailRow {
+    pub id: i64,
+    pub timestamp: NaiveDateTime,
+    pub phone_number: String,
+    pub message: String,
+    pub success: bool,
+    pub platform_response: Option<String>,
+    pub money: f64,
+}
+
 impl FirefoxMoneyStat {
     pub async fn query_all_by_sim() -> Result<Vec<Self>> {
         let pool = get_pool()?;
@@ -1627,6 +1639,39 @@ impl FirefoxMoneyStat {
             "SELECT country_id, country_title, item_uprice FROM firefox_item_prices WHERE item_id = ? ORDER BY country_id",
         )
         .bind(item_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Returns recent received SMS for a SIM, with per-message upload status and earning, for the Money page detail panel.
+    pub async fn query_sms_detail_by_sim(sim_id: &str, limit: i64) -> Result<Vec<MoneySmsDetailRow>> {
+        let pool = get_pool()?;
+        let rows = sqlx::query_as::<_, MoneySmsDetailRow>(
+            r#"
+            SELECT
+                s.id AS id,
+                s.timestamp AS timestamp,
+                COALESCE(sc.phone_number, '') AS phone_number,
+                s.message AS message,
+                (s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1) AS success,
+                s.platform_response AS platform_response,
+                CASE
+                    WHEN s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1
+                        THEN COALESCE(fin.seller_item_price, 0.0)
+                    ELSE 0.0
+                END AS money
+            FROM sms s
+            LEFT JOIN sim_cards sc ON sc.id = s.sim_id
+            LEFT JOIN firefox_item_names fin ON fin.item_id = s.platform_item_id
+            WHERE s.sim_id = ? AND s.send = 0
+            ORDER BY s.timestamp DESC, s.id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(sim_id)
+        .bind(limit)
         .fetch_all(pool)
         .await?;
 

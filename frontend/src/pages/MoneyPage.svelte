@@ -28,6 +28,10 @@
   let priceSaved = $state(false);
   let priceSavedTimer;
 
+  let detailRow = $state(null);
+  let detailSms = $state([]);
+  let detailLoading = $state(false);
+
   let pollTimer;
 
   function formatMoney(value) {
@@ -203,6 +207,36 @@
   function focusOnMount(node) {
     node.focus();
   }
+
+  async function openSmsDetail(row) {
+    detailRow = row;
+    detailSms = [];
+    if (!row.sim_id) return;
+
+    detailLoading = true;
+    try {
+      const data = await apiClient.getFirefoxMoneySmsDetail(row.sim_id);
+      detailSms = Array.isArray(data) ? data : (data?.data ?? []);
+    } catch (e) {
+      console.warn('Failed to load SMS detail:', e);
+      detailSms = [];
+    } finally {
+      detailLoading = false;
+    }
+  }
+
+  function closeSmsDetail() {
+    detailRow = null;
+    detailSms = [];
+  }
+
+  function formatDateTime(ts) {
+    if (!ts) return '-';
+    return new Date(ts).toLocaleString();
+  }
+
+  const detailSuccessCount = $derived(detailSms.filter((s) => s.success).length);
+  const detailFailedCount = $derived(detailSms.length - detailSuccessCount);
 
   onMount(async () => {
     const [, defaultOptions] = await Promise.all([fetchData(), apiClient.getFirefoxMoneyItems('', 300)]);
@@ -422,8 +456,11 @@
               </tr>
             </thead>
             <tbody>
-              {#each rows as row, idx}
-                <tr class={idx % 2 === 0 ? 'bg-white dark:bg-zinc-800' : 'bg-[#ececec] dark:bg-zinc-900'}>
+              {#each rows as row}
+                <tr
+                  class="bg-white dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700 cursor-pointer hover:bg-gray-50 dark:hover:bg-zinc-700/50"
+                  ondblclick={() => openSmsDetail(row)}
+                >
                   <td class="whitespace-nowrap px-3 py-2.5 font-medium">{row.com_port || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.phone_number || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.imsi ? getMccCountry(row.imsi, $lang) : '—'}</td>
@@ -454,6 +491,96 @@
       </section>
     {/if}
   </div>
+
+  {#if detailRow}
+    <div
+      class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-4"
+      onclick={closeSmsDetail}
+      onkeydown={(e) => e.key === 'Escape' && closeSmsDetail()}
+      role="button"
+      tabindex="-1"
+    >
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="flex max-h-[80vh] w-full max-w-3xl flex-col rounded-lg bg-white shadow-xl dark:bg-zinc-800"
+        onclick={(e) => e.stopPropagation()}
+        role="document"
+      >
+        <div class="flex items-start justify-between border-b border-gray-200 px-4 py-3 dark:border-zinc-700">
+          <div>
+            <div class="font-semibold">{$t('money_sms_detail_title')}</div>
+            <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {$t('money_sms_detail_subtitle', {
+                phone: detailRow.phone_number || '—',
+                attempts: detailSms.length,
+                success: detailSuccessCount,
+                failed: detailFailedCount,
+              })}
+            </div>
+          </div>
+          <button
+            onclick={closeSmsDetail}
+            class="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-zinc-700 dark:hover:text-gray-200"
+            aria-label={$t('close')}
+          >
+            <Icon icon="carbon:close" class="h-5 w-5" />
+          </button>
+        </div>
+        <div class="overflow-y-auto">
+          {#if detailLoading}
+            <div class="flex h-40 items-center justify-center text-gray-500 dark:text-gray-400">
+              <Icon icon="carbon:loading" class="mr-2 h-6 w-6 animate-spin" />
+              {$t('loading')}
+            </div>
+          {:else}
+            <table class="min-w-full text-sm">
+              <thead class="bg-gray-50 dark:bg-zinc-700/50">
+                <tr>
+                  <th class="px-4 py-2 text-left font-medium">{$t('col_time')}</th>
+                  <th class="px-4 py-2 text-left font-medium">{$t('col_phone_number')}</th>
+                  <th class="px-4 py-2 text-left font-medium">{$t('col_status')}</th>
+                  <th class="px-4 py-2 text-left font-medium">{$t('col_message')}</th>
+                  <th class="px-4 py-2 text-left font-medium">{$t('col_response')}</th>
+                  <th class="px-4 py-2 text-right font-medium">{$t('money_sms_detail_col_money')}</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-gray-100 dark:divide-zinc-700">
+                {#each detailSms as sms (sms.id)}
+                  <tr class="align-top">
+                    <td class="whitespace-nowrap px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
+                      {formatDateTime(sms.timestamp)}
+                    </td>
+                    <td class="whitespace-nowrap px-4 py-3">{sms.phone_number || '—'}</td>
+                    <td class="px-4 py-3">
+                      <span class={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${sms.success
+                        ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300'
+                        : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'}`}>
+                        {sms.success ? $t('status_success') : $t('status_failed')}
+                      </span>
+                    </td>
+                    <td class="max-w-xs break-words px-4 py-3">{sms.message}</td>
+                    <td class="max-w-xs break-words px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
+                      {sms.platform_response || '-'}
+                    </td>
+                    <td class="px-4 py-3 text-right font-semibold text-[#10a248] dark:text-green-300">
+                      {formatMoney(sms.money ?? 0)}
+                    </td>
+                  </tr>
+                {:else}
+                  <tr>
+                    <td colspan="6" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                      {$t('money_sms_detail_empty')}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>

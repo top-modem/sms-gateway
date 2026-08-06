@@ -2942,20 +2942,27 @@ async fn firefox_update_money_item_price(Json(payload): Json<MoneyItemPriceUpdat
 
 #[derive(Debug, Deserialize)]
 struct MoneySmsDetailQuery {
-    sim_id: String,
+    sim_id: Option<String>,
+    item_id: Option<String>,
 }
 
 async fn firefox_money_sms_detail(Query(query): Query<MoneySmsDetailQuery>) -> Response {
-    let sim_id = query.sim_id.trim();
-    if sim_id.is_empty() {
+    let sim_id = query.sim_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let item_id = query.item_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    let result = if let Some(item_id) = item_id {
+        crate::db::FirefoxMoneyStat::query_sms_detail_by_item(item_id, 200).await
+    } else if let Some(sim_id) = sim_id {
+        crate::db::FirefoxMoneyStat::query_sms_detail_by_sim(sim_id, 200).await
+    } else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "sim_id is required"})),
+            Json(json!({"error": "sim_id or item_id is required"})),
         )
             .into_response();
-    }
+    };
 
-    match crate::db::FirefoxMoneyStat::query_sms_detail_by_sim(sim_id, 200).await {
+    match result {
         Ok(rows) => (StatusCode::OK, Json(json!(rows))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

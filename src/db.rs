@@ -1678,6 +1678,39 @@ impl FirefoxMoneyStat {
         Ok(rows)
     }
 
+    /// Returns recent SMS attempts for a platform item (across all SIMs), for the Money page detail panel.
+    pub async fn query_sms_detail_by_item(item_id: &str, limit: i64) -> Result<Vec<MoneySmsDetailRow>> {
+        let pool = get_pool()?;
+        let rows = sqlx::query_as::<_, MoneySmsDetailRow>(
+            r#"
+            SELECT
+                s.id AS id,
+                s.timestamp AS timestamp,
+                COALESCE(sc.phone_number, '') AS phone_number,
+                s.message AS message,
+                (s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1) AS success,
+                s.platform_response AS platform_response,
+                CASE
+                    WHEN s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1
+                        THEN COALESCE(fin.seller_item_price, 0.0)
+                    ELSE 0.0
+                END AS money
+            FROM sms s
+            LEFT JOIN sim_cards sc ON sc.id = s.sim_id
+            LEFT JOIN firefox_item_names fin ON fin.item_id = s.platform_item_id
+            WHERE s.platform_item_id = ? AND s.send = 0
+            ORDER BY s.timestamp DESC, s.id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(item_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Updates the seller's own price for an existing item, or inserts a new item row if none exists yet.
     pub async fn update_money_item_price(item_id: &str, seller_item_price: f64) -> Result<()> {
         let pool = get_pool()?;

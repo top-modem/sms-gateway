@@ -367,11 +367,11 @@ class ApiClient {
     }
 
     /**
-     * Get recent received SMS detail (time/status/content/platform response/money) for a SIM.
-     * @param {string} simId
+     * Get recent SMS detail (time/status/content/platform response/money) for a platform item.
+     * @param {string} itemId
      */
-    async getFirefoxMoneySmsDetail(simId) {
-        return FetchApi.get('/api/firefox/money-sms-detail', { sim_id: simId });
+    async getFirefoxMoneySmsDetailByItem(itemId) {
+        return FetchApi.get('/api/firefox/money-sms-detail', { item_id: itemId });
     }
 
     /**

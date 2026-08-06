@@ -208,14 +208,14 @@
     node.focus();
   }
 
-  async function openSmsDetail(row) {
-    detailRow = row;
+  async function openSmsDetail() {
+    if (!selectedItemId) return;
+    detailRow = selectedItemId;
     detailSms = [];
-    if (!row.sim_id) return;
 
     detailLoading = true;
     try {
-      const data = await apiClient.getFirefoxMoneySmsDetail(row.sim_id);
+      const data = await apiClient.getFirefoxMoneySmsDetailByItem(selectedItemId);
       detailSms = Array.isArray(data) ? data : (data?.data ?? []);
     } catch (e) {
       console.warn('Failed to load SMS detail:', e);
@@ -409,7 +409,14 @@
         {/if}
 
         {#if selectedItemId}
-          <div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-700 dark:bg-blue-900/25 dark:text-blue-200">
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <div
+            class="mt-3 flex cursor-pointer flex-wrap items-center gap-x-4 gap-y-1 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-900/25 dark:text-blue-200 dark:hover:bg-blue-900/40"
+            role="button"
+            tabindex="0"
+            ondblclick={openSmsDetail}
+          >
             <div class="font-semibold">
               {$t('money_selected_item_result_title')}
             </div>
@@ -457,10 +464,7 @@
             </thead>
             <tbody>
               {#each rows as row}
-                <tr
-                  class="bg-white dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700 cursor-pointer hover:bg-gray-50 dark:hover:bg-zinc-700/50"
-                  ondblclick={() => openSmsDetail(row)}
-                >
+                <tr class="bg-white dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700">
                   <td class="whitespace-nowrap px-3 py-2.5 font-medium">{row.com_port || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.phone_number || '—'}</td>
                   <td class="whitespace-nowrap px-3 py-2.5">{row.imsi ? getMccCountry(row.imsi, $lang) : '—'}</td>

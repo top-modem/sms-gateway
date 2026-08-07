@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -71,6 +71,9 @@ pub struct ModemManager {
     pub unavailable_ports: RwLock<Vec<(String, u32)>>,
     /// Background tasks that periodically quick-probe unavailable ports.
     unavailable_port_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
+    /// Per-port in-process lease: only one internal probe/init path may open
+    /// a given COM port at a time, preventing self-contention lock storms.
+    port_open_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     /// Original device list so unavailable ports can be retried later.
     devices: Vec<crate::config::Device>,
     /// If true, UK MCC SIMs (234/235) will force COPS 46001 during SIM init.
@@ -81,6 +84,10 @@ pub struct ModemManager {
     default_sms_storage: Option<SmsStorage>,
     /// Transient AT+CCID probe failures keyed by COM port.
     sim_probe_fail_counts: RwLock<HashMap<String, u8>>,
+    /// Consecutive per-port ICCID mismatch samples (new_iccid, streak).
+    sim_swap_confirm_streaks: RwLock<HashMap<String, (String, u8)>>,
+    /// Last moment each port was explicitly observed as SIM READY.
+    recent_ready_at: RwLock<HashMap<String, Instant>>,
     /// Cooldown window keyed by COM port to avoid immediate re-demotion loops.
     sim_probe_cooldown_until: RwLock<HashMap<String, Instant>>,
     /// True once the initial background modem initialization has completed.
@@ -107,6 +114,8 @@ pub struct PortRuntimeState {
     pub lifecycle: PortLifecycle,
     pub active_sim_id: Option<String>,
     pub last_sim_id: Option<String>,
+    pub module_connected: bool,
+    pub last_imei: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,18 +126,60 @@ pub struct PortRuntimeSnapshot {
     pub lifecycle: PortLifecycle,
     pub active_sim_id: Option<String>,
     pub last_sim_id: Option<String>,
+    pub module_connected: bool,
+    pub last_imei: Option<String>,
 }
 
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 3;
 const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
 impl ModemManager {
+    fn extract_imei_from_text(text: &str) -> Option<String> {
+        let tail = text.split("imei=").nth(1)?.trim();
+
+        let candidate = if let Some(rest) = tail.strip_prefix("Some(") {
+            // Expected form: Some("862607...")
+            let first_quote = rest.find('"')?;
+            let after_first = &rest[first_quote + 1..];
+            let second_quote = after_first.find('"')?;
+            &after_first[..second_quote]
+        } else if let Some(rest) = tail.strip_prefix('"') {
+            // Expected form: "862607..."
+            let end = rest.find('"')?;
+            &rest[..end]
+        } else {
+            // Fallback: token up to whitespace/comma/paren
+            tail.split(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ']')
+                .next()
+                .unwrap_or("")
+        };
+
+        let digits: String = candidate.chars().filter(|c| c.is_ascii_digit()).collect();
+        if (14..=20).contains(&digits.len()) {
+            Some(digits)
+        } else {
+            None
+        }
+    }
+
     fn should_defer_sms_reads_from_snapshots(snapshots: &[PortRuntimeSnapshot]) -> bool {
         snapshots
             .iter()
             .any(|snapshot| {
                 snapshot.last_sim_id.is_some() && snapshot.lifecycle != PortLifecycle::Active
             })
+    }
+
+    async fn port_open_lock(&self, com_port: &str) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.port_open_locks.read().await.get(com_port).cloned() {
+            return lock;
+        }
+
+        let mut locks = self.port_open_locks.write().await;
+        locks
+            .entry(com_port.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     async fn begin_port_probe_cycle(&self, com_port: &str) -> u64 {
@@ -139,6 +190,8 @@ impl ModemManager {
             lifecycle: PortLifecycle::Unknown,
             active_sim_id: None,
             last_sim_id: None,
+            module_connected: false,
+            last_imei: None,
         });
         entry.generation = generation;
         entry.lifecycle = PortLifecycle::Probing;
@@ -153,6 +206,8 @@ impl ModemManager {
             lifecycle: PortLifecycle::Unknown,
             active_sim_id: None,
             last_sim_id: None,
+            module_connected: false,
+            last_imei: None,
         });
         if entry.generation > generation {
             return false;
@@ -161,6 +216,7 @@ impl ModemManager {
         entry.lifecycle = PortLifecycle::Active;
         entry.active_sim_id = Some(sim_id.to_string());
         entry.last_sim_id = Some(sim_id.to_string());
+        entry.module_connected = true;
         true
     }
 
@@ -171,6 +227,8 @@ impl ModemManager {
             lifecycle: PortLifecycle::Unknown,
             active_sim_id: None,
             last_sim_id: None,
+            module_connected: false,
+            last_imei: None,
         });
         entry.lifecycle = PortLifecycle::Unavailable;
         entry.active_sim_id = None;
@@ -191,6 +249,8 @@ impl ModemManager {
             lifecycle: PortLifecycle::Unknown,
             active_sim_id: None,
             last_sim_id: None,
+            module_connected: false,
+            last_imei: None,
         });
         let was_stale = entry.lifecycle != PortLifecycle::Active
             || entry.active_sim_id.as_deref() != Some(sim_id);
@@ -198,12 +258,57 @@ impl ModemManager {
         entry.lifecycle = PortLifecycle::Active;
         entry.active_sim_id = Some(sim_id.to_string());
         entry.last_sim_id = Some(sim_id.to_string());
+        entry.module_connected = true;
         was_stale
+    }
+
+    async fn set_port_module_connected(&self, com_port: &str, connected: bool) {
+        let mut runtime = self.port_runtime.write().await;
+        let entry = runtime.entry(com_port.to_string()).or_insert(PortRuntimeState {
+            generation: 0,
+            lifecycle: PortLifecycle::Unknown,
+            active_sim_id: None,
+            last_sim_id: None,
+            module_connected: connected,
+            last_imei: None,
+        });
+        entry.module_connected = connected;
+        if !connected {
+            entry.last_imei = None;
+        }
+    }
+
+    async fn set_port_last_imei(&self, com_port: &str, imei: Option<String>) {
+        let mut runtime = self.port_runtime.write().await;
+        let entry = runtime.entry(com_port.to_string()).or_insert(PortRuntimeState {
+            generation: 0,
+            lifecycle: PortLifecycle::Unknown,
+            active_sim_id: None,
+            last_sim_id: None,
+            module_connected: false,
+            last_imei: None,
+        });
+        entry.last_imei = imei;
     }
 
     /// Whether a live modem is currently registered on this COM port.
     async fn has_active_modem_on_port(&self, com_port: &str) -> bool {
         self.modems.read().await.contains_key(com_port)
+    }
+
+    /// Whether this ICCID is currently attached to another active COM port.
+    async fn is_iccid_active_on_other_port(&self, iccid: &str, com_port: &str) -> bool {
+        let modems = self.modems.read().await;
+        for (port, modem) in modems.iter() {
+            if port == com_port {
+                continue;
+            }
+            let sid = modem.sim_id.read().await.clone();
+            if sid.as_deref() == Some(iccid) {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn get_port_runtime_snapshots(&self) -> Vec<PortRuntimeSnapshot> {
@@ -216,6 +321,8 @@ impl ModemManager {
                     lifecycle: PortLifecycle::Unknown,
                     active_sim_id: None,
                     last_sim_id: None,
+                    module_connected: false,
+                    last_imei: None,
                 });
                 PortRuntimeSnapshot {
                     com_port: device.com_port.clone(),
@@ -224,6 +331,8 @@ impl ModemManager {
                     lifecycle: state.lifecycle,
                     active_sim_id: state.active_sim_id,
                     last_sim_id: state.last_sim_id,
+                    module_connected: state.module_connected,
+                    last_imei: state.last_imei,
                 }
             })
             .collect()
@@ -236,6 +345,57 @@ impl ModemManager {
 
     pub async fn is_initialization_complete(&self) -> bool {
         *self.initialization_complete.read().await
+    }
+
+    /// Reconcile `port_runtime` with the current live modem map.
+    ///
+    /// This is a defensive self-heal for cases where runtime state drifted to
+    /// `Unavailable` while a modem object on the same COM port is still alive.
+    /// The dashboard derives availability from `port_runtime`, so restoring it
+    /// here prevents stale "SIM REMOVED" rows for healthy ports.
+    pub async fn sync_port_runtime_with_live_modems(&self) {
+        let modems: Vec<Arc<Modem>> = self.modems.read().await.values().cloned().collect();
+
+        for modem in modems {
+            let sim_id = if let Some(sim_id) = modem.sim_id.read().await.clone() {
+                sim_id
+            } else {
+                // A live modem can temporarily lose its in-memory SIM id during
+                // churn. Probe ICCID directly so runtime can still be restored.
+                let recovered = tokio::time::timeout(Duration::from_secs(2), modem.get_sim_iccid())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+                    .filter(|v| !v.trim().is_empty());
+                let Some(recovered_id) = recovered else {
+                    continue;
+                };
+                *modem.sim_id.write().await = Some(recovered_id.clone());
+                log::warn!(
+                    "[runtime-sync] Recovered missing SIM ID on {} via direct ICCID probe: {}",
+                    modem.com_port,
+                    recovered_id
+                );
+                recovered_id
+            };
+
+            if self.reaffirm_port_active(&modem.com_port, &sim_id).await {
+                log::warn!(
+                    "[runtime-sync] Restored stale runtime state for {} on {} from live modem map",
+                    sim_id,
+                    modem.com_port
+                );
+            }
+
+            self
+                .recent_ready_at
+                .write()
+                .await
+                .insert(modem.com_port.clone(), Instant::now());
+            self.set_last_known_sim_port(&modem.com_port, &sim_id).await;
+            self.remove_unavailable_port(&modem.com_port).await;
+        }
     }
 
     /// Mark a port as unavailable and start a background worker that quick-probes
@@ -324,6 +484,7 @@ impl ModemManager {
         let probe_interval = PROBE_INTERVAL + Duration::from_secs((device_count as u64 / 48).min(7));
         let mut consecutive_init_failures: u8 = 0;
         let mut probe_miss_streak: u8 = 0;
+        const MODULE_DISCONNECT_MISS_THRESHOLD: u8 = 10;
 
         loop {
             // If the port is no longer in the unavailable list, this worker is done.
@@ -336,6 +497,8 @@ impl ModemManager {
             // Quick probe: empty ports fail fast. Acquire the shared probe semaphore
             // so a large number of unavailable ports cannot overwhelm the USB hub.
             let present = {
+                let port_lock = self.port_open_lock(&com_port).await;
+                let _port_open_guard = port_lock.lock().await;
                 let _permit = self.probe_semaphore.acquire().await;
                 Modem::quick_probe_port(&com_port, baud_rate).await
             };
@@ -345,13 +508,38 @@ impl ModemManager {
                     tokio::time::sleep(probe_interval).await;
                     continue;
                 }
+                // Do not downgrade to DISCONNECTED on short transient probe bursts.
+                // Only mark disconnected after sustained misses and no remembered IMEI.
+                if probe_miss_streak >= MODULE_DISCONNECT_MISS_THRESHOLD {
+                    let keep_connected = self
+                        .port_runtime
+                        .read()
+                        .await
+                        .get(&com_port)
+                        .and_then(|state| state.last_imei.clone())
+                        .is_some();
+                    self.set_port_module_connected(&com_port, keep_connected).await;
+                }
                 log::debug!(
                     "Port {} quick probe missed {} times; forcing a full init attempt to avoid false negatives.",
                     com_port,
                     probe_miss_streak
                 );
             } else {
+                self.set_port_module_connected(&com_port, true).await;
                 probe_miss_streak = 0;
+            }
+
+            // Race guard: this port may have already been promoted by another
+            // path while this worker was waiting/sleeping. Never compete with a
+            // live modem handle on the same COM port.
+            if self.has_active_modem_on_port(&com_port).await {
+                log::info!(
+                    "Port {} already has an active modem; stopping unavailable worker to avoid self-contention.",
+                    com_port
+                );
+                self.remove_unavailable_port(&com_port).await;
+                break;
             }
 
             // Full init for ports that look like they have a modem/SIM. Gate this
@@ -359,6 +547,8 @@ impl ModemManager {
             // (each doing several AT round-trips) saturate a shared serial/USB
             // bus on large fleets, so every one of them times out and retries
             // forever, leaving freshly-inserted SIMs stuck as "SIM REMOVED".
+            let port_lock = self.port_open_lock(&com_port).await;
+            let _port_open_guard = port_lock.lock().await;
             let _init_permit = self.init_semaphore.acquire().await;
             match Self::initialize_single_modem_safe(
                 com_port.clone(),
@@ -496,10 +686,52 @@ impl ModemManager {
                     break;
                 }
                 Err(e) => {
-                    log::debug!(
+                    log::warn!(
                         "Port {} quick probe passed but full init failed: {}",
                         com_port, e
                     );
+                    let e_raw = e.to_string();
+                    let e_text = e_raw.to_ascii_lowercase();
+                    let sim_not_ready = e_raw.contains("SIM_NOT_READY")
+                        || e_raw.contains("No SIM detected")
+                        || e_raw.contains("Failed to read SIM ICCID")
+                        || e_raw.contains("SIM_REMOVED");
+                    if sim_not_ready {
+                        self.set_port_module_connected(&com_port, true).await;
+                        if let Some(imei) = Self::extract_imei_from_text(&e_raw) {
+                            self.set_port_last_imei(&com_port, Some(imei)).await;
+                        }
+                        log::info!(
+                            "Port {} modem is present but SIM is not ready/removed yet ({}); keeping fast retry loop.",
+                            com_port,
+                            e_raw
+                        );
+                        self.mark_port_unavailable(&com_port, None).await;
+                        consecutive_init_failures = 0;
+                        tokio::time::sleep(probe_interval).await;
+                        continue;
+                    }
+                    // Another task may have reactivated this port while the init
+                    // attempt was in flight; treat access-denied here as a race
+                    // and stop this worker if a live modem now exists.
+                    if (e_text.contains("access is denied")
+                        || e_text.contains("permission denied")
+                        || e_raw.contains("拒绝访问"))
+                        && self.has_active_modem_on_port(&com_port).await
+                    {
+                        log::warn!(
+                            "Port {} init failed with access denied but modem is now active; stopping unavailable worker.",
+                            com_port
+                        );
+                        self.remove_unavailable_port(&com_port).await;
+                        break;
+                    }
+                    if e_text.contains("access is denied")
+                        || e_text.contains("permission denied")
+                        || e_raw.contains("拒绝访问")
+                    {
+                        self.set_port_module_connected(&com_port, true).await;
+                    }
                     self.mark_port_unavailable(&com_port, None).await;
                     consecutive_init_failures = consecutive_init_failures.saturating_add(1);
                 }
@@ -510,7 +742,7 @@ impl ModemManager {
             } else {
                 (probe_interval.as_secs())
                     .saturating_mul(1_u64 << consecutive_init_failures.min(4))
-                    .min(30)
+                    .min(12)
             };
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         }
@@ -590,6 +822,8 @@ impl ModemManager {
                     lifecycle: PortLifecycle::Unknown,
                     active_sim_id: None,
                     last_sim_id: None,
+                    module_connected: false,
+                    last_imei: None,
                 },
             );
         }
@@ -604,11 +838,14 @@ impl ModemManager {
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
             unavailable_port_tasks: RwLock::new(HashMap::new()),
+            port_open_locks: RwLock::new(HashMap::new()),
             devices: config.devices.clone(),
             force_uk_mcc_to_46001: config.settings.force_uk_mcc_to_46001.unwrap_or(true),
             max_concurrent_modem_init: init_concurrency,
             default_sms_storage: config.settings.sms_storage,
             sim_probe_fail_counts: RwLock::new(HashMap::new()),
+            sim_swap_confirm_streaks: RwLock::new(HashMap::new()),
+            recent_ready_at: RwLock::new(HashMap::new()),
             sim_probe_cooldown_until: RwLock::new(HashMap::new()),
             initialization_complete: RwLock::new(false),
             post_register_recovery_tasks: RwLock::new(HashMap::new()),
@@ -801,9 +1038,12 @@ impl ModemManager {
         let mut probe_futs = FuturesUnordered::new();
         for (index, device) in self.devices.iter().enumerate() {
             let sem = self.probe_semaphore.clone();
+            let mm = self.clone();
             let port = device.com_port.clone();
             let baud_rate = device.baud_rate;
             probe_futs.push(async move {
+                let port_lock = mm.port_open_lock(&port).await;
+                let _port_open_guard = port_lock.lock().await;
                 let _permit = sem.acquire().await;
                 let present = Modem::quick_probe_port(&port, baud_rate).await;
                 (index, port, baud_rate, present)
@@ -860,6 +1100,8 @@ impl ModemManager {
 
             init_futs.push(async move {
                 let generation = mm.begin_port_probe_cycle(&port).await;
+                let port_lock = mm.port_open_lock(&port).await;
+                let _port_open_guard = port_lock.lock().await;
                 let _permit = sem.acquire().await;
                 let result = Self::initialize_single_modem_safe(
                     port.clone(),
@@ -982,36 +1224,110 @@ impl ModemManager {
         )
         .await?;
 
-        // Some virtual COM ports open but are not backed by a real modem.
-        // Keep this probe as advisory only: certain healthy modems can miss the
-        // first quick AT check right after opening and then respond normally.
-        if !modem.is_responsive().await {
+        // Stage 1: verify the modem is actually responsive on this COM port.
+        const MODEM_READY_ATTEMPTS: u8 = 4;
+        const MODEM_READY_DELAY_MS: u64 = 300;
+        let mut modem_alive = false;
+        for attempt in 1..=MODEM_READY_ATTEMPTS {
+            if modem.is_responsive().await {
+                modem_alive = true;
+                break;
+            }
+            if attempt < MODEM_READY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(MODEM_READY_DELAY_MS)).await;
+            }
+        }
+        if !modem_alive {
+            return Err(anyhow::anyhow!(
+                "MODEM_NO_RESPONSE: {} did not respond to AT probes",
+                port
+            ));
+        }
+
+        // Stage 2: probe IMEI early so COM<->modem identity is confirmed.
+        // This is only for display/identity; SIM readiness is decided solely by
+        // AT+CPIN? returning +CPIN: READY in the next stage.
+        const IMEI_READ_ATTEMPTS: u8 = 4;
+        const IMEI_RETRY_DELAY_MS: u64 = 300;
+        let mut imei_seen = false;
+        let mut last_imei: Option<String> = None;
+        for attempt in 1..=IMEI_READ_ATTEMPTS {
+            match modem.get_imei().await {
+                Ok(Some(v)) if !v.trim().is_empty() => {
+                    imei_seen = true;
+                    last_imei = Some(v);
+                    break;
+                }
+                _ => {
+                    if attempt < IMEI_READ_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(IMEI_RETRY_DELAY_MS)).await;
+                    }
+                }
+            }
+        }
+        if !imei_seen {
             log::warn!(
-                "Modem on port {} did not pass initial quick AT probe; continuing with ICCID/init checks.",
+                "IMEI probe did not succeed immediately on {}; continuing to CPIN/SIM checks",
                 port
             );
         }
 
+        // Stage 3: CPIN READY is the only SIM-ready condition.
+        const CPIN_READ_ATTEMPTS: u8 = 8;
+        const CPIN_RETRY_DELAY_MS: u64 = 400;
+        let mut sim_ready = false;
+        let mut last_cpin: Option<String> = None;
+        for attempt in 1..=CPIN_READ_ATTEMPTS {
+            match modem.get_sim_status().await {
+                Ok(Some(status)) => {
+                    last_cpin = Some(status.clone());
+                    if status.trim().eq_ignore_ascii_case("READY") {
+                        sim_ready = true;
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    last_cpin = Some("<empty>".to_string());
+                }
+                Err(e) => {
+                    last_cpin = Some(format!("error: {}", e));
+                }
+            }
+            if attempt < CPIN_READ_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(CPIN_RETRY_DELAY_MS)).await;
+            }
+        }
+        if !sim_ready {
+            return Err(anyhow::anyhow!(
+                "SIM_REMOVED: {} cpin_last={:?} imei={:?}",
+                port,
+                last_cpin,
+                last_imei
+            ));
+        }
+
         // Newly inserted SIMs can take a short moment before ICCID becomes readable.
         // Retry quickly here so hot-inserted cards do not wait for the next worker cycle.
+        const ICCID_READ_ATTEMPTS: u8 = 8;
+        const ICCID_RETRY_DELAY_MS: u64 = 500;
         let mut pre_sim_id = None;
-        for attempt in 1..=3 {
+        for attempt in 1..=ICCID_READ_ATTEMPTS {
             match modem.get_sim_iccid().await {
                 Ok(Some(id)) => {
                     pre_sim_id = Some(id);
                     break;
                 }
                 Ok(None) => {
-                    if attempt < 3 {
-                        tokio::time::sleep(Duration::from_millis(700)).await;
+                    if attempt < ICCID_READ_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(ICCID_RETRY_DELAY_MS)).await;
                         continue;
                     }
                     log::debug!("No SIM detected on port {}, treating as unavailable", port);
                     return Err(anyhow::anyhow!("No SIM detected"));
                 }
                 Err(e) => {
-                    if attempt < 3 {
-                        tokio::time::sleep(Duration::from_millis(700)).await;
+                    if attempt < ICCID_READ_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(ICCID_RETRY_DELAY_MS)).await;
                         continue;
                     }
                     log::debug!(
@@ -1417,8 +1733,17 @@ impl ModemManager {
 
         enum ProbeOutcome {
             Healthy { iccid: String, modem: Arc<Modem> },
-            Swap { iccid: String, com_port: String, modem: Arc<Modem> },
-            ConfirmedAbsent { iccid: String, com_port: String, modem: Arc<Modem> },
+            Swap {
+                iccid: String,
+                com_port: String,
+                modem: Arc<Modem>,
+                new_iccid: String,
+            },
+            ConfirmedAbsent {
+                iccid: String,
+                com_port: String,
+                modem: Arc<Modem>,
+            },
             TransientIssue { iccid: String, com_port: String },
         }
 
@@ -1452,6 +1777,22 @@ impl ModemManager {
                     .map(|s| s.trim().eq_ignore_ascii_case("READY"))
                     .unwrap_or(false);
                 if !status_ready {
+                    let active_on_other_port = mgr
+                        .is_iccid_active_on_other_port(&iccid, &modem.com_port)
+                        .await;
+                    if active_on_other_port {
+                        log::warn!(
+                            "SIM {} on {} is not READY and already active on another port; demoting stale mapping immediately.",
+                            iccid,
+                            modem.com_port
+                        );
+                        return ProbeOutcome::ConfirmedAbsent {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                            modem,
+                        };
+                    }
+
                     let explicit_absent = status
                         .as_deref()
                         .map(|s| {
@@ -1518,7 +1859,45 @@ impl ModemManager {
                         );
                     }
 
-                    if explicit_absent || (!imsi_ok && !status_transient_error && !imsi_transient_error) {
+                    let suspect_error_only_absence =
+                        !explicit_absent && !imsi_ok && !status_transient_error && !imsi_transient_error;
+
+                    if suspect_error_only_absence {
+                        // A single CPIN/IMSI error burst (often +CME 10/3) can
+                        // happen while the modem is still alive; confirm once
+                        // more before counting this as true SIM removal.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let confirm_status = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_status())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten();
+                        let confirm_ready = confirm_status
+                            .as_deref()
+                            .map(|s| s.trim().eq_ignore_ascii_case("READY"))
+                            .unwrap_or(false);
+                        let confirm_iccid = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten();
+                        let confirm_same_iccid = confirm_iccid.as_deref() == Some(iccid.as_str());
+                        if confirm_ready || confirm_same_iccid {
+                            log::info!(
+                                "Ignoring provisional SIM-absent evidence on {} (was {}): confirm probe indicates modem still stable (ready={}, same_iccid={}); keeping modem active.",
+                                modem.com_port,
+                                iccid,
+                                confirm_ready,
+                                confirm_same_iccid
+                            );
+                            return ProbeOutcome::TransientIssue {
+                                iccid,
+                                com_port: modem.com_port.clone(),
+                            };
+                        }
+                    }
+
+                    if explicit_absent {
                         log::info!(
                             "SIM absence evidence on {} (was {}, status={:?}, status_err={:?}, imsi_readable={}, imsi_err={:?}).",
                             modem.com_port, iccid, status, status_error, imsi_ok, imsi_error
@@ -1527,6 +1906,34 @@ impl ModemManager {
                             iccid,
                             com_port: modem.com_port.clone(),
                             modem,
+                        };
+                    }
+
+                    if !imsi_ok && !status_transient_error && !imsi_transient_error {
+                        let recently_ready = mgr
+                            .recent_ready_at
+                            .read()
+                            .await
+                            .get(&modem.com_port)
+                            .copied()
+                            .map(|t| t.elapsed() < Duration::from_secs(180))
+                            .unwrap_or(false);
+                        if recently_ready {
+                            log::warn!(
+                                "Suppressing non-explicit SIM-absent sample on {} (was {}): port was READY within the last 180s; keeping active.",
+                                modem.com_port,
+                                iccid
+                            );
+                        } else {
+                            log::warn!(
+                                "Ignoring non-explicit SIM-absent sample on {} (was {}): explicit SIM REMOVED evidence required for demotion.",
+                                modem.com_port,
+                                iccid
+                            );
+                        }
+                        return ProbeOutcome::TransientIssue {
+                            iccid,
+                            com_port: modem.com_port.clone(),
                         };
                     }
 
@@ -1563,20 +1970,49 @@ impl ModemManager {
                     );
                     mgr.remove_unavailable_port(&modem.com_port).await;
                 }
+                mgr
+                    .recent_ready_at
+                    .write()
+                    .await
+                    .insert(modem.com_port.clone(), Instant::now());
 
                 match tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid()).await {
                     Ok(Ok(Some(current_iccid))) if current_iccid == iccid => {
                         ProbeOutcome::Healthy { iccid, modem }
                     }
                     Ok(Ok(Some(current_iccid))) => {
-                        info!(
-                            "SIM swap detected on {} (was {}, now {}). Forcing re-init.",
-                            modem.com_port, iccid, current_iccid
-                        );
-                        ProbeOutcome::Swap {
-                            iccid,
-                            com_port: modem.com_port.clone(),
-                            modem,
+                        // A single mismatched ICCID read can be a transient parse/
+                        // queue artifact under heavy load; require one immediate
+                        // confirmation read before demoting a live READY modem.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let confirm = tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten();
+                        if confirm.as_deref() == Some(current_iccid.as_str()) {
+                            info!(
+                                "SIM swap confirmed on {} (was {}, now {}). Forcing re-init.",
+                                modem.com_port, iccid, current_iccid
+                            );
+                            ProbeOutcome::Swap {
+                                iccid,
+                                com_port: modem.com_port.clone(),
+                                modem,
+                                new_iccid: current_iccid,
+                            }
+                        } else {
+                            log::warn!(
+                                "Ignoring unconfirmed ICCID mismatch on {} (was {}, first_read={}, confirm={:?}); keeping modem active.",
+                                modem.com_port,
+                                iccid,
+                                current_iccid,
+                                confirm
+                            );
+                            ProbeOutcome::TransientIssue {
+                                iccid,
+                                com_port: modem.com_port.clone(),
+                            }
                         }
                     }
                     Ok(Ok(None)) => {
@@ -1622,6 +2058,7 @@ impl ModemManager {
                 ProbeOutcome::Healthy { iccid, modem } => {
                     let port_key = modem.com_port.clone();
                     self.sim_probe_fail_counts.write().await.remove(&port_key);
+                    self.sim_swap_confirm_streaks.write().await.remove(&port_key);
                     self.sim_probe_cooldown_until.write().await.remove(&port_key);
 
                     // `port_runtime` was already reaffirmed to Active right after the
@@ -1689,11 +2126,58 @@ impl ModemManager {
                         }
                     }
                 }
-                ProbeOutcome::Swap { iccid, com_port, modem } => {
+                ProbeOutcome::Swap {
+                    iccid,
+                    com_port,
+                    modem,
+                    new_iccid,
+                } => {
+                    let seen_on_other_port = self
+                        .is_iccid_active_on_other_port(&new_iccid, &com_port)
+                        .await;
+                    // Under high multi-port load, occasional cross-port ICCID bleed
+                    // can produce a plausible but wrong "new ICCID" sample. Require
+                    // more consistent samples before demoting as swap.
+                    let required_streak: u8 = if seen_on_other_port { 6 } else { 3 };
+                    let confirm_swap = {
+                        let mut streaks = self.sim_swap_confirm_streaks.write().await;
+                        let entry = streaks
+                            .entry(com_port.clone())
+                            .or_insert((new_iccid.clone(), 0));
+                        if entry.0 == new_iccid {
+                            entry.1 = entry.1.saturating_add(1);
+                        } else {
+                            *entry = (new_iccid.clone(), 1);
+                        }
+                        entry.1 >= required_streak
+                    };
+                    if !confirm_swap {
+                        log::warn!(
+                            "Holding swap sample on {} (was {}, saw {}, active_on_other_port={}) until {}/{} consistent cycle(s).",
+                            com_port,
+                            iccid,
+                            new_iccid,
+                            seen_on_other_port,
+                            self.sim_swap_confirm_streaks
+                                .read()
+                                .await
+                                .get(&com_port)
+                                .map(|v| v.1)
+                                .unwrap_or(0),
+                            required_streak
+                        );
+                        continue;
+                    }
+                    self.sim_swap_confirm_streaks.write().await.remove(&com_port);
                     self.sim_probe_fail_counts.write().await.remove(&com_port);
                     demotions.push((iccid, com_port, modem));
                 }
-                ProbeOutcome::ConfirmedAbsent { iccid, com_port, modem } => {
+                ProbeOutcome::ConfirmedAbsent {
+                    iccid,
+                    com_port,
+                    modem,
+                } => {
+                    self.sim_swap_confirm_streaks.write().await.remove(&com_port);
                     let in_cooldown = self
                         .sim_probe_cooldown_until
                         .read()
@@ -1717,9 +2201,11 @@ impl ModemManager {
                         *count
                     };
 
-                    if failures >= SIM_PROBE_FAILURE_THRESHOLD {
+                    let required_failures = SIM_PROBE_FAILURE_THRESHOLD;
+
+                    if failures >= required_failures {
                         info!(
-                            "SIM probe failed {} times on {} (was {}). Marking port as unavailable.",
+                            "SIM probe explicitly failed {} times on {} (was {}). Marking port as unavailable.",
                             failures, com_port, iccid
                         );
                         self.sim_probe_fail_counts.write().await.remove(&com_port);
@@ -1736,7 +2222,7 @@ impl ModemManager {
                         log::debug!(
                             "Transient SIM probe failure {}/{} on {} (SIM {}). Keeping modem active.",
                             failures,
-                            SIM_PROBE_FAILURE_THRESHOLD,
+                            required_failures,
                             com_port,
                             iccid
                         );

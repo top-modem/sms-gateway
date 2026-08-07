@@ -100,15 +100,35 @@ fn format_memory_status(memory_status: &str) -> String {
     memory_status.to_string()
 }
 
-fn resolve_sim_status(sim_status: Option<String>, has_sim: bool, available: bool) -> Option<String> {
+fn resolve_sim_status(
+    sim_status: Option<String>,
+    has_sim: bool,
+    available: bool,
+    has_recent_imei: bool,
+) -> Option<String> {
     if has_sim {
         return sim_status.filter(|status| !status.trim().is_empty());
     }
 
-    if available {
-        Some("NO SIM".to_string())
-    } else {
+    let _ = available;
+    if has_recent_imei {
         Some("SIM REMOVED".to_string())
+    } else {
+        Some("DISCONNECTED".to_string())
+    }
+}
+
+fn resolve_runtime_fallback_status(
+    module_connected: bool,
+    has_historical_sim: bool,
+    has_recent_imei: bool,
+) -> String {
+    if has_recent_imei {
+        let _ = has_historical_sim;
+        "SIM REMOVED".to_string()
+    } else {
+        let _ = module_connected;
+        "DISCONNECTED".to_string()
     }
 }
 
@@ -123,12 +143,26 @@ mod tests {
 
     #[test]
     fn resolves_removed_state_for_unavailable_ports() {
-        assert_eq!(resolve_sim_status(None, false, false), Some("SIM REMOVED".to_string()));
+        assert_eq!(
+            resolve_sim_status(None, false, false, true),
+            Some("SIM REMOVED".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_disconnected_when_imei_is_missing() {
+        assert_eq!(
+            resolve_sim_status(None, false, false, false),
+            Some("DISCONNECTED".to_string())
+        );
     }
 
     #[test]
     fn preserves_live_status_for_inserted_sims() {
-        assert_eq!(resolve_sim_status(Some("READY".to_string()), true, true), Some("READY".to_string()));
+        assert_eq!(
+            resolve_sim_status(Some("READY".to_string()), true, true, false),
+            Some("READY".to_string())
+        );
     }
 }
 
@@ -521,6 +555,11 @@ async fn get_all_sim_info(
 
     let handler_start = std::time::Instant::now();
 
+    // Self-heal stale runtime lifecycle before taking snapshots used by the
+    // dashboard response. This keeps a live port from being shown as
+    // "SIM REMOVED" when runtime state drifted out of sync.
+    modem_manager.sync_port_runtime_with_live_modems().await;
+
     fn to_data_error<T, E: ToString>(result: Result<T, E>) -> (Option<T>, Option<String>) {
         match result {
             Ok(data) => (Some(data), None),
@@ -559,7 +598,7 @@ async fn get_all_sim_info(
                     Ok(Err(anyhow::anyhow!("eSIM session active")))
                 }
 
-                let (
+                    let (
                     signal_result,
                     network_result,
                     operator_result,
@@ -570,21 +609,19 @@ async fn get_all_sim_info(
                     imei_result,
                 ) = if esim_active {
                     (
-                        skip(), skip(), skip(), skip(),
-                        skip(), skip(), skip(), skip(),
+                        skip::<Option<crate::modem::types::SignalQuality>>(),
+                        skip::<Option<crate::modem::types::NetworkRegistrationStatus>>(),
+                        skip::<Option<crate::modem::types::OperatorInfo>>(),
+                        skip::<Option<crate::modem::types::ModemInfo>>(),
+                        skip::<Option<String>>(),
+                        skip::<Option<String>>(),
+                        skip::<Option<String>>(),
+                        skip::<Option<String>>(),
                     )
                 } else {
-                    // 并发执行所有AT命令，每个都有超时保护
-                    //
-                    // NOTE: This handler shares each modem's single-lane AT command
-                    // queue with background workers (SMS-read poll, SIM-presence
-                    // recheck). If a background command is already in flight when
-                    // this request arrives, these futures queue behind it. Using a
-                    // short timeout here means a queued/contended port fails fast
-                    // (returns nulls for that field) instead of blocking the whole
-                    // HTTP response for seconds — the frontend re-polls periodically
-                    // so the data fills in on the next cycle.
-                    const LIVE_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
+                    // Rollback to full live SIM info reads for dashboard fields,
+                    // while keeping per-field timeouts to avoid long request stalls.
+                    const LIVE_STATUS_TIMEOUT: Duration = Duration::from_millis(900);
                     let signal_future = timeout(
                         LIVE_STATUS_TIMEOUT,
                         modem_manager.get_signal_quality(&sim_id),
@@ -597,6 +634,10 @@ async fn get_all_sim_info(
                         LIVE_STATUS_TIMEOUT,
                         modem_manager.check_operator(&sim_id),
                     );
+                    let sim_status_future = timeout(
+                        LIVE_STATUS_TIMEOUT,
+                        modem_manager.get_sim_status(&sim_id),
+                    );
                     let model_future = timeout(
                         LIVE_STATUS_TIMEOUT,
                         modem_manager.get_modem_model(&sim_id),
@@ -604,10 +645,6 @@ async fn get_all_sim_info(
                     let sms_center_future = timeout(
                         LIVE_STATUS_TIMEOUT,
                         modem_manager.get_sms_center(&sim_id),
-                    );
-                    let sim_status_future = timeout(
-                        LIVE_STATUS_TIMEOUT,
-                        modem_manager.get_sim_status(&sim_id),
                     );
                     let memory_status_future = timeout(
                         LIVE_STATUS_TIMEOUT,
@@ -708,6 +745,7 @@ async fn get_all_sim_info(
 
     // 构建响应数据
     let mut details = Vec::new();
+    const STATUS_TRACE_PORTS: [&str; 3] = ["COM91", "COM92", "COM96"];
     for (
         sim_id,
         com_port,
@@ -732,9 +770,15 @@ async fn get_all_sim_info(
     {
         let (sim_data, _sim_error): (Option<SimCard>, Option<String>) = (sim_data, None);
 
-        // Determine if this modem has a SIM card inserted
-        let has_sim = !sim_id.starts_with("fallback_sim_");
+        let sim_status_value = sim_status_data.flatten();
+        // SIM presence is defined only by CPIN READY.
+        let cpin_ready = sim_status_value
+            .as_deref()
+            .map(|v| v.trim().eq_ignore_ascii_case("READY"))
+            .unwrap_or(false);
+        let has_sim = cpin_ready && !sim_id.starts_with("fallback_sim_");
         let json_sim_id: Option<&str> = if has_sim { Some(&sim_id) } else { None };
+        let available = has_sim;
 
         // Get the SIM card effective alias for display
         let _display_name = if let Some(ref sim) = sim_data {
@@ -744,12 +788,32 @@ async fn get_all_sim_info(
         };
 
         let phone_number = sim_data.as_ref().and_then(|s| s.phone_number.clone());
+        let resolved_sim_status = resolve_sim_status(
+            sim_status_value.clone(),
+            has_sim,
+            available,
+            imei_data.is_some(),
+        );
+
+        if STATUS_TRACE_PORTS.contains(&com_port.as_str()) {
+            log::warn!(
+                "[sims/info][trace][active] port={} sim_id={} cpin_raw={:?} cpin_ready={} has_sim={} available={} imei_present={} resolved_status={:?}",
+                com_port,
+                sim_id,
+                sim_status_value,
+                cpin_ready,
+                has_sim,
+                available,
+                imei_data.is_some(),
+                resolved_sim_status
+            );
+        }
 
         details.push(json!({
-            "available": true,
+            "available": available,
             "sim_id": json_sim_id,
             "has_sim": has_sim,
-            "name": sim_id.clone(),
+            "name": if has_sim { Some(sim_id.clone()) } else { None },
             "com_port": com_port,
             "baud_rate": baud_rate,
             "signal_quality": if has_sim { signal_data } else { None },
@@ -758,7 +822,7 @@ async fn get_all_sim_info(
             "model_info": model_data,
             "imei": imei_data,
             "sms_center": if has_sim { sms_center_data.as_ref().and_then(|s| s.as_ref()).map(|s| decode_sms_center(s)) } else { None },
-            "sim_status": resolve_sim_status(sim_status_data.flatten(), has_sim, true),
+            "sim_status": resolved_sim_status,
             "memory_status": if has_sim { memory_status_data.as_ref().and_then(|s| s.as_ref()).map(|s| format_memory_status(s)) } else { None },
             "phone_number": if has_sim { phone_number } else { None }
         }));
@@ -768,36 +832,59 @@ async fn get_all_sim_info(
         .iter()
         .filter_map(|entry| entry["com_port"].as_str().map(str::to_owned))
         .collect();
-    let active_sim_ids: std::collections::HashSet<String> = details
-        .iter()
-        .filter_map(|entry| entry["sim_id"].as_str().map(str::to_owned))
-        .collect();
-
     for snapshot in port_snapshots {
         if active_ports.contains(&snapshot.com_port) {
             continue;
         }
 
-        let last_known = modem_manager
-            .get_last_known_sim_card_for_port(&snapshot.com_port)
-            .await
-            .filter(|card| !active_sim_ids.contains(&card.id));
+        let has_historical_sim = snapshot.last_sim_id.is_some();
+        let available = snapshot.active_sim_id.is_some()
+            && matches!(snapshot.lifecycle, crate::modem::manager::PortLifecycle::Active);
+        let fallback_status = if !available {
+            Some(resolve_runtime_fallback_status(
+                snapshot.module_connected,
+                has_historical_sim,
+                snapshot.last_imei.is_some(),
+            ))
+        } else {
+            resolve_sim_status(
+                None,
+                snapshot.active_sim_id.is_some(),
+                available,
+                snapshot.last_imei.is_some(),
+            )
+        };
+
+        if STATUS_TRACE_PORTS.contains(&snapshot.com_port.as_str()) {
+            log::warn!(
+                "[sims/info][trace][fallback] port={} lifecycle={:?} has_active_sim={} has_last_sim={} module_connected={} imei_present={} available={} resolved_status={:?}",
+                snapshot.com_port,
+                snapshot.lifecycle,
+                snapshot.active_sim_id.is_some(),
+                has_historical_sim,
+                snapshot.module_connected,
+                snapshot.last_imei.is_some(),
+                available,
+                fallback_status
+            );
+        }
+
         details.push(json!({
-            "available": snapshot.active_sim_id.is_some() && matches!(snapshot.lifecycle, crate::modem::manager::PortLifecycle::Active),
-            "sim_id": snapshot.active_sim_id.clone().or_else(|| last_known.as_ref().map(|card| card.id.clone())),
+            "available": available,
+            "sim_id": snapshot.active_sim_id.clone(),
             "has_sim": snapshot.active_sim_id.is_some(),
-            "name": last_known.as_ref().map(|card| card.id.clone()),
+            "name": snapshot.active_sim_id.clone(),
             "com_port": snapshot.com_port,
             "baud_rate": snapshot.baud_rate,
             "signal_quality": null,
             "network_registration": null,
             "operator_info": null,
             "model_info": null,
-            "imei": null,
+            "imei": if available { Option::<String>::None } else { snapshot.last_imei.clone() },
             "sms_center": null,
-            "sim_status": resolve_sim_status(None, snapshot.active_sim_id.is_some(), snapshot.active_sim_id.is_some() && matches!(snapshot.lifecycle, crate::modem::manager::PortLifecycle::Active)),
+            "sim_status": fallback_status,
             "memory_status": null,
-            "phone_number": last_known.and_then(|card| card.phone_number)
+            "phone_number": null
         }));
     }
 

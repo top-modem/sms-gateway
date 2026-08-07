@@ -63,6 +63,38 @@
     return 0;
   }
 
+  function getSimStatusBadge(statusRaw) {
+    const status = String(statusRaw ?? '').trim().toUpperCase();
+    if (status === 'RECONNECTING') {
+      return {
+        label: $t('sim_reconnecting'),
+        cls: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
+      };
+    }
+    if (status === 'DISCONNECTED') {
+      return {
+        label: $t('sim_disconnected'),
+        cls: 'bg-gray-100 dark:bg-zinc-700 text-gray-500 dark:text-gray-400'
+      };
+    }
+    if (status === 'SIM REMOVED') {
+      return {
+        label: $t('sim_removed'),
+        cls: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+      };
+    }
+    if (status === 'NO SIM') {
+      return {
+        label: $t('sim_removed'),
+        cls: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+      };
+    }
+    return {
+      label: statusRaw,
+      cls: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+    };
+  }
+
   // COM port sort key: "COM12" → 12
   function comPortNum(port) {
     const m = (port ?? '').match(/(\d+)$/);
@@ -498,13 +530,14 @@
                   {#if hasSim}
                     <span class="{net.cls}">{net.key ? $t(net.key, { n: net.codeN }) : '—'}</span>
                   {:else if info.sim_status}
-                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">
-                      {info.sim_status}
+                    {@const statusBadge = getSimStatusBadge(info.sim_status)}
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium {statusBadge.cls}">
+                      {statusBadge.label}
                     </span>
                   {:else if info.available === false}
                     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">{$t('sim_removed')}</span>
                   {:else}
-                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-gray-100 dark:bg-zinc-700 text-gray-500 dark:text-gray-400">{$t('no_sim')}</span>
+                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">{$t('sim_removed')}</span>
                   {/if}
                 </td>
 
@@ -596,11 +629,7 @@
 
                 <!-- IMEI -->
                 <td class="px-3 py-2.5 font-mono text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                  {#if info.available === false}
-                    <span class="text-gray-400">—</span>
-                  {:else}
-                    {info.imei ?? '—'}
-                  {/if}
+                  {info.imei ?? '—'}
                 </td>
               </tr>
             {/each}

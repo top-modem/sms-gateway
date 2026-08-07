@@ -222,6 +222,19 @@ impl Drop for Modem {
     }
 }
 
+impl Modem {
+    /// Release the serial port immediately, without waiting for every `Arc<Modem>`
+    /// clone to be dropped. The reader task auto-reconnects on I/O errors, so a
+    /// lingering clone would otherwise keep re-opening the COM port and block any
+    /// attempt to re-initialize the modem on it.
+    pub async fn shutdown(&self) {
+        self.reader_task.abort();
+        self.command_task.abort();
+        *self.write_half.lock().await = None;
+        *self._connection_state.write().await = ConnectionState::Disconnected;
+    }
+}
+
 /// eSIM machine support. On these devices each COM port has two modes: a normal
 /// SMS mode and an eSIM-management mode. The mode is toggled with vendor AT
 /// commands over the same serial port; the actual eUICC/profile work is done

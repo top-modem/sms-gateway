@@ -59,6 +59,12 @@ pub struct ModemManager {
     /// Semaphore shared by unavailable-port quick probes to limit concurrent
     /// serial port opens (especially important on large USB hubs).
     probe_semaphore: Arc<Semaphore>,
+    /// Semaphore shared by EVERY full modem initialization (startup phase AND
+    /// the per-port reconnect workers) so a burst of newly-inserted SIMs on a
+    /// large fleet can never all negotiate AT commands over the shared serial
+    /// bus at once; unbounded concurrency here caused inits to stall/timeout
+    /// indefinitely and left freshly-inserted SIMs stuck as "SIM REMOVED".
+    init_semaphore: Arc<Semaphore>,
     /// Background URC tasks keyed by COM port so duplicate ICCIDs stay independent.
     urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
@@ -173,6 +179,33 @@ impl ModemManager {
         }
     }
 
+    /// Force `port_runtime` back in sync with a modem that is live in `self.modems`.
+    /// The API renders the dashboard from `port_runtime` alone, so a port whose
+    /// runtime state drifted out of `Active` shows as "SIM REMOVED" forever even
+    /// though the modem keeps answering AT+CPIN? normally.
+    async fn reaffirm_port_active(&self, com_port: &str, sim_id: &str) -> bool {
+        let generation = self.port_runtime_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut runtime = self.port_runtime.write().await;
+        let entry = runtime.entry(com_port.to_string()).or_insert(PortRuntimeState {
+            generation,
+            lifecycle: PortLifecycle::Unknown,
+            active_sim_id: None,
+            last_sim_id: None,
+        });
+        let was_stale = entry.lifecycle != PortLifecycle::Active
+            || entry.active_sim_id.as_deref() != Some(sim_id);
+        entry.generation = generation;
+        entry.lifecycle = PortLifecycle::Active;
+        entry.active_sim_id = Some(sim_id.to_string());
+        entry.last_sim_id = Some(sim_id.to_string());
+        was_stale
+    }
+
+    /// Whether a live modem is currently registered on this COM port.
+    async fn has_active_modem_on_port(&self, com_port: &str) -> bool {
+        self.modems.read().await.contains_key(com_port)
+    }
+
     pub async fn get_port_runtime_snapshots(&self) -> Vec<PortRuntimeSnapshot> {
         let runtime = self.port_runtime.read().await;
         self.devices
@@ -218,6 +251,18 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
+        // Never mark a port that still hosts a live modem as unavailable: the
+        // dashboard reads `port_runtime`, so it would report "SIM REMOVED" while
+        // the modem keeps working, and the spawned worker would fight the live
+        // modem for the serial port and never succeed.
+        if self.has_active_modem_on_port(&com_port).await {
+            log::debug!(
+                "Skipping unavailable-port registration for {}: a live modem is still active on it.",
+                com_port
+            );
+            return;
+        }
+
         self.mark_port_unavailable(&com_port, None).await;
 
         let mut ports = self.unavailable_ports.write().await;
@@ -309,7 +354,12 @@ impl ModemManager {
                 probe_miss_streak = 0;
             }
 
-            // Full init for ports that look like they have a modem/SIM.
+            // Full init for ports that look like they have a modem/SIM. Gate this
+            // behind the shared init semaphore: unbounded concurrent full inits
+            // (each doing several AT round-trips) saturate a shared serial/USB
+            // bus on large fleets, so every one of them times out and retries
+            // forever, leaving freshly-inserted SIMs stuck as "SIM REMOVED".
+            let _init_permit = self.init_semaphore.acquire().await;
             match Self::initialize_single_modem_safe(
                 com_port.clone(),
                 baud_rate,
@@ -374,12 +424,12 @@ impl ModemManager {
 
                     if !self.mark_port_active(&com_port, &sim_id, generation).await {
                         log::debug!(
-                            "Ignoring stale promotion result for {} on {} (generation {})",
+                            "Stale generation for {} on {} (generation {}); reaffirming active state instead of dropping this healthy modem.",
                             sim_id,
                             com_port,
                             generation
                         );
-                        continue;
+                        self.reaffirm_port_active(&com_port, &sim_id).await;
                     }
 
                     info!(
@@ -550,6 +600,7 @@ impl ModemManager {
             port_runtime: Arc::new(RwLock::new(port_runtime)),
             last_known_sim_ids_by_port: Arc::new(RwLock::new(HashMap::new())),
             probe_semaphore: Arc::new(Semaphore::new(probe_concurrency)),
+            init_semaphore: Arc::new(Semaphore::new(init_concurrency)),
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
             unavailable_port_tasks: RwLock::new(HashMap::new()),
@@ -783,7 +834,10 @@ impl ModemManager {
 
         // ── Phase 2: full initialization only on ports that passed the probe ───
         let mut new_sim_ids = Vec::new();
-        let init_semaphore = Arc::new(Semaphore::new(max_concurrent));
+        // Share the same semaphore the reconnect workers use, so startup
+        // inits and later hot-insert inits never together exceed the bus's
+        // safe concurrency.
+        let init_semaphore = self.init_semaphore.clone();
         let mut init_futs = FuturesUnordered::new();
 
         let init_candidates: Vec<usize> = if probed_present.is_empty() {
@@ -830,7 +884,12 @@ impl ModemManager {
                     let modem_arc = Arc::new(modem);
                     // Make the active modem visible to the API immediately,
                     // rather than waiting for the whole initialization pass.
-                    self.mark_port_active(&port, &sim_id, generation).await;
+                    // The modem goes into `self.modems`, so its runtime state must
+                    // become Active even if a concurrent probe cycle bumped the
+                    // generation; otherwise the port renders as "SIM REMOVED".
+                    if !self.mark_port_active(&port, &sim_id, generation).await {
+                        self.reaffirm_port_active(&port, &sim_id).await;
+                    }
                     self.set_last_known_sim_port(&port, &sim_id).await;
                     // Key the modem by its physical COM port, not by SIM id.
                     self.modems.write().await.insert(port.clone(), modem_arc);
@@ -1365,6 +1424,7 @@ impl ModemManager {
 
         let mut demotion_futs = FuturesUnordered::new();
         for (iccid, modem) in active_entries {
+            let mgr = self.clone();
             demotion_futs.push(async move {
                 // AT+CPIN? is the most reliable indicator of physical SIM presence.
                 // If the SIM is pulled out, the modem typically reports
@@ -1373,11 +1433,20 @@ impl ModemManager {
                 // whole recheck cycle, while still tolerating shared-bus latency
                 // spikes on large fleets (e.g. COM1-96 modem-pool boards) that
                 // would otherwise be misread as SIM removal.
-                let status = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_status())
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .flatten();
+                let status_probe = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_status()).await;
+                let mut status: Option<String> = None;
+                let mut status_error: Option<String> = None;
+                match status_probe {
+                    Ok(Ok(v)) => {
+                        status = v;
+                    }
+                    Ok(Err(e)) => {
+                        status_error = Some(e.to_string());
+                    }
+                    Err(_) => {
+                        status_error = Some("timeout".to_string());
+                    }
+                }
                 let status_ready = status
                     .as_deref()
                     .map(|s| s.trim().eq_ignore_ascii_case("READY"))
@@ -1398,18 +1467,61 @@ impl ModemManager {
                     // (e.g. +CME ERROR: 10). Corroborate with a fresh IMSI read:
                     // a physically absent SIM cannot return a valid IMSI, while a
                     // transient CPIN glitch on a present SIM still can.
-                    let imsi_ok = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_imsi())
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .flatten()
-                        .map(|v| !v.trim().is_empty())
+                    let status_transient_error = status_error
+                        .as_deref()
+                        .map(|e| {
+                            let lower = e.to_ascii_lowercase();
+                            lower.contains("backlogged")
+                                || lower.contains("wouldblock")
+                                || lower.contains("timeout")
+                                || lower.contains("timed out")
+                        })
                         .unwrap_or(false);
 
-                    if explicit_absent || !imsi_ok {
+                    let imsi_probe = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_imsi()).await;
+                    let mut imsi_value: Option<String> = None;
+                    let mut imsi_error: Option<String> = None;
+                    match imsi_probe {
+                        Ok(Ok(v)) => {
+                            imsi_value = v;
+                        }
+                        Ok(Err(e)) => {
+                            imsi_error = Some(e.to_string());
+                        }
+                        Err(_) => {
+                            imsi_error = Some("timeout".to_string());
+                        }
+                    }
+                    let imsi_ok = imsi_value
+                        .as_deref()
+                        .map(|v| !v.trim().is_empty())
+                        .unwrap_or(false);
+                    let imsi_transient_error = imsi_error
+                        .as_deref()
+                        .map(|e| {
+                            let lower = e.to_ascii_lowercase();
+                            lower.contains("backlogged")
+                                || lower.contains("wouldblock")
+                                || lower.contains("timeout")
+                                || lower.contains("timed out")
+                        })
+                        .unwrap_or(false);
+
+                    if status_transient_error || imsi_transient_error {
                         log::info!(
-                            "SIM absence evidence on {} (was {}, status={:?}, imsi_readable={}).",
-                            modem.com_port, iccid, status, imsi_ok
+                            "SIM probe on {} classified as transient queue/timeout pressure (was {}, status={:?}, status_err={:?}, imsi_err={:?}); keeping modem active.",
+                            modem.com_port,
+                            iccid,
+                            status,
+                            status_error,
+                            imsi_error
+                        );
+                    }
+
+                    if explicit_absent || (!imsi_ok && !status_transient_error && !imsi_transient_error) {
+                        log::info!(
+                            "SIM absence evidence on {} (was {}, status={:?}, status_err={:?}, imsi_readable={}, imsi_err={:?}).",
+                            modem.com_port, iccid, status, status_error, imsi_ok, imsi_error
                         );
                         return ProbeOutcome::ConfirmedAbsent {
                             iccid,
@@ -1418,9 +1530,14 @@ impl ModemManager {
                         };
                     }
 
-                    log::debug!(
-                        "SIM status on {} is inconclusive but IMSI still readable (was {}, status={:?}); keeping modem active.",
-                        modem.com_port, iccid, status
+                    log::warn!(
+                        "SIM probe on {} is inconclusive/transient (was {}, status={:?}, status_err={:?}, imsi_readable={}, imsi_err={:?}); keeping modem active.",
+                        modem.com_port,
+                        iccid,
+                        status,
+                        status_error,
+                        imsi_ok,
+                        imsi_error
                     );
                     return ProbeOutcome::TransientIssue {
                         iccid,
@@ -1432,6 +1549,21 @@ impl ModemManager {
                     "SIM status on {} is READY (was {}); checking ICCID for stale cached state.",
                     modem.com_port, iccid
                 );
+
+                // The modem just proved it is READY, independent of whatever the
+                // subsequent ICCID re-check below returns. `port_runtime` (what the
+                // API/dashboard reads) must reflect that now: if it had drifted
+                // out of Active for any reason, a flaky/timed-out ICCID re-check
+                // below would otherwise leave it stuck reporting "SIM REMOVED"
+                // forever even though this modem is demonstrably alive.
+                if mgr.reaffirm_port_active(&modem.com_port, &iccid).await {
+                    log::warn!(
+                        "[recheck] Port {} hosts READY SIM {} but runtime state had drifted; restored to Active.",
+                        modem.com_port, iccid
+                    );
+                    mgr.remove_unavailable_port(&modem.com_port).await;
+                }
+
                 match tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid()).await {
                     Ok(Ok(Some(current_iccid))) if current_iccid == iccid => {
                         ProbeOutcome::Healthy { iccid, modem }
@@ -1491,6 +1623,10 @@ impl ModemManager {
                     let port_key = modem.com_port.clone();
                     self.sim_probe_fail_counts.write().await.remove(&port_key);
                     self.sim_probe_cooldown_until.write().await.remove(&port_key);
+
+                    // `port_runtime` was already reaffirmed to Active right after the
+                    // READY probe above (before this ICCID re-check ran), so nothing
+                    // further to do here for dashboard state.
 
                     // Ensure the sim_cards DB row exists and has the current IMSI.
                     // A transient demotion may have deleted the row while the modem
@@ -1659,6 +1795,13 @@ impl ModemManager {
                     "[recheck] Skipped demotion of {} on {}: active entry was already replaced (SIM re-detected on another port).",
                     iccid, com_port
                 );
+            }
+
+            // Release the serial port explicitly. The reader task auto-reconnects on
+            // I/O errors, so any lingering Arc clone would keep re-opening this COM
+            // port and permanently block the reconnect worker from re-initializing it.
+            if removed {
+                probed_modem.shutdown().await;
             }
 
             // Whether the entry was removed or replaced, the probed modem on this

@@ -22,6 +22,7 @@ use crate::{
     config::SmsStorage,
     db::{AppSetting, BarcodeScan, Call, Contact, Conversation, SimCard, Sms},
     firefox_api,
+    modem::manager::TranscribeConfig,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
     phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
     service_control,
@@ -35,6 +36,13 @@ static PHONE_NUMBER_TASK: OnceLock<TaskHandle> = OnceLock::new();
 struct CallState {
     mm: ModemManagerRef,
     sse: Arc<SseManager>,
+}
+
+#[derive(Clone)]
+struct RestartPortsState {
+    mm: ModemManagerRef,
+    sse: Arc<SseManager>,
+    transcribe_cfg: Option<Arc<TranscribeConfig>>,
 }
 
 #[derive(Clone)]
@@ -179,6 +187,7 @@ pub async fn run_api(
     username: &str,
     password: &str,
     sse_manager: Arc<SseManager>,
+    transcribe_cfg: Option<Arc<TranscribeConfig>>,
     barcode_output_file: Option<String>,
     barcode_launcher_path: Option<String>,
     #[cfg(not(feature = "mock-data"))] esim_service: Arc<crate::esim::EsimService>,
@@ -223,6 +232,14 @@ pub async fn run_api(
         .route(
             "/sims/re-register",
             post(re_register_sims).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/sims/restart-ports",
+            post(restart_ports).with_state(RestartPortsState {
+                mm: modem_manager.clone(),
+                sse: sse_manager.clone(),
+                transcribe_cfg: transcribe_cfg.clone(),
+            }),
         )
         .route(
             "/sims/{sim_id}/info",
@@ -568,13 +585,18 @@ async fn get_all_sim_info(
     }
 
     let port_snapshots = modem_manager.get_port_runtime_snapshots().await;
+    let manual_restarting_ports = modem_manager.get_manual_restarting_ports().await;
+    let identity_revalidating_ports = modem_manager.get_identity_revalidating_ports().await;
     log::warn!(
         "[sims/info] snapshots fetched after {}ms",
         handler_start.elapsed().as_millis()
     );
     let modem_futures: Vec<_> = port_snapshots
         .iter()
-        .filter(|snapshot| snapshot.active_sim_id.is_some())
+        .filter(|snapshot| {
+            snapshot.active_sim_id.is_some()
+                && !identity_revalidating_ports.contains(&snapshot.com_port)
+        })
         .map(|snapshot| {
             let sim_id = snapshot.active_sim_id.clone().unwrap_or_default();
             let com_port = snapshot.com_port.clone();
@@ -839,8 +861,18 @@ async fn get_all_sim_info(
 
         let has_historical_sim = snapshot.last_sim_id.is_some();
         let available = snapshot.active_sim_id.is_some()
+            && !manual_restarting_ports.contains(&snapshot.com_port)
+            && !identity_revalidating_ports.contains(&snapshot.com_port)
             && matches!(snapshot.lifecycle, crate::modem::manager::PortLifecycle::Active);
-        let fallback_status = if !available {
+        let reconnecting = manual_restarting_ports.contains(&snapshot.com_port)
+            || identity_revalidating_ports.contains(&snapshot.com_port)
+            || matches!(
+                snapshot.lifecycle,
+                crate::modem::manager::PortLifecycle::Probing
+            );
+        let fallback_status = if reconnecting {
+            Some("RECONNECTING".to_string())
+        } else if !available {
             Some(resolve_runtime_fallback_status(
                 snapshot.module_connected,
                 has_historical_sim,
@@ -871,9 +903,9 @@ async fn get_all_sim_info(
 
         details.push(json!({
             "available": available,
-            "sim_id": snapshot.active_sim_id.clone(),
-            "has_sim": snapshot.active_sim_id.is_some(),
-            "name": snapshot.active_sim_id.clone(),
+            "sim_id": if available { snapshot.active_sim_id.clone() } else { None },
+            "has_sim": available,
+            "name": if available { snapshot.active_sim_id.clone() } else { None },
             "com_port": snapshot.com_port,
             "baud_rate": snapshot.baud_rate,
             "signal_quality": null,
@@ -913,6 +945,78 @@ struct AtCommandRequest {
 #[derive(Deserialize)]
 struct ForceRegisterRequest {
     sim_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RestartPortsRequest {
+    com_ports: Vec<String>,
+}
+
+async fn restart_ports(
+    State(state): State<RestartPortsState>,
+    Json(request): Json<RestartPortsRequest>,
+) -> Response {
+    if request.com_ports.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "com_ports is required"})),
+        )
+            .into_response();
+    }
+
+    let configured: HashMap<String, String> = state
+        .mm
+        .configured_ports()
+        .into_iter()
+        .map(|(port, _)| (port.to_ascii_uppercase(), port))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+
+    for requested in request.com_ports {
+        let normalized = requested.trim().to_ascii_uppercase();
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+
+        let Some(com_port) = configured.get(&normalized).cloned() else {
+            rejected.push(json!({
+                "com_port": requested,
+                "success": false,
+                "message": "Unknown configured COM port",
+            }));
+            continue;
+        };
+
+        accepted.push(json!({
+            "com_port": com_port,
+            "success": true,
+            "message": "Restart accepted",
+        }));
+
+        let mm = state.mm.clone();
+        let sse = state.sse.clone();
+        let transcribe_cfg = state.transcribe_cfg.clone();
+        tokio::spawn(async move {
+            if let Err(error) = mm
+                .restart_port(&com_port, sse, transcribe_cfg)
+                .await
+            {
+                log::error!("[manual-restart] {} failed: {}", com_port, error);
+            }
+        });
+    }
+
+    let accepted_count = accepted.len();
+    let rejected_count = rejected.len();
+    (StatusCode::ACCEPTED, Json(json!({
+        "accepted": accepted,
+        "rejected": rejected,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+    })))
+        .into_response()
 }
 
 /// Force network registration sequence immediately, then start an immediate

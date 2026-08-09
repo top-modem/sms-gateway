@@ -383,7 +383,13 @@ impl Modem {
                 .timeout(Duration::from_secs(10))
                 .flow_control(tokio_serial::FlowControl::None)
                 .open_native_async()
-                .map_err(|e| io::Error::other(format!("Failed to open {}: {}", port_name, e)))
+                .map_err(|e| {
+                    let kind = match e.kind() {
+                        tokio_serial::ErrorKind::Io(kind) => kind,
+                        _ => io::ErrorKind::Other,
+                    };
+                    io::Error::new(kind, format!("Failed to open {}: {}", port_name, e))
+                })
         });
 
         match tokio::time::timeout(

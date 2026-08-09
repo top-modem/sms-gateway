@@ -4,7 +4,6 @@
   import { apiClient } from '../js/api.js';
   import pkg from '../../package.json';
   import { getModuleLabel } from '../js/modem.js';
-  import { logout } from '../stores/auth.js';
   import { t, lang } from '../js/i18n.js';
   import { getMccCountry } from '../js/country.js';
 
@@ -142,6 +141,54 @@
   // ── Force registration (强制注册) ─────────────────────────────────────────
   let forceRegBusy    = $state(false);
   let reRegisterBusy  = $state(false);
+  let restartPortsBusy = $state(false);
+  let restartMessage = $state('');
+  let restartMessageError = $state(false);
+
+  function getSelectedComPorts() {
+    return rows
+      .filter((row) => selected.has(row.info.com_port))
+      .map((row) => row.info.com_port)
+      .filter(Boolean)
+      .sort((a, b) => comPortNum(a) - comPortNum(b));
+  }
+
+  async function restartSelectedPorts() {
+    if (restartPortsBusy) return;
+    const comPorts = getSelectedComPorts();
+    if (comPorts.length === 0) return;
+
+    const confirmed = window.confirm(
+      `${$t('restart_ports_confirm')}\n\n${comPorts.join(', ')}`
+    );
+    if (!confirmed) return;
+
+    restartPortsBusy = true;
+    restartMessage = '';
+    restartMessageError = false;
+    try {
+      const result = await apiClient.restartPorts(comPorts);
+      const payload = result?.data ?? result ?? {};
+      const acceptedCount = Number(payload.accepted_count ?? 0);
+      const rejected = Array.isArray(payload.rejected) ? payload.rejected : [];
+      const rejectedCount = Number(payload.rejected_count ?? rejected.length);
+      const rejectedPorts = rejected.map((item) => item.com_port).filter(Boolean);
+      restartMessage = $t('restart_ports_accepted', { n: acceptedCount });
+      if (rejectedPorts.length > 0) {
+        restartMessage += ` ${$t('restart_ports_rejected', { ports: rejectedPorts.join(', ') })}`;
+      }
+      restartMessageError = rejectedCount > 0;
+      selected = new Set();
+      lastClickedRowIndex = null;
+      await fetchData();
+    } catch (e) {
+      console.error('Restart ports failed', e);
+      restartMessage = e?.message ?? $t('restart_ports_failed');
+      restartMessageError = true;
+    } finally {
+      restartPortsBusy = false;
+    }
+  }
 
   async function forceRegister() {
     if (selected.size === 0 || forceRegBusy) return;
@@ -370,17 +417,27 @@
         {showOperatorColumn ? $t('hide_operator_column') : $t('show_operator_column')}
       </button>
       <button
-        onclick={logout}
+        onclick={restartSelectedPorts}
+        disabled={getSelectedComPorts().length === 0 || restartPortsBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
                border border-gray-200 dark:border-zinc-700
                text-gray-600 dark:text-gray-300
-               hover:bg-gray-50 dark:hover:bg-zinc-800 transition"
+               hover:bg-gray-50 dark:hover:bg-zinc-800 transition
+               disabled:opacity-60 disabled:cursor-not-allowed"
       >
-        <Icon icon="carbon:logout" class="w-4 h-4" />
-        {$t('btn_logout')}
+        <Icon icon="carbon:restart" class="w-4 h-4" />
+        {restartPortsBusy ? $t('restart_ports_running') : $t('btn_restart_ports')}
       </button>
     </div>
   </header>
+
+  {#if restartMessage}
+    <div class="px-6 py-2 text-xs border-b {restartMessageError
+      ? 'bg-red-50 border-red-200 text-red-700 dark:bg-red-950/30 dark:border-red-900 dark:text-red-300'
+      : 'bg-green-50 border-green-200 text-green-700 dark:bg-green-950/30 dark:border-green-900 dark:text-green-300'}">
+      {restartMessage}
+    </div>
+  {/if}
 
   <!-- ── Table area ──────────────────────────────────────────────────────── -->
   <div class="flex-1 overflow-auto pb-10">
@@ -392,7 +449,27 @@
         </div>
       </div>
     {:else}
-      <table class="w-full border-collapse text-xs">
+      <table
+        class="w-full border-collapse table-fixed text-xs [&_th]:overflow-hidden [&_td]:overflow-hidden"
+        style:min-width={showOperatorColumn ? '1450px' : '1330px'}
+      >
+        <colgroup>
+          <col style="width: 48px" />
+          <col style="width: 76px" />
+          <col style="width: 84px" />
+          <col style="width: 104px" />
+          <col style="width: 116px" />
+          <col style="width: 158px" />
+          {#if showOperatorColumn}
+            <col style="width: 120px" />
+          {/if}
+          <col style="width: 92px" />
+          <col style="width: 92px" />
+          <col style="width: 72px" />
+          <col style="width: 184px" />
+          <col style="width: 150px" />
+          <col style="width: 142px" />
+        </colgroup>
         <!-- ── Header ── -->
         <thead class="sticky top-0 z-10 bg-gray-100 dark:bg-zinc-800">
           <tr>

@@ -190,6 +190,14 @@ class ApiClient {
         return FetchApi.post('/api/sims/re-register', { sim_ids: simIds }, {}, 'application/json');
     }
 
+    /**
+     * Release and fully reinitialize selected physical COM ports.
+     * @param {string[]} comPorts
+     */
+    async restartPorts(comPorts) {
+        return FetchApi.post('/api/sims/restart-ports', { com_ports: comPorts }, {}, 'application/json');
+    }
+
     // ── 火狐狸 platform integration ─────────────────────────────────────────
 
     /**

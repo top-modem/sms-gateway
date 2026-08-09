@@ -189,7 +189,7 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
         sms_storage_map,
         sse_manager.clone(),
         webhook_manager.clone(),
-        transcribe_cfg,
+        transcribe_cfg.clone(),
     ));
 
     tokio::spawn(firefox_poll_worker(modem_manager.clone()));
@@ -210,6 +210,7 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
         &config.settings.username.unwrap(),
         &config.settings.password.unwrap(),
         sse_manager.clone(),
+        transcribe_cfg,
         None,
         None,
         #[cfg(not(feature = "mock-data"))]
@@ -335,11 +336,11 @@ fn run_windows_tray(url: String) -> anyhow::Result<()> {
     let mut tray = create_windows_tray_item()?;
 
     let open_url = url.clone();
-    tray.add_menu_item("Open Panel", move || {
+    tray.add_menu_item("打开面板", move || {
         open_browser_with_fallback(&open_url);
     })?;
 
-    tray.add_menu_item("Exit", || {
+    tray.add_menu_item("退出", || {
         std::process::exit(0);
     })?;
 

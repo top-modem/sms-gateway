@@ -3,6 +3,9 @@ use tokio::process::Command;
 
 use super::error::EsimError;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Thin wrapper around the external `lpac` CLI (SGP.22 LPA). All lpac output is
 /// line-delimited JSON of the form
 /// `{"type":"lpa","payload":{"code":0,"message":"success","data":...}}`.
@@ -53,6 +56,12 @@ impl Lpac {
         http_backend: &str,
     ) -> Result<Value, EsimError> {
         let mut cmd = Command::new(&self.exe);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+
+            cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.args(args);
         cmd.env("LPAC_APDU", &self.apdu_backend);
         cmd.env("LPAC_HTTP", http_backend);

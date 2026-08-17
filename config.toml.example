@@ -28,6 +28,7 @@ read_sms_frequency = 30          # How often to check for new SMS messages
 # windows_com_port_start = 1
 # windows_com_port_end = 128
 # mms_send_timeout_secs = 60               # AT+QMMSEND timeout and max wait for the +QMMSEND: completion URC (default 60)
+# mms_send_mode = "modem_direct_attachment_upload"  # "modem_direct_attachment_upload" or "host_staged_attachment_upload"
 
 # ── eSIM management (optional; requires eSIM-capable machines + lpac CLI) ──
 # esim_enabled = false                     # Master switch for the eSIM feature (default false)

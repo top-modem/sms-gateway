@@ -124,6 +124,12 @@ pub struct Modem {
     /// Oneshot sender for the in-flight MMS send, resolved by the URC handler when
     /// the modem emits the async `+QMMSEND: <err>,<httprsp>` completion notification.
     pending_mms: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32)>>>>,
+    /// Oneshot sender for the in-flight FTP login completion, resolved by the URC
+    /// handler when the modem emits `+QFTPOPEN: <err>,<protocol_error>`.
+    pending_ftp_open: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i32)>>>>,
+    /// Oneshot sender for the in-flight FTP download completion, resolved by the URC
+    /// handler when the modem emits `+QFTPGET: <err>,<transferlen>`.
+    pending_ftp_get: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(i32, i64)>>>>,
     /// Oneshot sender for the in-flight MMS content fetch, resolved by the URC handler
     /// when the modem emits the async `+QHTTPGET: <err>,<httprsp>,<content_length>`
     /// completion notification.
@@ -235,6 +241,8 @@ impl Modem {
             command_task,
             force_uk_mcc_to_46001,
             pending_mms: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_ftp_open: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_ftp_get: Arc::new(tokio::sync::Mutex::new(None)),
             pending_http_get: Arc::new(tokio::sync::Mutex::new(None)),
             pending_http_readfile: Arc::new(tokio::sync::Mutex::new(None)),
             esim_capable: RwLock::new(None),
@@ -2480,6 +2488,7 @@ impl Modem {
         to: &str,
         subject: Option<&str>,
         attachments: &[(String, Vec<u8>)],
+        attachment_upload_mode: &str,
         send_timeout_secs: u64,
     ) -> anyhow::Result<(i32, i32)> {
         // Clear any stale draft first (ignore errors — there may be nothing to clear).
@@ -2497,7 +2506,45 @@ impl Modem {
         let mut ram_names = Vec::with_capacity(attachments.len());
         for (idx, (filename, data)) in attachments.iter().enumerate() {
             let ram_name = format!("RAM:mms_{}_{}", idx, filename);
-            self.upload_file(&ram_name, data).await?;
+            match attachment_upload_mode {
+                "host_staged_attachment_upload" => {
+                    warn!(
+                        "[{}] using host-staged attachment upload for {} via FTP RAM fetch",
+                        self.name, filename
+                    );
+                    self.ftp_download_to_ram(filename, &ram_name, send_timeout_secs)
+                        .await
+                        .map_err(|ftp_err| {
+                            anyhow::anyhow!(
+                                "Host-staged upload failed for {}: {}",
+                                filename, ftp_err
+                            )
+                        })?;
+                }
+                _ => {
+                    match self.upload_file(&ram_name, data).await {
+                        Ok(()) => {}
+                        Err(upload_err) => {
+                            warn!(
+                                "[{}] direct serial MMS upload failed for {} ({}); retrying via FTP RAM fetch",
+                                self.name,
+                                filename,
+                                upload_err
+                            );
+                            self.ftp_download_to_ram(filename, &ram_name, send_timeout_secs)
+                                .await
+                                .map_err(|ftp_err| {
+                                    anyhow::anyhow!(
+                                        "Direct upload failed for {}: {}. FTP fallback also failed: {}",
+                                        filename,
+                                        upload_err,
+                                        ftp_err
+                                    )
+                                })?;
+                        }
+                    }
+                }
+            }
             self.send_command_with_ok(&format!("AT+QMMSEDIT=5,1,\"{}\"\r\n", ram_name))
                 .await?;
             ram_names.push(ram_name);
@@ -2544,6 +2591,160 @@ impl Modem {
         } else {
             None
         }
+    }
+
+    /// Parse a `+QFTPOPEN: <err>,<protocol_error>` URC line from the Quectel FTP API.
+    pub fn parse_qftpopen(line: &str) -> Option<(i32, i32)> {
+        let data = line.split(':').nth(1)?;
+        let parts: Vec<&str> = data.split(',').collect();
+        if parts.len() >= 2 {
+            let err = parts[0].trim().parse().ok()?;
+            let proto = parts[1].trim().parse().ok()?;
+            Some((err, proto))
+        } else {
+            None
+        }
+    }
+
+    /// Parse a `+QFTPGET: <err>,<transferlen>` URC line from the Quectel FTP API.
+    pub fn parse_qftpget(line: &str) -> Option<(i32, i64)> {
+        let data = line.split(':').nth(1)?;
+        let parts: Vec<&str> = data.split(',').collect();
+        if parts.len() >= 2 {
+            let err = parts[0].trim().parse().ok()?;
+            let len = parts[1].trim().parse().ok()?;
+            Some((err, len))
+        } else {
+            None
+        }
+    }
+
+    /// Register a completion waiter for the next `+QFTPOPEN:` URC.
+    async fn take_ftp_open_waiter(&self) -> tokio::sync::oneshot::Receiver<(i32, i32)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.pending_ftp_open.lock().await = Some(tx);
+        rx
+    }
+
+    /// Called by the URC handler when a `+QFTPOPEN: <err>,<protocol_error>` notification arrives.
+    pub async fn resolve_ftp_open_completion(&self, err_code: i32, protocol_error: i32) {
+        if let Some(tx) = self.pending_ftp_open.lock().await.take() {
+            let _ = tx.send((err_code, protocol_error));
+        }
+    }
+
+    /// Register a completion waiter for the next `+QFTPGET:` URC.
+    async fn take_ftp_get_waiter(&self) -> tokio::sync::oneshot::Receiver<(i32, i64)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.pending_ftp_get.lock().await = Some(tx);
+        rx
+    }
+
+    /// Called by the URC handler when a `+QFTPGET: <err>,<transferlen>` notification arrives.
+    pub async fn resolve_ftp_get_completion(&self, err_code: i32, transfer_len: i64) {
+        if let Some(tx) = self.pending_ftp_get.lock().await.take() {
+            let _ = tx.send((err_code, transfer_len));
+        }
+    }
+
+    /// Download an attachment from the configured FTP server into modem RAM, avoiding
+    /// the fragile serial-byte upload path when the hardware rejects `AT+QFUPL`.
+    /// This is intentionally a fallback: healthy modems keep using the direct serial
+    /// upload path, while a failing modem can fetch the file over cellular data instead.
+    pub async fn ftp_download_to_ram(
+        &self,
+        remote_name: &str,
+        local_ram_name: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<()> {
+        const FTP_HOST: &str = "anymodem.top";
+        const FTP_PORT: u16 = 21;
+        const FTP_USER: &str = "ftpuser";
+        const FTP_PASS: &str = "ftpuser";
+        const CONTEXT_ID: u8 = 1;
+
+        let _ = self
+            .send_command_with_ok(&format!("AT+QFTPCFG=\"contextid\",{}\r\n", CONTEXT_ID))
+            .await;
+        self.send_command_with_ok(&format!(
+            "AT+QFTPCFG=\"account\",\"{}\",\"{}\"\r\n",
+            FTP_USER, FTP_PASS
+        ))
+        .await?;
+        self.send_command_with_ok(&format!("AT+QFTPCFG=\"rsptimeout\",{}\r\n", timeout_secs))
+            .await?;
+
+        if let Err(e) = self
+            .send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID))
+            .await
+        {
+            debug!(
+                "FTP fallback: AT+QIACT={} was not active yet or rejected: {}",
+                CONTEXT_ID, e
+            );
+        }
+
+        let waiter = self.take_ftp_open_waiter().await;
+        self.send_command_with_ok(&format!(
+            "AT+QFTPOPEN=\"{}\",{}\r\n",
+            FTP_HOST, FTP_PORT
+        ))
+        .await?;
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs.max(15) + 10), waiter).await {
+            Ok(Ok((err_code, protocol_error))) => {
+                if err_code != 0 || protocol_error != 0 {
+                    return Err(anyhow::anyhow!(
+                        "AT+QFTPOPEN failed: err={}, protocol_error={}",
+                        err_code,
+                        protocol_error
+                    ));
+                }
+            }
+            Ok(Err(_)) => return Err(anyhow::anyhow!("FTP open completion channel closed")),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for +QFTPOPEN completion"
+                ));
+            }
+        }
+
+        let get_waiter = self.take_ftp_get_waiter().await;
+        let cmd = format!(
+            "AT+QFTPGET=\"{}\",\"{}\",0\r\n",
+            remote_name, local_ram_name
+        );
+        self.send_command_with_ok(&cmd).await?;
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs + 20), get_waiter).await {
+            Ok(Ok((err_code, transfer_len))) => {
+                if err_code != 0 {
+                    return Err(anyhow::anyhow!(
+                        "AT+QFTPGET failed for {} -> {}: err={}, transfer_len={}",
+                        remote_name,
+                        local_ram_name,
+                        err_code,
+                        transfer_len
+                    ));
+                }
+                if transfer_len <= 0 {
+                    return Err(anyhow::anyhow!(
+                        "AT+QFTPGET returned zero-length transfer for {} -> {}",
+                        remote_name,
+                        local_ram_name
+                    ));
+                }
+            }
+            Ok(Err(_)) => return Err(anyhow::anyhow!("FTP download completion channel closed")),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for +QFTPGET completion"
+                ));
+            }
+        }
+
+        let _ = self.send_command("AT+QFTPCLOSE\r\n").await;
+        Ok(())
     }
 
     // ─── MMS content fetch (AT+QHTTPxxx) ───────────────────────────────────────

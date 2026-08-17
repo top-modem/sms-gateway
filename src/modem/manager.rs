@@ -3614,6 +3614,34 @@ impl ModemManager {
                 continue;
             }
 
+            // FTP login completion — resolve the waiter set by Modem::ftp_download_to_ram().
+            if line.starts_with("+QFTPOPEN:") {
+                if let Some((err_code, protocol_error)) = Modem::parse_qftpopen(&line) {
+                    info!(
+                        "[URC {}] FTP login completed: err={}, protocol_error={}",
+                        sim_id, err_code, protocol_error
+                    );
+                    modem.resolve_ftp_open_completion(err_code, protocol_error).await;
+                } else {
+                    error!("[URC {}] failed to parse +QFTPOPEN: line: {}", sim_id, line);
+                }
+                continue;
+            }
+
+            // FTP GET completion — resolve the waiter set by Modem::ftp_download_to_ram().
+            if line.starts_with("+QFTPGET:") {
+                if let Some((err_code, transfer_len)) = Modem::parse_qftpget(&line) {
+                    info!(
+                        "[URC {}] FTP GET completed: err={}, transfer_len={}",
+                        sim_id, err_code, transfer_len
+                    );
+                    modem.resolve_ftp_get_completion(err_code, transfer_len).await;
+                } else {
+                    error!("[URC {}] failed to parse +QFTPGET: line: {}", sim_id, line);
+                }
+                continue;
+            }
+
             // MMS content fetch (AT+QHTTPGET) completion — resolve the waiter set by
             // Modem::fetch_mms_content().
             if line.starts_with("+QHTTPGET:") {

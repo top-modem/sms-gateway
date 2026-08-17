@@ -27,6 +27,7 @@
   let profileMmsc = $state('');
   let profileProxyHost = $state('');
   let profileProxyPort = $state('');
+  let profileSendMode = $state('modem_direct_attachment_upload');
   let profileLoading = $state(false);
   let profileSaving = $state(false);
   let profileError = $state('');
@@ -97,6 +98,7 @@
       profileMmsc = profile.mms_mmsc ?? '';
       profileProxyHost = profile.mms_proxy_host ?? '';
       profileProxyPort = profile.mms_proxy_port != null ? String(profile.mms_proxy_port) : '';
+      profileSendMode = profile.mms_send_mode || 'modem_direct_attachment_upload';
     } catch (e) {
       console.error('Failed to load MMS profile:', e);
       profileError = $t('err_profile_load_failed');
@@ -104,6 +106,7 @@
       profileMmsc = '';
       profileProxyHost = '';
       profileProxyPort = '';
+      profileSendMode = 'modem_direct_attachment_upload';
     } finally {
       profileLoading = false;
     }
@@ -123,6 +126,7 @@
         mmsc: String(profileMmsc ?? '').trim() || null,
         proxy_host: String(profileProxyHost ?? '').trim() || null,
         proxy_port: String(profileProxyPort ?? '').trim() ? Number(String(profileProxyPort).trim()) : null,
+        mms_send_mode: profileSendMode || 'modem_direct_attachment_upload',
       };
       await apiClient.setMmsProfile(selectedSimId, payload);
       profileSuccess = $t('msg_profile_saved');
@@ -634,6 +638,18 @@
               <div class="h-8 animate-pulse rounded-lg bg-gray-100 dark:bg-gray-700"></div>
             </div>
           {:else}
+            <div>
+              <label for="mms-send-mode" class="mb-1 block text-xs font-medium text-gray-700 dark:text-gray-300">{$t('mms_send_mode_label')}</label>
+              <select
+                id="mms-send-mode"
+                bind:value={profileSendMode}
+                class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-gray-100"
+              >
+                <option value="modem_direct_attachment_upload">{$t('mms_send_mode_direct')}</option>
+                <option value="host_staged_attachment_upload">{$t('mms_send_mode_host')}</option>
+              </select>
+              <div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">{$t('mms_send_mode_desc')}</div>
+            </div>
             <div>
               <label for="mms-apn" class="mb-1 block text-xs font-medium text-gray-700 dark:text-gray-300">{$t('mms_apn_label')}</label>
               <input

@@ -45,6 +45,9 @@ pub struct Settings {
     /// Seconds to pass as the `AT+QMMSEND=<timeout>` argument and to wait for the
     /// modem's `+QMMSEND:` completion URC before giving up (default 60).
     pub mms_send_timeout_secs: Option<u64>,
+    /// MMS attachment upload strategy: "modem_direct_attachment_upload" or
+    /// "host_staged_attachment_upload". Default is modem_direct_attachment_upload.
+    pub mms_send_mode: Option<String>,
     /// Optional Windows COM auto-expansion range start, e.g. 1 for COM1.
     pub windows_com_port_start: Option<u16>,
     /// Optional Windows COM auto-expansion range end, e.g. 64 for COM64.

@@ -86,6 +86,21 @@ async fn process_queue(
 
         // Apply the per-SIM MMS profile (APN/MMSC/proxy) before every send — cheap AT
         // round-trips, and avoids stale config if the operator changed carriers.
+        let attachment_upload_mode = match MmsProfile::get(&job.sim_id).await {
+            Ok(Some(profile)) => profile
+                .mms_send_mode
+                .clone()
+                .unwrap_or_else(|| "modem_direct_attachment_upload".to_string()),
+            Ok(None) => "modem_direct_attachment_upload".to_string(),
+            Err(e) => {
+                error!(
+                    "[MMS Worker] Job {}: failed to load MMS profile: {}",
+                    job.id, e
+                );
+                "modem_direct_attachment_upload".to_string()
+            }
+        };
+
         match MmsProfile::get(&job.sim_id).await {
             Ok(Some(profile))
                 if profile.mms_apn.is_some()
@@ -154,6 +169,7 @@ async fn process_queue(
                 &job.to_number,
                 job.subject.as_deref(),
                 &attachments,
+                &attachment_upload_mode,
                 send_timeout_secs,
             )
             .await

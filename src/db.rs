@@ -2262,24 +2262,26 @@ pub struct MmsProfile {
     pub mms_mmsc: Option<String>,
     pub mms_proxy_host: Option<String>,
     pub mms_proxy_port: Option<i32>,
+    pub mms_send_mode: Option<String>,
 }
 
 impl MmsProfile {
     pub async fn get(sim_id: &str) -> Result<Option<Self>> {
         let pool = get_pool()?;
-        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
-            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port FROM sim_cards WHERE id = ?"#,
+        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>)> = sqlx::query_as(
+            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode FROM sim_cards WHERE id = ?"#,
         )
         .bind(sim_id)
         .fetch_optional(pool)
         .await?;
         Ok(row.map(
-            |(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port)| Self {
+            |(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode)| Self {
                 sim_id,
                 mms_apn,
                 mms_mmsc,
                 mms_proxy_host,
                 mms_proxy_port,
+                mms_send_mode,
             },
         ))
     }
@@ -2290,16 +2292,18 @@ impl MmsProfile {
         mms_mmsc: Option<&str>,
         mms_proxy_host: Option<&str>,
         mms_proxy_port: Option<i32>,
+        mms_send_mode: Option<&str>,
     ) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(
-            r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?
+            r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?, mms_send_mode = ?
                WHERE id = ?"#,
         )
         .bind(mms_apn)
         .bind(mms_mmsc)
         .bind(mms_proxy_host)
         .bind(mms_proxy_port)
+        .bind(mms_send_mode)
         .bind(sim_id)
         .execute(pool)
         .await?;

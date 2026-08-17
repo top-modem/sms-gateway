@@ -1913,6 +1913,7 @@ pub struct SetMmsProfilePayload {
     mmsc: Option<String>,
     proxy_host: Option<String>,
     proxy_port: Option<i32>,
+    mms_send_mode: Option<String>,
 }
 
 async fn set_mms_profile(
@@ -1925,6 +1926,7 @@ async fn set_mms_profile(
         payload.mmsc.as_deref(),
         payload.proxy_host.as_deref(),
         payload.proxy_port,
+        payload.mms_send_mode.as_deref(),
     )
     .await
     {

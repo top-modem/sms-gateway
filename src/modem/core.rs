@@ -83,6 +83,14 @@ pub struct Modem {
     write_half: Arc<Mutex<Option<WriteHalf<SerialStream>>>>,
     /// Shared routing state for the background reader task.
     reader_state: Arc<Mutex<ReaderState>>,
+    /// Serializes ownership of `reader_state.response_tx` across the queued
+    /// command processor and the raw multi-step senders (`send_pdu_atomic`,
+    /// `upload_file`, `send_http_url`, `fetch_mms_content_via_requestheader`).
+    /// Without this, a queued command (e.g. the periodic AT+CCID health check)
+    /// can release the write lock before its response arrives, letting another
+    /// sender overwrite `response_tx` and steal that response -- observed as
+    /// e.g. an MMS `AT+QFUPL` CONNECT-prompt wait receiving a `+CCID` reply.
+    command_lock: Arc<Mutex<()>>,
     /// URC sender (background reader holds a clone; kept here for test injection).
     _urc_tx: mpsc::UnboundedSender<String>,
     /// URC receiver — subscribed to by the ModemManager URC handler task.
@@ -93,6 +101,20 @@ pub struct Modem {
     pub outbound_poll_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Becomes true when the CLCC poller observes stat=0 (remote answered the call).
     pub outbound_call_answered: Arc<tokio::sync::Mutex<bool>>,
+    /// Call ID of the current inbound call, set by the URC handler on RING and
+    /// cleared when the call ends. Lets a manual `/calls/answer` request update
+    /// the same DB/SSE/recording state that auto-answer would.
+    pub inbound_call_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Cancel sender for the pending auto-answer delay; fired when the call is
+    /// answered manually before the timer elapses, so the URC handler does not
+    /// also send ATA.
+    pub inbound_auto_answer_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// True once the current inbound call has been answered, by either path.
+    pub inbound_call_answered: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancel sender for the inbound call's 30s recording timer, shared so a
+    /// manually-started recording is still stopped/downloaded by the URC
+    /// handler's NO CARRIER cleanup.
+    pub inbound_recording_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Reader task handle so we can abort and release COM resources on drop.
     reader_task: JoinHandle<()>,
     /// Command processor task handle so it does not outlive modem shutdown.
@@ -175,13 +197,15 @@ impl Modem {
 
         // Spawn sequential command processor
         let pending_commands = Arc::new(AtomicUsize::new(0));
+        let command_lock = Arc::new(Mutex::new(()));
         let command_task = tokio::spawn({
             let write_half = write_half.clone();
             let reader_state = reader_state.clone();
             let name_c = name.to_string();
             let pending_commands = pending_commands.clone();
+            let command_lock = command_lock.clone();
             async move {
-                Self::command_processor(command_rx, write_half, reader_state, name_c, pending_commands).await;
+                Self::command_processor(command_rx, write_half, reader_state, name_c, pending_commands, command_lock).await;
             }
         });
 
@@ -197,11 +221,16 @@ impl Modem {
             _connection_state: connection_state,
             write_half,
             reader_state,
+            command_lock,
             _urc_tx: urc_tx,
             urc_rx: Arc::new(Mutex::new(urc_rx)),
             outbound_call_id: Arc::new(tokio::sync::Mutex::new(None)),
             outbound_poll_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
             outbound_call_answered: Arc::new(tokio::sync::Mutex::new(false)),
+            inbound_call_id: Arc::new(tokio::sync::Mutex::new(None)),
+            inbound_auto_answer_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            inbound_call_answered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inbound_recording_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
             reader_task,
             command_task,
             force_uk_mcc_to_46001,
@@ -704,6 +733,7 @@ impl Modem {
         reader_state: Arc<Mutex<ReaderState>>,
         name: String,
         pending_commands: Arc<AtomicUsize>,
+        command_lock: Arc<Mutex<()>>,
     ) {
         while let Some(mut at_command) = command_rx.recv().await {
             loop {
@@ -713,6 +743,7 @@ impl Modem {
                     &at_command.command,
                     &name,
                     Duration::from_secs(8),
+                    &command_lock,
                 )
                 .await
                 {
@@ -748,7 +779,11 @@ impl Modem {
         command: &str,
         name: &str,
         timeout_dur: Duration,
+        command_lock: &Arc<Mutex<()>>,
     ) -> io::Result<String> {
+        // Held for the whole write+response round trip so no other sender can
+        // steal this command's response out of `reader_state.response_tx`.
+        let _command_guard = command_lock.lock().await;
         let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
         {
             let mut write_guard = write_half.lock().await;
@@ -1134,6 +1169,9 @@ impl Modem {
         let setup_cmd = format!("AT+CMGS={}\r", tpdu_len);
         let full_pdu = format!("{}\x1A", pdu_hex);
 
+        // Hold command_lock for the whole exchange so a queued command can't
+        // steal the CMGS prompt/response out of reader_state.response_tx.
+        let _command_guard = self.command_lock.lock().await;
         // Hold write lock for the entire two-step PDU sequence
         let mut write_guard = self.write_half.lock().await;
         let write = write_guard
@@ -2322,6 +2360,10 @@ impl Modem {
     pub async fn upload_file(&self, filename: &str, data: &[u8]) -> anyhow::Result<()> {
         let setup_cmd = format!("AT+QFUPL=\"{}\",{}\r\n", filename, data.len());
 
+        // Hold command_lock for the whole exchange so a queued command (e.g. the
+        // periodic AT+CCID health check) can't steal the CONNECT prompt/final
+        // response out of reader_state.response_tx.
+        let _command_guard = self.command_lock.lock().await;
         let mut write_guard = self.write_half.lock().await;
         let write = write_guard
             .as_mut()
@@ -2629,6 +2671,9 @@ impl Modem {
     async fn send_http_url(&self, url: &str, timeout_secs: u64) -> anyhow::Result<()> {
         let setup_cmd = format!("AT+QHTTPURL={},{}\r\n", url.len(), timeout_secs);
 
+        // Hold command_lock for the whole exchange so a queued command can't
+        // steal the CONNECT prompt/final response out of reader_state.response_tx.
+        let _command_guard = self.command_lock.lock().await;
         let mut write_guard = self.write_half.lock().await;
         let write = write_guard
             .as_mut()
@@ -2782,6 +2827,10 @@ impl Modem {
         // In requestheader mode AT+QHTTPGET takes <rsptime>,<data_length>[,<input_time>]
         // -- omitting <data_length> is rejected with +CME ERROR: 730 (Invalid parameter).
         let setup_cmd = format!("AT+QHTTPGET={},{}\r\n", timeout_secs, request_headers.len());
+        // Held only across the response_tx round trip below (steps 1+2); released
+        // before awaiting the async +QHTTPGET completion URC and issuing the
+        // follow-up queued commands, which acquire this same lock themselves.
+        let command_guard = self.command_lock.lock().await;
         let mut write_guard = self.write_half.lock().await;
         let write = write_guard
             .as_mut()
@@ -2845,6 +2894,9 @@ impl Modem {
                 Self::format_log(&final_response)
             ));
         }
+        // response_tx round trip is done; release before the follow-up queued
+        // commands below try to acquire the same command_lock.
+        drop(command_guard);
 
         let (err_code, http_code, _content_length) =
             match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), waiter).await {

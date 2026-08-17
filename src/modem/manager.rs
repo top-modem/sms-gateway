@@ -3200,12 +3200,78 @@ impl ModemManager {
         None
     }
 
-    pub async fn answer_call(&self, sim_id: &str) -> anyhow::Result<()> {
+    /// Answer the current inbound call. Mirrors the URC handler's auto-answer
+    /// side effects (DB status, SSE event, recording) and coordinates with it
+    /// via shared `Modem` state so the two paths never both send ATA.
+    pub async fn answer_call(&self, sim_id: &str, sse: Arc<SseManager>) -> anyhow::Result<()> {
         let modem = self
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
-        modem.answer_call().await.map_err(Into::into)
+
+        // Auto-answer may have already answered this call (e.g. the button was
+        // pressed after the auto-answer delay elapsed); sending ATA again would
+        // just return ERROR, so treat it as an idempotent success.
+        if modem.inbound_call_answered.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        if let Err(e) = modem.answer_call().await {
+            // Lost the race with the URC handler's auto-answer — if it already
+            // marked the call answered, this is a harmless no-op, not a failure.
+            if modem.inbound_call_answered.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+
+        // Prevent the URC handler's pending auto-answer timer from sending a
+        // second ATA now that the call has been answered manually.
+        if let Some(tx) = modem.inbound_auto_answer_cancel_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        modem.inbound_call_answered.store(true, Ordering::SeqCst);
+
+        let call_id = modem.inbound_call_id.lock().await.clone();
+        if let Some(call_id) = call_id {
+            if let Err(e) = Call::update_status(&call_id, "active").await {
+                error!("[{}] failed to set call {} active: {}", sim_id, call_id, e);
+            }
+            sse.send_call_event(CallEvent {
+                event_type: "call_answered".into(),
+                sim_id: sim_id.to_string(),
+                call_id,
+                phone: None,
+                direction: "inbound".into(),
+            });
+            // ── Start downlink recording (mirrors auto-answer) ──────────────
+            if let Err(e) = modem.delete_files().await {
+                error!("[{}] failed to clear modem UFS: {}", sim_id, e);
+            }
+            match modem.start_recording("a.amr").await {
+                Ok(()) => info!("[{}] recording started -> a.amr (manual answer)", sim_id),
+                Err(e) => error!("[{}] failed to start recording: {}", sim_id, e),
+            }
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            *modem.inbound_recording_cancel_tx.lock().await = Some(cancel_tx);
+            let modem_c = modem.clone();
+            let sim_id_c = sim_id.to_string();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        info!("[{}] 30s recording limit, stopping and hanging up", sim_id_c);
+                        modem_c.stop_recording().await.ok();
+                        modem_c.hangup_call().await.ok();
+                        modem_c.inject_urc("NO CARRIER");
+                    }
+                    _ = cancel_rx => {
+                        info!("[{}] recording timer cancelled", sim_id_c);
+                    }
+                }
+            });
+        }
+
+        Ok(())
     }
 
     /// Hang up the current call.  Returns the call_id and final status of the
@@ -3279,8 +3345,6 @@ impl ModemManager {
         let mut current_phone: Option<String> = None;
         // Whether ATA was sent (answered); used to distinguish missed vs ended.
         let mut call_answered = false;
-        // Oneshot sender to cancel the 30-second recording timer. Some = recording active.
-        let mut recording_cancel_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
 
         info!("[URC {}] handler started", sim_id);
 
@@ -3335,23 +3399,41 @@ impl ModemManager {
                             });
                             active_call_id = Some(id.clone());
                             call_answered = false;
+                            *modem.inbound_call_id.lock().await = Some(id.clone());
+                            modem.inbound_call_answered.store(false, Ordering::SeqCst);
                             // Check if auto-answer is enabled
                             let should_auto_answer = transcribe_cfg
                                 .as_ref()
                                 .map(|cfg| cfg.auto_answer_enabled)
                                 .unwrap_or(true);
                             if should_auto_answer {
-                                // Wait before auto-answering to let the phone ring briefly.
-                                if let Some(cfg) = transcribe_cfg.as_ref() {
-                                    if cfg.auto_answer_delay_secs > 0 {
-                                        info!(
-                                            "[URC {}] waiting {}s before auto-answer",
-                                            sim_id, cfg.auto_answer_delay_secs
-                                        );
-                                        tokio::time::sleep(Duration::from_secs(cfg.auto_answer_delay_secs))
-                                            .await;
+                                // Wait before auto-answering, but let a manual `/calls/answer`
+                                // request cancel this wait so we never send a second ATA.
+                                let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                                *modem.inbound_auto_answer_cancel_tx.lock().await = Some(cancel_tx);
+                                let delay_secs = transcribe_cfg
+                                    .as_ref()
+                                    .map(|cfg| cfg.auto_answer_delay_secs)
+                                    .unwrap_or(0);
+                                let mut answered_manually = false;
+                                if delay_secs > 0 {
+                                    info!(
+                                        "[URC {}] waiting {}s before auto-answer",
+                                        sim_id, delay_secs
+                                    );
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
+                                        _ = &mut cancel_rx => { answered_manually = true; }
                                     }
+                                } else if cancel_rx.try_recv().is_ok() {
+                                    answered_manually = true;
                                 }
+                                *modem.inbound_auto_answer_cancel_tx.lock().await = None;
+
+                                if answered_manually || modem.inbound_call_answered.load(Ordering::SeqCst) {
+                                    info!("[URC {}] auto-answer skipped; call already answered manually", sim_id);
+                                    call_answered = true;
+                                } else {
                                 // Auto-answer the incoming call.
                                 // EC20 voice calls respond to ATA with OK only — no CONNECT URC.
                                 // So we handle the answered state here rather than in the CONNECT branch.
@@ -3360,6 +3442,7 @@ impl ModemManager {
                                 Ok(()) => {
                                     info!("[URC {}] auto-answered incoming call", sim_id);
                                     call_answered = true;
+                                    modem.inbound_call_answered.store(true, Ordering::SeqCst);
                                     if let Err(e) = Call::update_status(&id, "active").await {
                                         error!("[URC {}] failed to set call {} active: {}", sim_id, id, e);
                                     }
@@ -3380,7 +3463,7 @@ impl ModemManager {
                                     }
                                     info!("[URC {}] call_answered={} after start_recording", sim_id, call_answered);
                                     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-                                    recording_cancel_tx = Some(cancel_tx);
+                                    *modem.inbound_recording_cancel_tx.lock().await = Some(cancel_tx);
                                     let modem_c = modem.clone();
                                     let sim_id_c = sim_id.clone();
                                     tokio::spawn(async move {
@@ -3400,10 +3483,11 @@ impl ModemManager {
                                     });
                                     // ─────────────────────────────────────────────────────
                                 }
+                                }
+                                }
+                            } else {
+                                info!("[URC {}] auto-answer disabled, call waiting for manual answer", sim_id);
                             }
-                        } else {
-                            info!("[URC {}] auto-answer disabled, call waiting for manual answer", sim_id);
-                        }
                         }
                         Err(e) => error!("[URC {}] failed to insert call: {}", sim_id, e),
                     }
@@ -3432,11 +3516,17 @@ impl ModemManager {
             }
 
             if line == "NO CARRIER" || line == "BUSY" || line.starts_with("VOICE CALL: END") || line.starts_with("+CEND:") {
+                let has_recording = modem.inbound_recording_cancel_tx.lock().await.is_some();
                 info!("[URC {}] {} received: call_answered={}, has_active={}, has_recording={}",
-                    sim_id, line, call_answered, active_call_id.is_some(), recording_cancel_tx.is_some());
+                    sim_id, line, call_answered, active_call_id.is_some(), has_recording);
                 if let Some(call_id) = active_call_id.take() {
+                    *modem.inbound_call_id.lock().await = None;
+                    modem.inbound_call_answered.store(false, Ordering::SeqCst);
+                    if let Some(tx) = modem.inbound_auto_answer_cancel_tx.lock().await.take() {
+                        let _ = tx.send(());
+                    }
                     // ── Stop recording if active ──────────────────────────────
-                    if let Some(tx) = recording_cancel_tx.take() {
+                    if let Some(tx) = modem.inbound_recording_cancel_tx.lock().await.take() {
                         modem.stop_recording().await.ok();
                         tx.send(()).ok(); // cancel the 30s timer task
                         info!("[URC {}] recording stopped", sim_id);

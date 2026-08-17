@@ -362,7 +362,7 @@ pub async fn run_api(
         )
         .route(
             "/calls/answer",
-            post(answer_call).with_state(modem_manager.clone()),
+            post(answer_call).with_state(CallState { mm: modem_manager.clone(), sse: sse_manager.clone() }),
         )
         .route(
             "/calls/hangup",
@@ -1641,8 +1641,8 @@ async fn make_call(State(cs): State<CallState>, Json(body): Json<MakeCallRequest
     }
 }
 
-async fn answer_call(State(mm): State<ModemManagerRef>, Json(body): Json<SimIdRequest>) -> Response {
-    match mm.answer_call(&body.sim_id).await {
+async fn answer_call(State(cs): State<CallState>, Json(body): Json<SimIdRequest>) -> Response {
+    match cs.mm.answer_call(&body.sim_id, cs.sse.clone()).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

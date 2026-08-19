@@ -5,6 +5,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -2461,9 +2464,10 @@ impl Modem {
         .await?;
         self.send_command_with_ok("AT+QMMSCFG=\"character\",\"ASCII\"\r\n")
             .await?;
-        // Disable optional MMS support fields (delivery/read reports etc.) -- matches
-        // the reference implementations above; keeps behavior simple/predictable.
-        self.send_command_with_ok("AT+QMMSCFG=\"supportfield\",0\r\n")
+        // Request the carrier's MMS delivery response using the verified modem
+        // setting: report parameters, delivery/read notification flags, and
+        // the carrier-specific response options.
+        self.send_command_with_ok("AT+QMMSCFG=\"sendparam\",6,3,1,1,2,4\r\n")
             .await?;
         Ok(())
     }
@@ -2503,7 +2507,7 @@ impl Modem {
     }
 
     fn build_ftp_apn_command(apn: &str) -> String {
-        format!("AT+QICSGP=1,1,\"{}\",\"\",\"\",1\r\n", apn)
+        format!("AT+QICSGP=2,1,\"{}\",\"\",\"\",1\r\n", apn)
     }
 
     fn select_ftp_apn(ftp_apn: Option<String>) -> String {
@@ -2512,10 +2516,18 @@ impl Modem {
             .unwrap_or_else(|| "cmnet".to_string())
     }
 
-    fn is_qiact_active(response: &str) -> bool {
-        response
-            .lines()
-            .any(|line| line.trim_start().starts_with("+QIACT:") && line.contains(',') && !line.contains("+QIACT: 0"))
+    fn is_qiact_context_active(response: &str, context_id: u8) -> bool {
+        response.lines().any(|line| {
+            let line = line.trim_start();
+            let Some(data) = line.strip_prefix("+QIACT:") else {
+                return false;
+            };
+            data.trim_start()
+                .split(',')
+                .next()
+                .and_then(|value| value.trim().parse::<u8>().ok())
+                == Some(context_id)
+        })
     }
 
     fn ftp_upload_target(remote_name: &str) -> String {
@@ -2534,16 +2546,19 @@ impl Modem {
         ));
         std::fs::write(&temp_path, data).map_err(|e| anyhow::anyhow!("Failed to write temp attachment for FTP upload: {}", e))?;
 
-        let output = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--ftp-create-dirs",
-                "-T",
-                temp_path.to_str().unwrap(),
-                &upload_url,
-            ])
+        let mut curl_command = Command::new("curl");
+        curl_command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--ftp-create-dirs",
+            "-T",
+            temp_path.to_str().unwrap(),
+            &upload_url,
+        ]);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut curl_command, CREATE_NO_WINDOW);
+        let output = curl_command
             .output()
             .map_err(|e| anyhow::anyhow!("Failed to start curl for FTP upload: {}", e))?;
 
@@ -2790,7 +2805,7 @@ impl Modem {
         const FTP_PORT: u16 = 21;
         const FTP_USER: &str = "ftpuser";
         const FTP_PASS: &str = "ftpuser";
-        const CONTEXT_ID: u8 = 1;
+        const CONTEXT_ID: u8 = 2;
 
         let ftp_apn = if let Some(sim_id) = self.sim_id.read().await.clone() {
             crate::db::MmsProfile::get(&sim_id)
@@ -2811,7 +2826,7 @@ impl Modem {
         let qiact_before = self.send_command_with_ok("AT+QIACT?\r\n").await;
         let qiact_active = qiact_before
             .as_ref()
-            .map(|v| Self::is_qiact_active(v))
+            .map(|v| Self::is_qiact_context_active(v, CONTEXT_ID))
             .unwrap_or(false);
         info!(
             "[{}] FTP APN before open: '{}' ; QIACT before: {} ; active={}",
@@ -2824,26 +2839,55 @@ impl Modem {
             qiact_active
         );
 
-        // FTP may use a different APN from MMS. Deactivate the current bearer
-        // first so QICSGP=cmnet is actually applied before QFTPOPEN.
+        // FIZZ uses PDP 1 for MMS and PDP 2 for data with the same APN. Only
+        // recycle PDP 2 so the active MMS bearer remains available.
         if qiact_active {
-            let _ = self.send_command("AT+QIDEACT=1\r\n").await;
+            info!(
+                "[{}] deactivating FTP PDP context {} before reconfiguration",
+                self.name, CONTEXT_ID
+            );
+            self.send_command_with_ok(&format!("AT+QIDEACT={}\r\n", CONTEXT_ID))
+                .await
+                .map_err(|e| anyhow::anyhow!("FTP PDP {} deactivation failed: {}", CONTEXT_ID, e))?;
         }
-        self.send_command_with_ok(&Self::build_ftp_apn_command(&ftp_apn)).await?;
-        self.send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID)).await?;
+        info!(
+            "[{}] configuring FTP PDP context {} with APN '{}'",
+            self.name, CONTEXT_ID, ftp_apn
+        );
+        self.send_command_with_ok(&Self::build_ftp_apn_command(&ftp_apn))
+            .await
+            .map_err(|e| anyhow::anyhow!("FTP PDP {} APN configuration failed: {}", CONTEXT_ID, e))?;
+        self.send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID))
+            .await
+            .map_err(|e| anyhow::anyhow!("FTP PDP {} activation failed: {}", CONTEXT_ID, e))?;
         let qiact_after = self.send_command_with_ok("AT+QIACT?\r\n").await;
         info!(
-            "[{}] QIACT after FTP PDP activation: {}",
+            "[{}] QIACT after FTP PDP {} activation: {}",
             self.name,
+            CONTEXT_ID,
             qiact_after
                 .as_ref()
                 .map(|v| Self::format_log(v))
                 .unwrap_or_else(|e| format!("<error: {}>", e))
         );
+        if !qiact_after
+            .as_ref()
+            .map(|response| Self::is_qiact_context_active(response, CONTEXT_ID))
+            .unwrap_or(false)
+        {
+            return Err(anyhow::anyhow!(
+                "FTP PDP {} activation was accepted but context is not active",
+                CONTEXT_ID
+            ));
+        }
 
-        let _ = self
-            .send_command_with_ok(&format!("AT+QFTPCFG=\"contextid\",{}\r\n", CONTEXT_ID))
-            .await;
+        info!(
+            "[{}] configuring FTP session for PDP context {}",
+            self.name, CONTEXT_ID
+        );
+        self.send_command_with_ok(&format!("AT+QFTPCFG=\"contextid\",{}\r\n", CONTEXT_ID))
+            .await
+            .map_err(|e| anyhow::anyhow!("FTP context selection failed for PDP {}: {}", CONTEXT_ID, e))?;
         self.send_command_with_ok(&format!(
             "AT+QFTPCFG=\"account\",\"{}\",\"{}\"\r\n",
             FTP_USER, FTP_PASS
@@ -3530,7 +3574,7 @@ mod tests {
     #[test]
     fn build_ftp_apn_command_uses_configured_apn() {
         let command = Modem::build_ftp_apn_command("customftp");
-        assert_eq!(command, "AT+QICSGP=1,1,\"customftp\",\"\",\"\",1\r\n");
+        assert_eq!(command, "AT+QICSGP=2,1,\"customftp\",\"\",\"\",1\r\n");
     }
 
     #[test]
@@ -3545,15 +3589,10 @@ mod tests {
     }
 
     #[test]
-    fn qiact_active_detects_active_context() {
+    fn qiact_context_active_only_matches_requested_context() {
         let response = "+QIACT: 1,1,1,\"10.129.219.75\"\r\n\r\nOK\r\n";
-        assert!(Modem::is_qiact_active(response));
-    }
-
-    #[test]
-    fn qiact_active_rejects_inactive_context() {
-        let response = "\r\nOK\r\n";
-        assert!(!Modem::is_qiact_active(response));
+        assert!(!Modem::is_qiact_context_active(response, 2));
+        assert!(Modem::is_qiact_context_active(response, 1));
     }
 
     #[test]
@@ -3571,6 +3610,7 @@ mod tests {
             "8613812345678_0_a.png"
         );
     }
+
 }
 
 /// Decode a UCS2 hex string (e.g. "00410042" → "AB").

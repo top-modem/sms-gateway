@@ -101,6 +101,8 @@ async fn process_queue(
             }
         };
 
+        let mut mms_profile_for_restore: Option<(String, String, String, u16)> = None;
+
         match MmsProfile::get(&job.sim_id).await {
             Ok(Some(profile))
                 if profile.mms_apn.is_some()
@@ -112,6 +114,12 @@ async fn process_queue(
                 let mmsc = profile.mms_mmsc.unwrap();
                 let proxy_host = profile.mms_proxy_host.unwrap();
                 let proxy_port = profile.mms_proxy_port.unwrap() as u16;
+                mms_profile_for_restore = Some((
+                    apn.clone(),
+                    mmsc.clone(),
+                    proxy_host.clone(),
+                    proxy_port,
+                ));
                 if let Err(e) = modem
                     .configure_mms_profile(&apn, &mmsc, &proxy_host, proxy_port)
                     .await
@@ -171,6 +179,9 @@ async fn process_queue(
                 &attachments,
                 &attachment_upload_mode,
                 send_timeout_secs,
+                mms_profile_for_restore.as_ref().map(|(apn, mmsc, proxy, port)| {
+                    (apn.as_str(), mmsc.as_str(), proxy.as_str(), *port)
+                }),
             )
             .await
         {

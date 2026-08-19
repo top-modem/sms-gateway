@@ -1,6 +1,7 @@
 ﻿use chrono::{Timelike, Utc};
 use log::{debug, error, info, warn};
 use std::io;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2443,8 +2444,12 @@ impl Modem {
         proxy_host: &str,
         proxy_port: u16,
     ) -> anyhow::Result<()> {
+        // QICSGP changes the profile, but does not replace an already-active
+        // bearer. Deactivate/reactivate so QMMSEND actually uses the MMS APN.
+        let _ = self.send_command("AT+QIDEACT=1\r\n").await;
         self.send_command_with_ok(&format!("AT+QICSGP=1,1,\"{}\",\"\",\"\",0\r\n", apn))
             .await?;
+        self.send_command_with_ok("AT+QIACT=1\r\n").await?;
         self.send_command_with_ok("AT+QMMSCFG=\"contextid\",1\r\n")
             .await?;
         self.send_command_with_ok(&format!("AT+QMMSCFG=\"mmsc\",\"{}\"\r\n", mmsc))
@@ -2478,6 +2483,98 @@ impl Modem {
         }
     }
 
+    fn sanitize_mms_filename(filename: &str) -> String {
+        filename
+            .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "_")
+    }
+
+    fn build_mms_ram_name(own_number: &str, idx: usize, filename: &str) -> String {
+        let cleaned_phone = crate::phone_number::normalize_msisdn(own_number);
+        let safe_name = Self::sanitize_mms_filename(filename);
+        if cleaned_phone.is_empty() {
+            format!("RAM:mms_{}_{}", idx, safe_name)
+        } else {
+            format!("RAM:{}_{}_{}", cleaned_phone, idx, safe_name)
+        }
+    }
+
+    fn host_staged_remote_name(local_ram_name: &str) -> String {
+        local_ram_name.trim_start_matches("RAM:").to_string()
+    }
+
+    fn build_ftp_apn_command(apn: &str) -> String {
+        format!("AT+QICSGP=1,1,\"{}\",\"\",\"\",1\r\n", apn)
+    }
+
+    fn select_ftp_apn(ftp_apn: Option<String>) -> String {
+        ftp_apn
+            .filter(|apn| !apn.trim().is_empty())
+            .unwrap_or_else(|| "cmnet".to_string())
+    }
+
+    fn is_qiact_active(response: &str) -> bool {
+        response
+            .lines()
+            .any(|line| line.trim_start().starts_with("+QIACT:") && line.contains(',') && !line.contains("+QIACT: 0"))
+    }
+
+    fn ftp_upload_target(remote_name: &str) -> String {
+        const FTP_HOST: &str = "47.237.101.133";
+        const FTP_USER: &str = "ftpuser";
+        const FTP_PASS: &str = "ftpuser";
+        format!("ftp://{}:{}@{}/{}", FTP_USER, FTP_PASS, FTP_HOST, remote_name)
+    }
+
+    async fn ftp_upload_to_server(&self, remote_name: &str, data: &[u8]) -> anyhow::Result<()> {
+        let upload_url = Self::ftp_upload_target(remote_name);
+        let temp_path = std::env::temp_dir().join(format!(
+            "sms_gateway_mms_{}_{}.bin",
+            self.com_port.replace(['/', '\\'], "_"),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&temp_path, data).map_err(|e| anyhow::anyhow!("Failed to write temp attachment for FTP upload: {}", e))?;
+
+        let output = Command::new("curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--ftp-create-dirs",
+                "-T",
+                temp_path.to_str().unwrap(),
+                &upload_url,
+            ])
+            .output()
+            .map_err(|e| anyhow::anyhow!("Failed to start curl for FTP upload: {}", e))?;
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        Err(anyhow::anyhow!(
+            "FTP upload failed for {} via {}: {}",
+            remote_name,
+            upload_url,
+            if detail.is_empty() { "curl exited with non-zero status" } else { &detail }
+        ))
+    }
+
+    fn upload_attempt_order(mode: &str) -> Vec<&str> {
+        match mode {
+            "host_staged_attachment_upload" => vec!["host_staged_attachment_upload"],
+            _ => vec!["modem_direct_attachment_upload"],
+        }
+    }
+
     /// Compose and send an MMS: clears any existing draft, sets recipient/subject,
     /// uploads and attaches each file, then issues `AT+QMMSEND` and awaits the
     /// asynchronous `+QMMSEND: <err>,<httprsp>` completion URC.
@@ -2490,6 +2587,7 @@ impl Modem {
         attachments: &[(String, Vec<u8>)],
         attachment_upload_mode: &str,
         send_timeout_secs: u64,
+        mms_profile: Option<(&str, &str, &str, u16)>,
     ) -> anyhow::Result<(i32, i32)> {
         // Clear any stale draft first (ignore errors — there may be nothing to clear).
         let _ = self.send_command_with_ok("AT+QMMSEDIT=0\r\n").await;
@@ -2503,51 +2601,82 @@ impl Modem {
             }
         }
 
+        let own_number = self.get_phone_number().await.ok().flatten().unwrap_or_default();
         let mut ram_names = Vec::with_capacity(attachments.len());
         for (idx, (filename, data)) in attachments.iter().enumerate() {
-            let ram_name = format!("RAM:mms_{}_{}", idx, filename);
-            match attachment_upload_mode {
-                "host_staged_attachment_upload" => {
-                    warn!(
-                        "[{}] using host-staged attachment upload for {} via FTP RAM fetch",
-                        self.name, filename
-                    );
-                    self.ftp_download_to_ram(filename, &ram_name, send_timeout_secs)
-                        .await
-                        .map_err(|ftp_err| {
-                            anyhow::anyhow!(
-                                "Host-staged upload failed for {}: {}",
-                                filename, ftp_err
-                            )
-                        })?;
-                }
-                _ => {
-                    match self.upload_file(&ram_name, data).await {
-                        Ok(()) => {}
-                        Err(upload_err) => {
-                            warn!(
-                                "[{}] direct serial MMS upload failed for {} ({}); retrying via FTP RAM fetch",
-                                self.name,
-                                filename,
-                                upload_err
-                            );
-                            self.ftp_download_to_ram(filename, &ram_name, send_timeout_secs)
-                                .await
-                                .map_err(|ftp_err| {
-                                    anyhow::anyhow!(
-                                        "Direct upload failed for {}: {}. FTP fallback also failed: {}",
-                                        filename,
-                                        upload_err,
-                                        ftp_err
-                                    )
-                                })?;
+            let ram_name = Self::build_mms_ram_name(&own_number, idx, filename);
+            let _ = self.send_command(&format!("AT+QFDEL=\"{}\"\r\n", ram_name)).await;
+
+            let mut last_err = None;
+            for strategy in Self::upload_attempt_order(attachment_upload_mode) {
+                match strategy {
+                    "host_staged_attachment_upload" => {
+                        let remote_name = Self::host_staged_remote_name(&ram_name);
+                        warn!(
+                            "[{}] uploading local attachment {} to FTP host as {} before modem fetch",
+                            self.name, filename, remote_name
+                        );
+                        match self.ftp_upload_to_server(&remote_name, data).await {
+                            Ok(()) => {}
+                            Err(err) => {
+                                warn!(
+                                    "[{}] app-side FTP upload failed for {} -> {}: {}",
+                                    self.name, filename, remote_name, err
+                                );
+                                last_err = Some(err);
+                                continue;
+                            }
+                        }
+                        match self.ftp_download_to_ram(&remote_name, &ram_name, send_timeout_secs).await {
+                            Ok(()) => break,
+                            Err(err) => {
+                                warn!(
+                                    "[{}] host-staged attachment upload failed for {}: {}",
+                                    self.name, filename, err
+                                );
+                                last_err = Some(err);
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!(
+                            "[{}] trying direct serial MMS upload for {}",
+                            self.name, filename
+                        );
+                        match self.upload_file(&ram_name, data).await {
+                            Ok(()) => break,
+                            Err(err) => {
+                                warn!(
+                                    "[{}] direct serial MMS upload failed for {}: {}",
+                                    self.name, filename, err
+                                );
+                                last_err = Some(err.into());
+                            }
                         }
                     }
                 }
             }
+
+            if last_err.is_some() {
+                return Err(anyhow::anyhow!(
+                    "All MMS attachment upload strategies failed for {} ({}). Last error: {}",
+                    filename,
+                    attachment_upload_mode,
+                    last_err.unwrap()
+                ));
+            }
+
             self.send_command_with_ok(&format!("AT+QMMSEDIT=5,1,\"{}\"\r\n", ram_name))
                 .await?;
             ram_names.push(ram_name);
+        }
+
+        // Host-staged FTP uses a separate PDP/APN. Restore the MMS profile before
+        // QMMSEND so the modem submits through the carrier's MMS bearer.
+        if attachment_upload_mode == "host_staged_attachment_upload" {
+            if let Some((apn, mmsc, proxy_host, proxy_port)) = mms_profile {
+                self.configure_mms_profile(apn, mmsc, proxy_host, proxy_port).await?;
+            }
         }
 
         let waiter = self.take_mms_waiter().await;
@@ -2657,11 +2786,60 @@ impl Modem {
         local_ram_name: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<()> {
-        const FTP_HOST: &str = "anymodem.top";
+        const FTP_HOST: &str = "47.237.101.133";
         const FTP_PORT: u16 = 21;
         const FTP_USER: &str = "ftpuser";
         const FTP_PASS: &str = "ftpuser";
         const CONTEXT_ID: u8 = 1;
+
+        let ftp_apn = if let Some(sim_id) = self.sim_id.read().await.clone() {
+            crate::db::MmsProfile::get(&sim_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|profile| profile.ftp_apn)
+                .map(|apn| Self::select_ftp_apn(Some(apn)))
+                .unwrap_or_else(|| "cmnet".to_string())
+        } else {
+            "cmnet".to_string()
+        };
+
+        // Match the known-good modem flow used on real hardware:
+        // 1) ensure a cellular PDP context exists and is active;
+        // 2) configure FTP context/account/filetype/transmode/timeout;
+        // 3) then open the FTP session and fetch the remote attachment.
+        let qiact_before = self.send_command_with_ok("AT+QIACT?\r\n").await;
+        let qiact_active = qiact_before
+            .as_ref()
+            .map(|v| Self::is_qiact_active(v))
+            .unwrap_or(false);
+        info!(
+            "[{}] FTP APN before open: '{}' ; QIACT before: {} ; active={}",
+            self.name,
+            ftp_apn,
+            qiact_before
+                .as_ref()
+                .map(|v| Self::format_log(v))
+                .unwrap_or_else(|e| format!("<error: {}>", e)),
+            qiact_active
+        );
+
+        // FTP may use a different APN from MMS. Deactivate the current bearer
+        // first so QICSGP=cmnet is actually applied before QFTPOPEN.
+        if qiact_active {
+            let _ = self.send_command("AT+QIDEACT=1\r\n").await;
+        }
+        self.send_command_with_ok(&Self::build_ftp_apn_command(&ftp_apn)).await?;
+        self.send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID)).await?;
+        let qiact_after = self.send_command_with_ok("AT+QIACT?\r\n").await;
+        info!(
+            "[{}] QIACT after FTP PDP activation: {}",
+            self.name,
+            qiact_after
+                .as_ref()
+                .map(|v| Self::format_log(v))
+                .unwrap_or_else(|e| format!("<error: {}>", e))
+        );
 
         let _ = self
             .send_command_with_ok(&format!("AT+QFTPCFG=\"contextid\",{}\r\n", CONTEXT_ID))
@@ -2671,20 +2849,26 @@ impl Modem {
             FTP_USER, FTP_PASS
         ))
         .await?;
-        self.send_command_with_ok(&format!("AT+QFTPCFG=\"rsptimeout\",{}\r\n", timeout_secs))
+        self.send_command_with_ok("AT+QFTPCFG=\"filetype\",0\r\n").await?;
+        self.send_command_with_ok("AT+QFTPCFG=\"transmode\",1\r\n").await?;
+        self.send_command_with_ok(&format!("AT+QFTPCFG=\"rsptimeout\",{}\r\n", timeout_secs.max(30)))
             .await?;
 
-        if let Err(e) = self
-            .send_command_with_ok(&format!("AT+QIACT={}\r\n", CONTEXT_ID))
-            .await
-        {
-            debug!(
-                "FTP fallback: AT+QIACT={} was not active yet or rejected: {}",
-                CONTEXT_ID, e
-            );
-        }
-
         let waiter = self.take_ftp_open_waiter().await;
+        info!(
+            "[{}] opening FTP session to {}:{} for remote file {} -> RAM {}",
+            self.name,
+            FTP_HOST,
+            FTP_PORT,
+            remote_name,
+            local_ram_name
+        );
+        info!(
+            "[{}] FTP remote target name: '{}' (local RAM name: '{}')",
+            self.name,
+            remote_name,
+            local_ram_name
+        );
         self.send_command_with_ok(&format!(
             "AT+QFTPOPEN=\"{}\",{}\r\n",
             FTP_HOST, FTP_PORT
@@ -2713,6 +2897,11 @@ impl Modem {
         let cmd = format!(
             "AT+QFTPGET=\"{}\",\"{}\",0\r\n",
             remote_name, local_ram_name
+        );
+        info!(
+            "[{}] executing FTP download: {}",
+            self.name,
+            Self::format_log(&cmd)
         );
         self.send_command_with_ok(&cmd).await?;
 
@@ -3331,6 +3520,56 @@ impl Modem {
         } else {
             Some(number.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Modem;
+
+    #[test]
+    fn build_ftp_apn_command_uses_configured_apn() {
+        let command = Modem::build_ftp_apn_command("customftp");
+        assert_eq!(command, "AT+QICSGP=1,1,\"customftp\",\"\",\"\",1\r\n");
+    }
+
+    #[test]
+    fn ftp_apn_defaults_to_cmnet_without_profile_value() {
+        assert_eq!(Modem::select_ftp_apn(None), "cmnet");
+        assert_eq!(Modem::select_ftp_apn(Some("  ".to_string())), "cmnet");
+    }
+
+    #[test]
+    fn ftp_apn_preserves_explicit_profile_value() {
+        assert_eq!(Modem::select_ftp_apn(Some("customftp".to_string())), "customftp");
+    }
+
+    #[test]
+    fn qiact_active_detects_active_context() {
+        let response = "+QIACT: 1,1,1,\"10.129.219.75\"\r\n\r\nOK\r\n";
+        assert!(Modem::is_qiact_active(response));
+    }
+
+    #[test]
+    fn qiact_active_rejects_inactive_context() {
+        let response = "\r\nOK\r\n";
+        assert!(!Modem::is_qiact_active(response));
+    }
+
+    #[test]
+    fn build_mms_ram_name_uses_own_phone_number() {
+        assert_eq!(
+            Modem::build_mms_ram_name("+86 138 1234 5678", 0, "a.png"),
+            "RAM:8613812345678_0_a.png"
+        );
+    }
+
+    #[test]
+    fn host_staged_remote_name_strips_ram_prefix() {
+        assert_eq!(
+            Modem::host_staged_remote_name("RAM:8613812345678_0_a.png"),
+            "8613812345678_0_a.png"
+        );
     }
 }
 

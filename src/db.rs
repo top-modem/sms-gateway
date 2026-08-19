@@ -274,6 +274,49 @@ impl Call {
 }
 
 impl Sms {
+    /// Delete all SMS rows belonging to one SIM or one phone/contact.
+    pub async fn delete_all_by_scope(
+        sim_id: Option<&str>,
+        phone_number: Option<&str>,
+    ) -> Result<u64> {
+        let pool = get_pool()?;
+        let (column, value) = match (sim_id, phone_number) {
+            (Some(sim_id), None) => ("sim_id", sim_id),
+            (None, Some(phone_number)) => ("contact_id", phone_number),
+            _ => return Err(anyhow::anyhow!("Specify exactly one of sim_id or phone_number")),
+        };
+
+        let query = format!("DELETE FROM sms WHERE {} = ?", column);
+        let result = sqlx::query(&query).bind(value).execute(pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete one SMS, optionally requiring matching SIM and phone/contact ID.
+    pub async fn delete_by_id_scoped(
+        id: i64,
+        sim_id: Option<&str>,
+        phone_number: Option<&str>,
+    ) -> Result<bool> {
+        let pool = get_pool()?;
+        let mut query = String::from("DELETE FROM sms WHERE id = ?");
+        if sim_id.is_some() {
+            query.push_str(" AND sim_id = ?");
+        }
+        if phone_number.is_some() {
+            query.push_str(" AND contact_id = ?");
+        }
+
+        let mut request = sqlx::query(&query).bind(id);
+        if let Some(sim_id) = sim_id {
+            request = request.bind(sim_id);
+        }
+        if let Some(phone_number) = phone_number {
+            request = request.bind(phone_number);
+        }
+
+        Ok(request.execute(pool).await?.rows_affected() > 0)
+    }
+
     pub async fn count() -> Result<i64> {
         let pool = get_pool()?;
         let count = sqlx::query_scalar(
@@ -2263,25 +2306,27 @@ pub struct MmsProfile {
     pub mms_proxy_host: Option<String>,
     pub mms_proxy_port: Option<i32>,
     pub mms_send_mode: Option<String>,
+    pub ftp_apn: Option<String>,
 }
 
 impl MmsProfile {
     pub async fn get(sim_id: &str) -> Result<Option<Self>> {
         let pool = get_pool()?;
-        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>)> = sqlx::query_as(
-            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode FROM sim_cards WHERE id = ?"#,
+        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode, ftp_apn FROM sim_cards WHERE id = ?"#,
         )
         .bind(sim_id)
         .fetch_optional(pool)
         .await?;
         Ok(row.map(
-            |(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode)| Self {
+            |(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode, ftp_apn)| Self {
                 sim_id,
                 mms_apn,
                 mms_mmsc,
                 mms_proxy_host,
                 mms_proxy_port,
                 mms_send_mode,
+                ftp_apn,
             },
         ))
     }
@@ -2293,10 +2338,11 @@ impl MmsProfile {
         mms_proxy_host: Option<&str>,
         mms_proxy_port: Option<i32>,
         mms_send_mode: Option<&str>,
+        ftp_apn: Option<&str>,
     ) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(
-            r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?, mms_send_mode = ?
+            r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?, mms_send_mode = ?, ftp_apn = ?
                WHERE id = ?"#,
         )
         .bind(mms_apn)
@@ -2304,6 +2350,7 @@ impl MmsProfile {
         .bind(mms_proxy_host)
         .bind(mms_proxy_port)
         .bind(mms_send_mode)
+        .bind(ftp_apn)
         .bind(sim_id)
         .execute(pool)
         .await?;

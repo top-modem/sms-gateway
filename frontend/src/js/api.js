@@ -74,6 +74,22 @@ class ApiClient {
         return FetchApi.get('/api/sms', { direction, page, per_page: perPage });
     }
 
+    /** Delete one SMS; optional scope prevents deleting a row from another SIM/phone. */
+    async deleteSms(id, simId = null, phoneNumber = null) {
+        const query = {};
+        if (simId) query.sim_id = simId;
+        if (phoneNumber) query.phone_number = phoneNumber;
+        return FetchApi.delete(`/api/sms/${id}`, query);
+    }
+
+    /** Delete all SMS for exactly one SIM or phone number. */
+    async deleteAllSms({ simId = null, phoneNumber = null } = {}) {
+        const query = {};
+        if (simId) query.sim_id = simId;
+        if (phoneNumber) query.phone_number = phoneNumber;
+        return FetchApi.delete('/api/sms', query);
+    }
+
     /**
      * Send an SMS
      * @param {string} simId - Modem ID

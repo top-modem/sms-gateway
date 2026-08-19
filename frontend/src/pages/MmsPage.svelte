@@ -27,6 +27,7 @@
   let profileMmsc = $state('');
   let profileProxyHost = $state('');
   let profileProxyPort = $state('');
+  let profileFtpApn = $state('');
   let profileSendMode = $state('modem_direct_attachment_upload');
   let profileLoading = $state(false);
   let profileSaving = $state(false);
@@ -98,6 +99,7 @@
       profileMmsc = profile.mms_mmsc ?? '';
       profileProxyHost = profile.mms_proxy_host ?? '';
       profileProxyPort = profile.mms_proxy_port != null ? String(profile.mms_proxy_port) : '';
+      profileFtpApn = profile.ftp_apn ?? '';
       profileSendMode = profile.mms_send_mode || 'modem_direct_attachment_upload';
     } catch (e) {
       console.error('Failed to load MMS profile:', e);
@@ -106,6 +108,7 @@
       profileMmsc = '';
       profileProxyHost = '';
       profileProxyPort = '';
+      profileFtpApn = '';
       profileSendMode = 'modem_direct_attachment_upload';
     } finally {
       profileLoading = false;
@@ -127,6 +130,7 @@
         proxy_host: String(profileProxyHost ?? '').trim() || null,
         proxy_port: String(profileProxyPort ?? '').trim() ? Number(String(profileProxyPort).trim()) : null,
         mms_send_mode: profileSendMode || 'modem_direct_attachment_upload',
+        ftp_apn: String(profileFtpApn ?? '').trim() || null,
       };
       await apiClient.setMmsProfile(selectedSimId, payload);
       profileSuccess = $t('msg_profile_saved');
@@ -656,6 +660,17 @@
                 id="mms-apn"
                 type="text"
                 bind:value={profileApn}
+                class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900
+                       focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500
+                       dark:border-zinc-700 dark:bg-zinc-950 dark:text-gray-100"
+              />
+            </div>
+            <div>
+              <label for="mms-ftp-apn" class="mb-1 block text-xs font-medium text-gray-700 dark:text-gray-300">{$t('mms_ftp_apn_label')}</label>
+              <input
+                id="mms-ftp-apn"
+                type="text"
+                bind:value={profileFtpApn}
                 class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900
                        focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500
                        dark:border-zinc-700 dark:bg-zinc-950 dark:text-gray-100"

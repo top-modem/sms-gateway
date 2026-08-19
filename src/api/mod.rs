@@ -204,6 +204,8 @@ pub async fn run_api(
         .route("/service/stop", post(stop_service))
         .route("/sms", get(get_sms_paginated))
         .route("/sms", post(send_sms).with_state((modem_manager.clone(), sse_manager.clone())))
+        .route("/sms", delete(delete_sms_bulk))
+        .route("/sms/{id}", delete(delete_sms_by_id))
         .route("/sms/sse", get(sse_events).with_state(sse_manager.clone()))
         // 破坏性改造: 删除所有/api/device路径，改为/api/sims
         .route(
@@ -434,6 +436,14 @@ pub struct SmsQuery {
     direction: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Default)]
+pub struct DeleteSmsQuery {
+    #[serde(default)]
+    sim_id: Option<String>,
+    #[serde(default)]
+    phone_number: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ServiceStatusResponse {
     running: bool,
@@ -512,6 +522,77 @@ async fn get_sms_paginated(Query(query): Query<SmsQuery>) -> Response {
         per_page: query.per_page,
     })
     .into_response()
+}
+
+async fn delete_sms_by_id(
+    Path(id): Path<i64>,
+    Query(query): Query<DeleteSmsQuery>,
+) -> Response {
+    match Sms::delete_by_id_scoped(
+        id,
+        query.sim_id.as_deref(),
+        query.phone_number.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => Json(json!({ "deleted": true, "id": id })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "SMS not found or scope did not match" })),
+        )
+            .into_response(),
+        Err(e) => {
+            error!("Failed to delete SMS {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to delete SMS: {}", e) })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_sms_bulk(Query(query): Query<DeleteSmsQuery>) -> Response {
+    let has_sim_id = query.sim_id.as_deref().is_some_and(|value| !value.trim().is_empty());
+    let has_phone_number = query
+        .phone_number
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if has_sim_id == has_phone_number {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Specify exactly one of sim_id or phone_number" })),
+        )
+            .into_response();
+    }
+
+    match Sms::delete_all_by_scope(
+        if has_sim_id { query.sim_id.as_deref() } else { None },
+        if has_phone_number {
+            query.phone_number.as_deref()
+        } else {
+            None
+        },
+    )
+    .await
+    {
+        Ok(deleted_count) => Json(json!({
+            "deleted": true,
+            "deleted_count": deleted_count,
+            "sim_id": query.sim_id,
+            "phone_number": query.phone_number,
+        }))
+        .into_response(),
+        Err(e) => {
+            error!("Failed to bulk delete SMS: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to bulk delete SMS: {}", e) })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn send_sms(
@@ -1914,6 +1995,7 @@ pub struct SetMmsProfilePayload {
     proxy_host: Option<String>,
     proxy_port: Option<i32>,
     mms_send_mode: Option<String>,
+    ftp_apn: Option<String>,
 }
 
 async fn set_mms_profile(
@@ -1927,6 +2009,7 @@ async fn set_mms_profile(
         payload.proxy_host.as_deref(),
         payload.proxy_port,
         payload.mms_send_mode.as_deref(),
+        payload.ftp_apn.as_deref(),
     )
     .await
     {

@@ -1,4 +1,5 @@
 pub mod core;
+pub mod ftp_uploader;
 #[cfg(not(feature = "mock-data"))]
 pub mod manager;
 #[cfg(feature = "mock-data")]

@@ -1,13 +1,10 @@
 ﻿use chrono::{Timelike, Utc};
 use log::{debug, error, info, warn};
 use std::io;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -19,6 +16,7 @@ use crate::db::{Contact, ModemSMS, SimCard, Sms};
 use crate::decode::parse_pdu_sms;
 use crate::webhook;
 
+use super::ftp_uploader;
 use super::pdu::{build_pdus, string_to_ucs2_pub};
 use super::types::*;
 
@@ -159,6 +157,7 @@ pub struct Modem {
     /// own internal retries), so repeated polling can pile up an ever-growing
     /// backlog that never drains.
     pending_commands: Arc<AtomicUsize>,
+    ftp_uploader: ftp_uploader::FtpUploader,
 }
 
 impl Modem {
@@ -249,6 +248,14 @@ impl Modem {
             pending_ftp_get: Arc::new(tokio::sync::Mutex::new(None)),
             pending_http_get: Arc::new(tokio::sync::Mutex::new(None)),
             pending_http_readfile: Arc::new(tokio::sync::Mutex::new(None)),
+            ftp_uploader: ftp_uploader::FtpUploader::new(ftp_uploader::FtpUploadConfig {
+                host: "47.237.101.133".to_string(),
+                port: 21,
+                username: "ftpuser".to_string(),
+                password: "ftpuser".to_string(),
+                timeout: Duration::from_secs(60),
+                passive: true,
+            }),
             esim_capable: RwLock::new(None),
             esim_mode: RwLock::new(false),
             pending_commands,
@@ -2530,57 +2537,8 @@ impl Modem {
         })
     }
 
-    fn ftp_upload_target(remote_name: &str) -> String {
-        const FTP_HOST: &str = "47.237.101.133";
-        const FTP_USER: &str = "ftpuser";
-        const FTP_PASS: &str = "ftpuser";
-        format!("ftp://{}:{}@{}/{}", FTP_USER, FTP_PASS, FTP_HOST, remote_name)
-    }
-
     async fn ftp_upload_to_server(&self, remote_name: &str, data: &[u8]) -> anyhow::Result<()> {
-        let upload_url = Self::ftp_upload_target(remote_name);
-        let temp_path = std::env::temp_dir().join(format!(
-            "sms_gateway_mms_{}_{}.bin",
-            self.com_port.replace(['/', '\\'], "_"),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::write(&temp_path, data).map_err(|e| anyhow::anyhow!("Failed to write temp attachment for FTP upload: {}", e))?;
-
-        let mut curl_command = Command::new("curl");
-        curl_command.args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--ftp-create-dirs",
-            "-T",
-            temp_path.to_str().unwrap(),
-            &upload_url,
-        ]);
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut curl_command, CREATE_NO_WINDOW);
-        let output = curl_command
-            .output()
-            .map_err(|e| anyhow::anyhow!("Failed to start curl for FTP upload: {}", e))?;
-
-        let _ = std::fs::remove_file(&temp_path);
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        };
-        Err(anyhow::anyhow!(
-            "FTP upload failed for {} via {}: {}",
-            remote_name,
-            upload_url,
-            if detail.is_empty() { "curl exited with non-zero status" } else { &detail }
-        ))
+        self.ftp_uploader.upload(remote_name, data).await
     }
 
     fn upload_attempt_order(mode: &str) -> Vec<&str> {

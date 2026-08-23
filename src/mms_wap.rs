@@ -29,13 +29,18 @@ use crate::decode::MmsNotificationCandidate;
 // WSP well-known header field codes (high bit set) relevant to m-notification-ind.
 const HDR_FROM: u8 = 0x89;
 const HDR_MESSAGE_CLASS: u8 = 0x8A;
+const HDR_MESSAGE_ID: u8 = 0x8B;
 const HDR_MESSAGE_TYPE: u8 = 0x8C;
 const HDR_MESSAGE_SIZE: u8 = 0x8E;
 const HDR_EXPIRY: u8 = 0x88;
+const HDR_DATE: u8 = 0x85;
+const HDR_STATUS: u8 = 0x95;
+const HDR_TO: u8 = 0x97;
 const HDR_TRANSACTION_ID: u8 = 0x98;
 const HDR_CONTENT_LOCATION: u8 = 0x83;
 
 const MMS_MSG_TYPE_NOTIFICATION_IND: u8 = 0x82;
+const MMS_MSG_TYPE_DELIVERY_IND: u8 = 0x86;
 
 // Additional well-known MMS header fields we don't need the *value* of, but
 // which real-world notifications commonly include (e.g. every notification
@@ -54,6 +59,21 @@ struct MmsNotification {
     expiry: Option<NaiveDateTime>,
 }
 
+#[derive(Debug)]
+enum MmsPush {
+    Notification(MmsNotification),
+    DeliveryReport(MmsDeliveryReport),
+    Unsupported(u8),
+}
+
+#[derive(Debug, Default)]
+struct MmsDeliveryReport {
+    message_id: String,
+    recipient: Option<String>,
+    status: Option<u8>,
+    date: Option<NaiveDateTime>,
+}
+
 /// Entry point: called for every WAP-push candidate found while reading SMS.
 /// Persists (or refreshes, if the carrier re-sent the same notification) a row
 /// in `mms_inbox`. Errors are logged by the caller and never abort the SMS read
@@ -65,7 +85,7 @@ pub async fn handle_notification_candidate(
     let raw = candidate.raw.as_slice();
 
     match decode_wap_push(raw) {
-        Ok(notif) => {
+        Ok(MmsPush::Notification(notif)) => {
             log::info!(
                 "[{}] MMS通知已解析: txn={} content_location={:?} size={:?}",
                 sim_id,
@@ -82,9 +102,39 @@ pub async fn handle_notification_candidate(
                 notif.expiry,
                 notif.message_class.as_deref(),
                 raw,
+                candidate.timestamp - chrono::Duration::hours(8),
             )
             .await
             .context("failed to persist MMS notification")?;
+        }
+        Ok(MmsPush::DeliveryReport(report)) => {
+            log::info!(
+                "[{}] MMS delivery report: message_id={} recipient={:?} status={:?}",
+                sim_id,
+                report.message_id,
+                report.recipient,
+                report.status
+            );
+            let received_at = candidate.timestamp - chrono::Duration::hours(8);
+            MmsInboxNotification::insert_delivery_report(
+                sim_id,
+                &report.message_id,
+                &candidate.sender,
+                report.recipient.as_deref(),
+                report.status,
+                report.date.unwrap_or(received_at),
+                raw,
+            )
+            .await
+            .context("failed to persist MMS delivery report")?;
+        }
+        Ok(MmsPush::Unsupported(message_type)) => {
+            log::info!(
+                "[{}] Ignoring unsupported MMS WAP-push message type 0x{:02X} from {}",
+                sim_id,
+                message_type,
+                candidate.sender
+            );
         }
         Err(e) => {
             // Best-effort decode failed (protocol details unconfirmed against
@@ -106,6 +156,7 @@ pub async fn handle_notification_candidate(
                 None,
                 None,
                 raw,
+                candidate.timestamp - chrono::Duration::hours(8),
             )
             .await
             .context("failed to persist raw MMS WAP-push payload")?;
@@ -125,7 +176,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Decodes a raw WSP "Push" PDU down to the `m-notification-ind` fields we need.
 /// Layout (WAP-230-WSP §8): `[TID][PDU-Type=0x06][Headers-Len][Headers...][Body]`
-fn decode_wap_push(data: &[u8]) -> Result<MmsNotification> {
+fn decode_wap_push(data: &[u8]) -> Result<MmsPush> {
     anyhow::ensure!(
         data.len() > 2,
         "WAP push payload too short ({} bytes)",
@@ -152,7 +203,65 @@ fn decode_wap_push(data: &[u8]) -> Result<MmsNotification> {
         "WSP push header length out of bounds"
     );
 
-    decode_mms_notification_ind(&data[body_start..])
+    let body = &data[body_start..];
+    anyhow::ensure!(
+        body.len() >= 2 && body[0] == HDR_MESSAGE_TYPE,
+        "MMS body does not start with X-Mms-Message-Type"
+    );
+
+    match body[1] {
+        MMS_MSG_TYPE_NOTIFICATION_IND => {
+            decode_mms_notification_ind(body).map(MmsPush::Notification)
+        }
+        MMS_MSG_TYPE_DELIVERY_IND => decode_mms_delivery_ind(body).map(MmsPush::DeliveryReport),
+        message_type => Ok(MmsPush::Unsupported(message_type)),
+    }
+}
+
+fn decode_mms_delivery_ind(data: &[u8]) -> Result<MmsDeliveryReport> {
+    let mut report = MmsDeliveryReport::default();
+    let mut pos = 0usize;
+
+    while pos < data.len() {
+        let field = data[pos];
+        pos += 1;
+        if pos >= data.len() {
+            break;
+        }
+
+        let step = match field {
+            HDR_MESSAGE_TYPE => Some(1),
+            HDR_MESSAGE_ID => read_text_string(&data[pos..]).ok().map(|(value, n)| {
+                report.message_id = value;
+                n
+            }),
+            HDR_TO => read_text_string(&data[pos..]).ok().map(|(value, n)| {
+                report.recipient = Some(value);
+                n
+            }),
+            HDR_DATE => read_long_integer(&data[pos..]).ok().map(|(value, n)| {
+                report.date =
+                    chrono::DateTime::from_timestamp(value as i64, 0).map(|date| date.naive_utc());
+                n
+            }),
+            HDR_STATUS => {
+                report.status = Some(data[pos]);
+                Some(1)
+            }
+            _ => skip_unknown_value(&data[pos..]),
+        };
+
+        match step {
+            Some(n) if pos + n <= data.len() => pos += n,
+            _ => break,
+        }
+    }
+
+    anyhow::ensure!(
+        !report.message_id.is_empty(),
+        "delivery report missing Message-ID"
+    );
+    Ok(report)
 }
 
 /// Decodes WAP-209 encoded MMS headers with no overall length prefix (runs to
@@ -386,4 +495,49 @@ pub(crate) fn read_long_integer(data: &[u8]) -> Result<(u64, usize)> {
         value = (value << 8) | b as u64;
     }
     Ok((value, 1 + len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOTIFICATION_PUSH: &str = "1806246170706C69636174696F6E2F766E642E7761702E6D6D732D6D65737361676500B487AF848C82982323477242353630736C3133008D9089178031383132363130313031352F545950453D504C4D4E008A808E04000005018805810303F47F83687474703A2F2F3132302E3139382E3234372E34363A38302F5F5643784D793200";
+    const DELIVERY_REPORT_PUSH: &str = "6106246170706C69636174696F6E2F766E642E7761702E6D6D732D6D65737361676500B487AF848C868D918B303832333134313233363932303031313236313938009731383132363130313031352F545950453D504C4D4E0085046A8A8F549581";
+
+    #[test]
+    fn decodes_real_notification_push() {
+        let raw = hex::decode(NOTIFICATION_PUSH).unwrap();
+        let MmsPush::Notification(notification) = decode_wap_push(&raw).unwrap() else {
+            panic!("expected notification");
+        };
+
+        assert_eq!(notification.transaction_id, "##GrB560sl13");
+        assert_eq!(
+            notification.content_location.as_deref(),
+            Some("http://120.198.247.46:80/_VCxMy2")
+        );
+        assert_eq!(notification.message_size, Some(1281));
+    }
+
+    #[test]
+    fn classifies_real_delivery_report_push() {
+        let raw = hex::decode(DELIVERY_REPORT_PUSH).unwrap();
+        assert!(matches!(
+            decode_wap_push(&raw).unwrap(),
+            MmsPush::DeliveryReport(_)
+        ));
+    }
+
+    #[test]
+    fn decodes_real_delivery_report_fields() {
+        let raw = hex::decode(DELIVERY_REPORT_PUSH).unwrap();
+        let MmsPush::DeliveryReport(report) = decode_wap_push(&raw).unwrap() else {
+            panic!("expected delivery report");
+        };
+
+        assert_eq!(report.message_id, "082314123692001126198");
+        assert_eq!(report.recipient.as_deref(), Some("18126101015/TYPE=PLMN"));
+        assert_eq!(report.status, Some(0x81));
+        assert!(report.date.is_some());
+    }
 }

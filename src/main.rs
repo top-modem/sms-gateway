@@ -198,9 +198,20 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
 
     firefox_upload_retry_worker::start_retry_worker();
 
+    let mms_default_send_mode = config::normalize_mms_send_mode(
+        config.settings.mms_send_mode.as_deref(),
+    )
+    .unwrap_or(config::MMS_SEND_MODE_DIRECT)
+    .to_string();
+    log::info!(
+        "MMS default attachment upload mode from config: {}",
+        mms_default_send_mode
+    );
+
     mms_worker::start_mms_worker(
         modem_manager.clone(),
         config.settings.mms_send_timeout_secs.unwrap_or(60),
+        mms_default_send_mode.clone(),
     );
 
     api::run_api(
@@ -213,6 +224,7 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
         transcribe_cfg,
         None,
         None,
+        mms_default_send_mode,
         #[cfg(not(feature = "mock-data"))]
         esim_service.clone(),
     )

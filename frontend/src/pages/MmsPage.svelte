@@ -142,6 +142,14 @@
     }
   }
 
+  async function handleSendModeChange(event) {
+    profileSendMode = event.currentTarget.value;
+    await saveProfile();
+    if (!profileError) {
+      await loadProfile(selectedSimId);
+    }
+  }
+
   function fileToBase64(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -379,6 +387,8 @@
     switch (status) {
       case 'fetched':
         return 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300';
+      case 'delivery_report':
+        return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300';
       case 'failed':
       case 'expired':
         return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300';
@@ -396,6 +406,7 @@
       case 'fetched': return $t('mms_inbox_status_fetched');
       case 'failed': return $t('mms_inbox_status_failed');
       case 'expired': return $t('mms_inbox_status_expired');
+      case 'delivery_report': return $t('mms_inbox_status_delivery_report');
       default: return status;
     }
   }
@@ -430,6 +441,11 @@
     return normalizeMmsSender(item?.sender) || '-';
   }
 
+  function mmsReceiverDisplay(item) {
+    const sim = sims.find((candidate) => candidate.sim_id === item?.sim_id);
+    return sim?.phone_number || sim?.com_port || item?.sim_id || '-';
+  }
+
   $effect(() => {
     if (selectedSimId) {
       loadProfile(selectedSimId);
@@ -440,10 +456,13 @@
     loadSims();
     loadHistory(1);
     loadInbox(1);
-    // Light polling so queued/sending jobs update to sent/failed without manual refresh.
+    // Light polling keeps outgoing status and newly received MMS visible without a manual refresh.
     pollTimer = setInterval(() => {
       if (hasPendingJobs()) {
         loadHistory(historyPage);
+      }
+      if (!inboxLoading) {
+        loadInbox(inboxPage);
       }
     }, 5000);
   });
@@ -647,6 +666,8 @@
               <select
                 id="mms-send-mode"
                 bind:value={profileSendMode}
+                onchange={handleSendModeChange}
+                disabled={profileSaving}
                 class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-gray-100"
               >
                 <option value="modem_direct_attachment_upload">{$t('mms_send_mode_direct')}</option>
@@ -877,6 +898,8 @@
               <tr>
                 <th class="px-4 py-2 text-left font-medium">{$t('col_time')}</th>
                 <th class="px-4 py-2 text-left font-medium">{$t('col_sender')}</th>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_received_on')}</th>
+                <th class="px-4 py-2 text-left font-medium">{$t('col_report_recipient')}</th>
                 <th class="px-4 py-2 text-left font-medium">{$t('col_transaction_id')}</th>
                 <th class="px-4 py-2 text-left font-medium">{$t('col_size')}</th>
                 <th class="px-4 py-2 text-left font-medium">{$t('col_status')}</th>
@@ -890,6 +913,8 @@
                     {formatDate(item.created_at)}
                   </td>
                   <td class="px-4 py-3">{mmsSenderDisplay(item)}</td>
+                  <td class="px-4 py-3">{mmsReceiverDisplay(item)}</td>
+                  <td class="px-4 py-3">{normalizeMmsSender(item.report_recipient) || '-'}</td>
                   <td class="max-w-[220px] truncate px-4 py-3 font-mono text-xs" title={item.transaction_id}>
                     {item.transaction_id}
                   </td>
@@ -911,7 +936,7 @@
                 </tr>
               {:else}
                 <tr>
-                  <td colspan="6" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                  <td colspan="8" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
                     {$t('mms_inbox_no_data')}
                   </td>
                 </tr>

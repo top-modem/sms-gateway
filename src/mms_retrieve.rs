@@ -215,6 +215,12 @@ fn decode_encoded_string(bytes: &[u8]) -> Option<String> {
 /// `X-Mms-Subject` value: either a plain Text-string or a Value-length
 /// `[charset][text]` pair (mirrors mmsd-tng's `extract_encoded_text`).
 fn decode_encoded_text_header(data: &[u8]) -> Option<(Option<String>, usize)> {
+    if data.first().is_some_and(|first| *first > 31) {
+        let (text, consumed) = read_text_string(data).ok()?;
+        let text = text.trim_matches(char::is_control).trim();
+        return Some(((!text.is_empty()).then(|| text.to_string()), consumed));
+    }
+
     let (val, consumed) = decode_field_value(data)?;
     let text = match val {
         WspFieldValue::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
@@ -229,6 +235,10 @@ fn decode_encoded_text_header(data: &[u8]) -> Option<(Option<String>, usize)> {
         }
         WspFieldValue::Short(_) => None,
     };
+    let text = text.and_then(|value| {
+        let value = value.trim_matches(char::is_control).trim();
+        (!value.is_empty()).then(|| value.to_string())
+    });
     Some((text, consumed))
 }
 
@@ -376,12 +386,16 @@ fn extract_part_filename(headers: &[u8]) -> Option<String> {
         let mut consumed_here = None;
         if field == PART_HDR_CONTENT_LOCATION {
             if let Ok((s, n)) = read_text_string(&headers[pos..]) {
-                filename.get_or_insert(s);
+                if let Some(s) = normalize_part_filename(&s) {
+                    filename.get_or_insert(s);
+                }
                 consumed_here = Some(n);
             }
         } else if field == PART_HDR_CONTENT_ID {
             if let Ok((s, n)) = read_text_string(&headers[pos..]) {
-                filename.get_or_insert(s.trim_matches(|c| c == '<' || c == '>').to_string());
+                if let Some(s) = normalize_part_filename(&s) {
+                    filename.get_or_insert(s);
+                }
                 consumed_here = Some(n);
             }
         }
@@ -394,6 +408,17 @@ fn extract_part_filename(headers: &[u8]) -> Option<String> {
     }
 
     filename
+}
+
+fn normalize_part_filename(value: &str) -> Option<String> {
+    let value = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .trim_matches(|c: char| {
+            c.is_control() || c.is_whitespace() || matches!(c, '"' | '<' | '>')
+        });
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// WSP well-known Content-Type assignments (http://www.wapforum.org/wina/wsp-content-type.htm),
@@ -477,6 +502,36 @@ const CONTENT_TYPES: &[&str] = &[
     "application/vnd.oma.drm.rights+xml",
     "application/vnd.oma.drm.rights+wbxml",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_empty_subject_is_none() {
+        assert_eq!(decode_encoded_text_header(&[0x7F, 0x00]), Some((None, 2)));
+    }
+
+    #[test]
+    fn quoted_subject_is_decoded_without_quote_token() {
+        assert_eq!(
+            decode_encoded_text_header(&[0x7F, b'h', b'i', 0x00]),
+            Some((Some("hi".to_string()), 4))
+        );
+    }
+
+    #[test]
+    fn part_filename_removes_transport_wrappers_and_paths() {
+        assert_eq!(
+            normalize_part_filename("\"<13590401700_1_fizz.png>"),
+            Some("13590401700_1_fizz.png".to_string())
+        );
+        assert_eq!(
+            normalize_part_filename("C:\\temp\\image000001"),
+            Some("image000001".to_string())
+        );
+    }
+}
 
 fn content_type_name(code: u8) -> Option<&'static str> {
     CONTENT_TYPES.get(code as usize).copied()

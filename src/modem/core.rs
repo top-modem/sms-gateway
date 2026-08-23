@@ -1865,7 +1865,7 @@ impl Modem {
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
         let trimmed = response.trim();
         if trimmed != "OK" && !trimmed.is_empty() {
-            log::info!("[{}] AT+CMGL raw response: {}", sim_id, trimmed);
+            log::debug!("[{}] AT+CMGL raw response: {}", sim_id, trimmed);
         }
         let (sms_list, mms_candidates) = parse_pdu_sms(&response, &sim_id);
         let mms_found = !mms_candidates.is_empty();
@@ -2509,8 +2509,18 @@ impl Modem {
         }
     }
 
-    fn host_staged_remote_name(local_ram_name: &str) -> String {
-        local_ram_name.trim_start_matches("RAM:").to_string()
+    fn host_staged_remote_name(phone_number: &str, filename: &str) -> String {
+        let cleaned_phone = crate::phone_number::normalize_msisdn(phone_number);
+        let safe_name = Self::sanitize_mms_filename(filename);
+        let extension = std::path::Path::new(&safe_name)
+            .extension()
+            .and_then(|value| value.to_str());
+
+        match (cleaned_phone.is_empty(), extension) {
+            (false, Some(extension)) => format!("{}.{}", cleaned_phone, extension),
+            (false, None) => cleaned_phone,
+            (true, _) => safe_name,
+        }
     }
 
     fn build_ftp_apn_command(apn: &str) -> String {
@@ -2584,7 +2594,7 @@ impl Modem {
             for strategy in Self::upload_attempt_order(attachment_upload_mode) {
                 match strategy {
                     "host_staged_attachment_upload" => {
-                        let remote_name = Self::host_staged_remote_name(&ram_name);
+                        let remote_name = Self::host_staged_remote_name(&own_number, filename);
                         warn!(
                             "[{}] uploading local attachment {} to FTP host as {} before modem fetch",
                             self.name, filename, remote_name
@@ -2852,7 +2862,7 @@ impl Modem {
         ))
         .await?;
         self.send_command_with_ok("AT+QFTPCFG=\"filetype\",0\r\n").await?;
-        self.send_command_with_ok("AT+QFTPCFG=\"transmode\",1\r\n").await?;
+        self.send_command_with_ok("AT+QFTPCFG=\"transmode\",0\r\n").await?;
         self.send_command_with_ok(&format!("AT+QFTPCFG=\"rsptimeout\",{}\r\n", timeout_secs.max(30)))
             .await?;
 
@@ -3562,10 +3572,14 @@ mod tests {
     }
 
     #[test]
-    fn host_staged_remote_name_strips_ram_prefix() {
+    fn host_staged_remote_name_uses_own_sim_number_and_extension() {
         assert_eq!(
-            Modem::host_staged_remote_name("RAM:8613812345678_0_a.png"),
-            "8613812345678_0_a.png"
+            Modem::host_staged_remote_name("18126101015", "image.png"),
+            "18126101015.png"
+        );
+        assert_eq!(
+            Modem::host_staged_remote_name("18126101015", "message.txt"),
+            "18126101015.txt"
         );
     }
 

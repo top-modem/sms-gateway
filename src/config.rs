@@ -7,6 +7,64 @@ use std::{collections::HashMap, fmt, path::Path, str::FromStr};
 
 const MAX_WINDOWS_COM_PORT: u16 = 128;
 
+pub const MMS_SEND_MODE_DIRECT: &str = "modem_direct_attachment_upload";
+pub const MMS_SEND_MODE_HOST_STAGED: &str = "host_staged_attachment_upload";
+
+pub fn normalize_mms_send_mode(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim) {
+        Some(MMS_SEND_MODE_DIRECT) => Some(MMS_SEND_MODE_DIRECT),
+        Some(MMS_SEND_MODE_HOST_STAGED) => Some(MMS_SEND_MODE_HOST_STAGED),
+        _ => None,
+    }
+}
+
+pub fn resolve_mms_send_mode(
+    profile_mode: Option<&str>,
+    profile_source: Option<&str>,
+    configured_default: &str,
+) -> &'static str {
+    if profile_source == Some("user") {
+        if let Some(mode) = normalize_mms_send_mode(profile_mode) {
+            return mode;
+        }
+    }
+
+    normalize_mms_send_mode(Some(configured_default)).unwrap_or(MMS_SEND_MODE_DIRECT)
+}
+
+#[cfg(test)]
+mod mms_send_mode_tests {
+    use super::*;
+
+    #[test]
+    fn config_default_applies_until_user_saves_an_override() {
+        assert_eq!(
+            resolve_mms_send_mode(
+                Some(MMS_SEND_MODE_DIRECT),
+                None,
+                MMS_SEND_MODE_HOST_STAGED,
+            ),
+            MMS_SEND_MODE_HOST_STAGED
+        );
+        assert_eq!(
+            resolve_mms_send_mode(
+                Some(MMS_SEND_MODE_DIRECT),
+                Some("user"),
+                MMS_SEND_MODE_HOST_STAGED,
+            ),
+            MMS_SEND_MODE_DIRECT
+        );
+        assert_eq!(
+            resolve_mms_send_mode(
+                Some(MMS_SEND_MODE_HOST_STAGED),
+                Some("user"),
+                MMS_SEND_MODE_DIRECT,
+            ),
+            MMS_SEND_MODE_HOST_STAGED
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub settings: Settings,

@@ -2306,26 +2306,29 @@ pub struct MmsProfile {
     pub mms_proxy_host: Option<String>,
     pub mms_proxy_port: Option<i32>,
     pub mms_send_mode: Option<String>,
+    #[serde(skip_serializing)]
+    pub mms_send_mode_source: Option<String>,
     pub ftp_apn: Option<String>,
 }
 
 impl MmsProfile {
     pub async fn get(sim_id: &str) -> Result<Option<Self>> {
         let pool = get_pool()?;
-        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> = sqlx::query_as(
-            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode, ftp_apn FROM sim_cards WHERE id = ?"#,
+        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"SELECT id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode, mms_send_mode_source, ftp_apn FROM sim_cards WHERE id = ?"#,
         )
         .bind(sim_id)
         .fetch_optional(pool)
         .await?;
         Ok(row.map(
-            |(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode, ftp_apn)| Self {
+            |(sim_id, mms_apn, mms_mmsc, mms_proxy_host, mms_proxy_port, mms_send_mode, mms_send_mode_source, ftp_apn)| Self {
                 sim_id,
                 mms_apn,
                 mms_mmsc,
                 mms_proxy_host,
                 mms_proxy_port,
                 mms_send_mode,
+                mms_send_mode_source,
                 ftp_apn,
             },
         ))
@@ -2342,13 +2345,17 @@ impl MmsProfile {
     ) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(
-            r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?, mms_send_mode = ?, ftp_apn = ?
+             r#"UPDATE sim_cards SET mms_apn = ?, mms_mmsc = ?, mms_proxy_host = ?, mms_proxy_port = ?,
+             mms_send_mode = COALESCE(?, mms_send_mode),
+             mms_send_mode_source = CASE WHEN ? IS NULL THEN mms_send_mode_source ELSE 'user' END,
+             ftp_apn = ?
                WHERE id = ?"#,
         )
         .bind(mms_apn)
         .bind(mms_mmsc)
         .bind(mms_proxy_host)
         .bind(mms_proxy_port)
+        .bind(mms_send_mode)
         .bind(mms_send_mode)
         .bind(ftp_apn)
         .bind(sim_id)
@@ -2379,6 +2386,8 @@ pub struct MmsInboxNotification {
     pub subject: Option<String>,
     pub from_address: Option<String>,
     pub fetched_at: Option<NaiveDateTime>,
+    pub report_recipient: Option<String>,
+    pub report_status: Option<i32>,
     #[serde(skip_serializing)]
     // Kept for re-processing if the decoder in mms_wap.rs/mms_retrieve.rs is
     // fixed later; not useful to API consumers.
@@ -2402,6 +2411,7 @@ impl MmsInboxNotification {
         expiry_at: Option<NaiveDateTime>,
         message_class: Option<&str>,
         notification_raw: &[u8],
+        received_at: NaiveDateTime,
     ) -> Result<()> {
         let pool = get_pool()?;
         let now = chrono::Utc::now().naive_utc();
@@ -2447,7 +2457,68 @@ impl MmsInboxNotification {
             .bind(message_class)
             .bind(expiry_at)
             .bind(notification_raw)
+            .bind(received_at)
             .bind(now)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn insert_delivery_report(
+        sim_id: &str,
+        message_id: &str,
+        sender: &str,
+        recipient: Option<&str>,
+        delivery_status: Option<u8>,
+        received_at: NaiveDateTime,
+        notification_raw: &[u8],
+    ) -> Result<()> {
+        let pool = get_pool()?;
+        let now = chrono::Utc::now().naive_utc();
+        let message_class = delivery_status.map(|status| format!("delivery-status-0x{status:02X}"));
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM mms_inbox WHERE sim_id = ? AND transaction_id = ?",
+        )
+        .bind(sim_id)
+        .bind(message_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(id) = existing {
+            sqlx::query(
+                r#"UPDATE mms_inbox
+                   SET sender = ?, report_recipient = ?, report_status = ?, message_class = ?,
+                       status = 'delivery_report',
+                       notification_raw = ?, updated_at = ?
+                   WHERE id = ?"#,
+            )
+            .bind(sender)
+            .bind(recipient)
+            .bind(delivery_status.map(i32::from))
+            .bind(message_class.as_deref())
+            .bind(notification_raw)
+            .bind(now)
+            .bind(id)
+            .execute(pool)
+            .await?;
+        } else {
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                r#"INSERT INTO mms_inbox
+                   (id, sim_id, sender, transaction_id, message_class, status, retry_count,
+                    report_recipient, report_status, notification_raw, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'delivery_report', 0, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(id)
+            .bind(sim_id)
+            .bind(sender)
+            .bind(message_id)
+            .bind(message_class.as_deref())
+            .bind(recipient)
+            .bind(delivery_status.map(i32::from))
+            .bind(notification_raw)
+            .bind(received_at)
             .bind(now)
             .execute(pool)
             .await?;
@@ -2460,7 +2531,8 @@ impl MmsInboxNotification {
         let items = sqlx::query_as(
             r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
                       message_class, expiry_at, status, error_message, retry_count, next_retry_at,
-                      subject, from_address, fetched_at, notification_raw, created_at, updated_at
+                      subject, from_address, fetched_at, report_recipient, report_status,
+                      notification_raw, created_at, updated_at
                FROM mms_inbox ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
         )
         .bind(limit)
@@ -2478,7 +2550,8 @@ impl MmsInboxNotification {
         let item = sqlx::query_as(
             r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
                       message_class, expiry_at, status, error_message, retry_count, next_retry_at,
-                      subject, from_address, fetched_at, notification_raw, created_at, updated_at
+                      subject, from_address, fetched_at, report_recipient, report_status,
+                      notification_raw, created_at, updated_at
                FROM mms_inbox WHERE id = ?"#,
         )
         .bind(id)
@@ -2496,7 +2569,8 @@ impl MmsInboxNotification {
         let items = sqlx::query_as(
             r#"SELECT id, sim_id, sender, transaction_id, content_location, message_size,
                       message_class, expiry_at, status, error_message, retry_count, next_retry_at,
-                      subject, from_address, fetched_at, notification_raw, created_at, updated_at
+                      subject, from_address, fetched_at, report_recipient, report_status,
+                      notification_raw, created_at, updated_at
                FROM mms_inbox
                WHERE status IN ('notified', 'failed')
                  AND content_location IS NOT NULL

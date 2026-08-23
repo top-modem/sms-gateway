@@ -15,13 +15,26 @@ use std::time::Duration;
 /// inbox content-fetch timeout (AT+QHTTPGET/AT+QHTTPREADFILE) -- both talk to
 /// the same MMSC/APN over similar-latency HTTP round-trips, so a single
 /// configured value is sufficient for now.
-pub fn start_mms_worker(modem_manager: ModemManagerRef, send_timeout_secs: u64) {
+pub fn start_mms_worker(
+    modem_manager: ModemManagerRef,
+    send_timeout_secs: u64,
+    default_attachment_upload_mode: String,
+) {
     tokio::spawn(async move {
-        mms_worker_loop(modem_manager, send_timeout_secs).await;
+        mms_worker_loop(
+            modem_manager,
+            send_timeout_secs,
+            default_attachment_upload_mode,
+        )
+        .await;
     });
 }
 
-async fn mms_worker_loop(modem_manager: ModemManagerRef, send_timeout_secs: u64) {
+async fn mms_worker_loop(
+    modem_manager: ModemManagerRef,
+    send_timeout_secs: u64,
+    default_attachment_upload_mode: String,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
@@ -31,7 +44,13 @@ async fn mms_worker_loop(modem_manager: ModemManagerRef, send_timeout_secs: u64)
             continue;
         }
 
-        if let Err(e) = process_queue(&modem_manager, send_timeout_secs).await {
+        if let Err(e) = process_queue(
+            &modem_manager,
+            send_timeout_secs,
+            &default_attachment_upload_mode,
+        )
+        .await
+        {
             error!("[MMS Worker] Error processing queue: {}", e);
         }
 
@@ -44,6 +63,7 @@ async fn mms_worker_loop(modem_manager: ModemManagerRef, send_timeout_secs: u64)
 async fn process_queue(
     modem_manager: &ModemManagerRef,
     send_timeout_secs: u64,
+    default_attachment_upload_mode: &str,
 ) -> anyhow::Result<()> {
     // Process a small batch per tick so one slow send doesn't starve the poll loop for long.
     let jobs = MmsMessage::get_queued(5).await?;
@@ -87,19 +107,25 @@ async fn process_queue(
         // Apply the per-SIM MMS profile (APN/MMSC/proxy) before every send — cheap AT
         // round-trips, and avoids stale config if the operator changed carriers.
         let attachment_upload_mode = match MmsProfile::get(&job.sim_id).await {
-            Ok(Some(profile)) => profile
-                .mms_send_mode
-                .clone()
-                .unwrap_or_else(|| "modem_direct_attachment_upload".to_string()),
-            Ok(None) => "modem_direct_attachment_upload".to_string(),
+            Ok(Some(profile)) => crate::config::resolve_mms_send_mode(
+                profile.mms_send_mode.as_deref(),
+                profile.mms_send_mode_source.as_deref(),
+                default_attachment_upload_mode,
+            )
+            .to_string(),
+            Ok(None) => default_attachment_upload_mode.to_string(),
             Err(e) => {
                 error!(
                     "[MMS Worker] Job {}: failed to load MMS profile: {}",
                     job.id, e
                 );
-                "modem_direct_attachment_upload".to_string()
+                default_attachment_upload_mode.to_string()
             }
         };
+        info!(
+            "[MMS Worker] Job {}: attachment upload mode={}",
+            job.id, attachment_upload_mode
+        );
 
         let mut mms_profile_for_restore: Option<(String, String, String, u16)> = None;
 

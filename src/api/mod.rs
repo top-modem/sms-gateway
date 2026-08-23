@@ -51,6 +51,11 @@ struct BarcodeState {
     launcher_path: Option<String>,
 }
 
+#[derive(Clone)]
+struct MmsProfileState {
+    default_send_mode: String,
+}
+
 fn decode_sms_center(sms_center: &str) -> String {
     // Check if it's UCS2 encoded (contains sequences like 002B, 0030, etc.)
     if sms_center.contains("002B") || sms_center.contains("0030") {
@@ -190,11 +195,15 @@ pub async fn run_api(
     transcribe_cfg: Option<Arc<TranscribeConfig>>,
     barcode_output_file: Option<String>,
     barcode_launcher_path: Option<String>,
+    mms_default_send_mode: String,
     #[cfg(not(feature = "mock-data"))] esim_service: Arc<crate::esim::EsimService>,
 ) -> anyhow::Result<()> {
     let barcode_state = BarcodeState {
         output_file: barcode_output_file,
         launcher_path: barcode_launcher_path,
+    };
+    let mms_profile_state = MmsProfileState {
+        default_send_mode: mms_default_send_mode,
     };
 
     let api = Router::new()
@@ -387,11 +396,11 @@ pub async fn run_api(
         .route("/mms/{id}", get(get_mms_detail))
         .route(
             "/sim-cards/{sim_id}/mms-profile",
-            get(get_mms_profile),
+            get(get_mms_profile).with_state(mms_profile_state.clone()),
         )
         .route(
             "/sim-cards/{sim_id}/mms-profile",
-            put(set_mms_profile),
+            put(set_mms_profile).with_state(mms_profile_state),
         )
         .route("/mms/inbox", get(get_mms_inbox_paginated))
         .route("/mms/inbox/{id}", get(get_mms_inbox_detail))
@@ -1979,9 +1988,22 @@ async fn get_mms_detail(Path(id): Path<String>) -> Response {
     Json(json!({ "job": job, "attachments": attachments })).into_response()
 }
 
-async fn get_mms_profile(Path(sim_id): Path<String>) -> Response {
+async fn get_mms_profile(
+    State(state): State<MmsProfileState>,
+    Path(sim_id): Path<String>,
+) -> Response {
     match crate::db::MmsProfile::get(&sim_id).await {
-        Ok(Some(profile)) => Json(profile).into_response(),
+        Ok(Some(mut profile)) => {
+            profile.mms_send_mode = Some(
+                crate::config::resolve_mms_send_mode(
+                    profile.mms_send_mode.as_deref(),
+                    profile.mms_send_mode_source.as_deref(),
+                    &state.default_send_mode,
+                )
+                .to_string(),
+            );
+            Json(profile).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "SIM card not found".to_string()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load MMS profile: {}", e))
             .into_response(),
@@ -1999,16 +2021,31 @@ pub struct SetMmsProfilePayload {
 }
 
 async fn set_mms_profile(
+    State(_state): State<MmsProfileState>,
     Path(sim_id): Path<String>,
     Json(payload): Json<SetMmsProfilePayload>,
 ) -> Response {
+    let mms_send_mode = match payload.mms_send_mode.as_deref() {
+        Some(value) => match crate::config::normalize_mms_send_mode(Some(value)) {
+            Some(mode) => Some(mode),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "Invalid MMS send mode"})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     match crate::db::MmsProfile::set(
         &sim_id,
         payload.apn.as_deref(),
         payload.mmsc.as_deref(),
         payload.proxy_host.as_deref(),
         payload.proxy_port,
-        payload.mms_send_mode.as_deref(),
+        mms_send_mode,
         payload.ftp_apn.as_deref(),
     )
     .await

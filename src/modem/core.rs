@@ -2062,6 +2062,13 @@ impl Modem {
             .replace("\n", "\\n")
     }
 
+    fn is_cme_error_13(err: &io::Error) -> bool {
+        let upper = err.to_string().to_ascii_uppercase();
+        upper.contains("+CME ERROR: 13")
+            || upper.contains("+CME ERROR:13")
+            || upper.contains("+CME ERROR 13")
+    }
+
     pub async fn send_sms_text(
         &self,
         contact: &Contact,
@@ -2152,13 +2159,87 @@ impl Modem {
     }
 
     pub async fn get_sim_status(&self) -> io::Result<Option<String>> {
-        self.get_modem_info("AT+CPIN?\r\n", |response| {
-            response
-                .lines()
-                .find(|line| line.starts_with("+CPIN:"))
-                .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
-        })
-        .await
+        const CPIN_RECOVERY_RETRY_ATTEMPTS: u8 = 3;
+        const CPIN_RECOVERY_RETRY_DELAY_SECS: u64 = 3;
+
+        let first_try = self
+            .get_modem_info("AT+CPIN?\r\n", |response| {
+                response
+                    .lines()
+                    .find(|line| line.starts_with("+CPIN:"))
+                    .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
+            })
+            .await;
+
+        let first_err = match first_try {
+            Ok(status) => return Ok(status),
+            Err(e) => e,
+        };
+
+        if !Self::is_cme_error_13(&first_err) {
+            return Err(first_err);
+        }
+
+        warn!(
+            "[CPIN恢复] 端口 {} (设备 {}) 检测到 +CME ERROR: 13，触发 AT+CFUN=1,1 重启恢复",
+            self.com_port,
+            self.name
+        );
+        info!(
+            "[CPIN恢复] 端口 {} 正在发送恢复命令 AT+CFUN=1,1",
+            self.com_port
+        );
+        self.reboot().await;
+
+        let mut last_err = first_err;
+        for attempt in 1..=CPIN_RECOVERY_RETRY_ATTEMPTS {
+            info!(
+                "[CPIN恢复] 端口 {} 等待 {} 秒后进行第 {}/{} 次 AT+CPIN? 重试",
+                self.com_port,
+                CPIN_RECOVERY_RETRY_DELAY_SECS,
+                attempt,
+                CPIN_RECOVERY_RETRY_ATTEMPTS
+            );
+            tokio::time::sleep(Duration::from_secs(CPIN_RECOVERY_RETRY_DELAY_SECS)).await;
+
+            match self
+                .get_modem_info("AT+CPIN?\r\n", |response| {
+                    response
+                        .lines()
+                        .find(|line| line.starts_with("+CPIN:"))
+                        .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
+                })
+                .await
+            {
+                Ok(status) => {
+                    info!(
+                        "[CPIN恢复] 端口 {} AT+CPIN? 已恢复成功（第 {}/{} 次重试）",
+                        self.com_port, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS
+                    );
+                    return Ok(status);
+                }
+                Err(e) => {
+                    warn!(
+                        "[CPIN恢复] 端口 {} 第 {}/{} 次 AT+CPIN? 重试失败: {}",
+                        self.com_port,
+                        attempt,
+                        CPIN_RECOVERY_RETRY_ATTEMPTS,
+                        e
+                    );
+                    last_err = e;
+                }
+            }
+        }
+
+        warn!(
+            "[CPIN恢复] 端口 {} 已完成 {}/{} 次重试，仍未恢复 AT+CPIN?，返回最后错误: {}",
+            self.com_port,
+            CPIN_RECOVERY_RETRY_ATTEMPTS,
+            CPIN_RECOVERY_RETRY_ATTEMPTS,
+            last_err
+        );
+
+        Err(last_err)
     }
 
     pub async fn get_memory_status(&self) -> io::Result<Option<String>> {

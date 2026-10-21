@@ -1504,7 +1504,9 @@ impl ModemManager {
         // Retry quickly here so hot-inserted cards do not wait for the next worker cycle.
         const ICCID_READ_ATTEMPTS: u8 = 8;
         const ICCID_RETRY_DELAY_MS: u64 = 500;
+        const ICCID_CME13_MAX_RECOVERIES: u8 = 2;
         let mut pre_sim_id = None;
+        let mut cme13_recoveries: u8 = 0;
         for attempt in 1..=ICCID_READ_ATTEMPTS {
             match modem.get_sim_iccid().await {
                 Ok(Some(id)) => {
@@ -1520,6 +1522,36 @@ impl ModemManager {
                     return Err(anyhow::anyhow!("No SIM detected"));
                 }
                 Err(e) => {
+                    let err_text = e.to_string();
+                    let is_cme_13 = err_text.to_ascii_uppercase().contains("+CME ERROR: 13");
+                    if is_cme_13 && cme13_recoveries < ICCID_CME13_MAX_RECOVERIES {
+                        cme13_recoveries = cme13_recoveries.saturating_add(1);
+                        log::warn!(
+                            "[USB_REPLUG_RECOVERY] {} ICCID read hit +CME ERROR: 13 (recovery {}/{}). Sending AT+CFUN=1,1 and retrying initialization.",
+                            port,
+                            cme13_recoveries,
+                            ICCID_CME13_MAX_RECOVERIES
+                        );
+                        modem.reboot().await;
+
+                        // Give the modem time to come back after CFUN reset.
+                        let mut alive = false;
+                        for _ in 0..10 {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            if modem.probe_alive().await {
+                                alive = true;
+                                break;
+                            }
+                        }
+                        if !alive {
+                            log::warn!(
+                                "[USB_REPLUG_RECOVERY] {} did not respond after ICCID-stage CFUN reset yet; continuing retries.",
+                                port
+                            );
+                        }
+                        continue;
+                    }
+
                     if attempt < ICCID_READ_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(ICCID_RETRY_DELAY_MS)).await;
                         continue;
@@ -2136,14 +2168,41 @@ impl ModemManager {
                         })
                         .unwrap_or(false);
 
+                    // USB hot-unplug can leave a stale modem object around for a
+                    // while. In that state CPIN/IMSI usually degrade to repeated
+                    // timeout/backlog errors and never self-heal unless we demote
+                    // the port so the unavailable-worker can fully re-init it.
+                    // Use a lightweight AT liveness probe to distinguish that case
+                    // from transient command-pressure spikes.
+                    let modem_alive = tokio::time::timeout(Duration::from_secs(3), modem.probe_alive())
+                        .await
+                        .unwrap_or(false);
+
+                    if !explicit_absent && !modem_alive {
+                        log::warn!(
+                            "[USB_REPLUG_RECOVERY] Treating {} as absent after liveness loss (imsi_ok={}, status={:?}, status_err={:?}, imsi_err={:?}); scheduling demotion/recovery.",
+                            modem.com_port,
+                            imsi_ok,
+                            status,
+                            status_error,
+                            imsi_error
+                        );
+                        return ProbeOutcome::ConfirmedAbsent {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                            modem,
+                        };
+                    }
+
                     if status_transient_error || imsi_transient_error {
                         log::info!(
-                            "SIM probe on {} classified as transient queue/timeout pressure (was {}, status={:?}, status_err={:?}, imsi_err={:?}); keeping modem active.",
+                            "SIM probe on {} classified as transient queue/timeout pressure (was {}, status={:?}, status_err={:?}, imsi_err={:?}, modem_alive={}); keeping modem active.",
                             modem.com_port,
                             iccid,
                             status,
                             status_error,
-                            imsi_error
+                            imsi_error,
+                            modem_alive
                         );
                     }
 

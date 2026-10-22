@@ -1504,9 +1504,9 @@ impl ModemManager {
         // Retry quickly here so hot-inserted cards do not wait for the next worker cycle.
         const ICCID_READ_ATTEMPTS: u8 = 8;
         const ICCID_RETRY_DELAY_MS: u64 = 500;
-        const ICCID_CME13_MAX_RECOVERIES: u8 = 2;
+        const ICCID_MAX_RECOVERIES: u8 = 2;
         let mut pre_sim_id = None;
-        let mut cme13_recoveries: u8 = 0;
+        let mut sim_error_recoveries: u8 = 0;
         for attempt in 1..=ICCID_READ_ATTEMPTS {
             match modem.get_sim_iccid().await {
                 Ok(Some(id)) => {
@@ -1522,15 +1522,14 @@ impl ModemManager {
                     return Err(anyhow::anyhow!("No SIM detected"));
                 }
                 Err(e) => {
-                    let err_text = e.to_string();
-                    let is_cme_13 = err_text.to_ascii_uppercase().contains("+CME ERROR: 13");
-                    if is_cme_13 && cme13_recoveries < ICCID_CME13_MAX_RECOVERIES {
-                        cme13_recoveries = cme13_recoveries.saturating_add(1);
+                    if Modem::is_recoverable_sim_error(&e) && sim_error_recoveries < ICCID_MAX_RECOVERIES && attempt < ICCID_READ_ATTEMPTS {
+                        sim_error_recoveries = sim_error_recoveries.saturating_add(1);
                         log::warn!(
-                            "[USB_REPLUG_RECOVERY] {} ICCID read hit +CME ERROR: 13 (recovery {}/{}). Sending AT+CFUN=1,1 and retrying initialization.",
+                            "[USB_REPLUG_RECOVERY] {} ICCID read failed: {} (recovery {}/{}). Sending AT+CFUN=1,1 and retrying initialization.",
                             port,
-                            cme13_recoveries,
-                            ICCID_CME13_MAX_RECOVERIES
+                            e,
+                            sim_error_recoveries,
+                            ICCID_MAX_RECOVERIES
                         );
                         modem.reboot().await;
 

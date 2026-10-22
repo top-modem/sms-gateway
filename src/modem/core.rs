@@ -541,7 +541,7 @@ impl Modem {
     /// Routes bytes: when `response_tx` is set → command-response buffer;
     ///               otherwise → URC channel, line by line.
     async fn reader_task_main(
-        mut read_half: ReadHalf<SerialStream>,
+        read_half: ReadHalf<SerialStream>,
         reader_state: Arc<Mutex<ReaderState>>,
         urc_tx: mpsc::UnboundedSender<String>,
         write_half: Arc<Mutex<Option<WriteHalf<SerialStream>>>>,
@@ -550,10 +550,11 @@ impl Modem {
         baud_rate: u32,
         connection_state: Arc<RwLock<ConnectionState>>,
     ) {
+        let mut read_half = Some(read_half);
         let mut raw_buf = [0u8; 256];
         let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
-        loop {
-            match read_half.read(&mut raw_buf).await {
+        while let Some(reader) = read_half.as_mut() {
+            match reader.read(&mut raw_buf).await {
                 Ok(0) => {
                     error!("Reader [{}]: EOF on serial port", name);
                     let ok = Self::reader_do_reconnect(
@@ -616,7 +617,7 @@ impl Modem {
     /// Reconnect: notify any pending command, reset state, attempt up to 3 reconnects.
     /// Returns `true` on success, `false` after all attempts fail.
     async fn reader_do_reconnect(
-        read_half: &mut ReadHalf<SerialStream>,
+        read_half: &mut Option<ReadHalf<SerialStream>>,
         write_half: &Arc<Mutex<Option<WriteHalf<SerialStream>>>>,
         reader_state: &Arc<Mutex<ReaderState>>,
         com_port: &str,
@@ -635,6 +636,7 @@ impl Modem {
         }
         *connection_state.write().await = ConnectionState::Disconnected;
         *write_half.lock().await = None;
+        drop(read_half.take());
 
         info!("Attempting to reconnect {} on {}", name, com_port);
         for attempt in 1..=3u32 {
@@ -643,7 +645,7 @@ impl Modem {
                 Ok(new_stream) => {
                     let (new_read, new_write) = tokio::io::split(new_stream);
                     *write_half.lock().await = Some(new_write);
-                    *read_half = new_read;
+                    *read_half = Some(new_read);
                     *connection_state.write().await = ConnectionState::Connected;
                     info!("Reconnected {} on {}", name, com_port);
                     return true;
@@ -2062,11 +2064,20 @@ impl Modem {
             .replace("\n", "\\n")
     }
 
-    fn is_cme_error_13(err: &io::Error) -> bool {
+    pub(crate) fn is_recoverable_sim_error(err: &io::Error) -> bool {
         let upper = err.to_string().to_ascii_uppercase();
-        upper.contains("+CME ERROR: 13")
-            || upper.contains("+CME ERROR:13")
-            || upper.contains("+CME ERROR 13")
+        let Some((_, tail)) = upper.split_once("+CME") else {
+            return false;
+        };
+        let Some(tail) = tail.trim_start_matches(|character: char| character.is_ascii_whitespace() || character == ':').strip_prefix("ERROR") else {
+            return false;
+        };
+        let code: String = tail
+            .trim_start_matches(|character: char| character.is_ascii_whitespace() || character == ':')
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        matches!(code.as_str(), "13" | "50")
     }
 
     pub async fn send_sms_text(
@@ -2176,14 +2187,15 @@ impl Modem {
             Err(e) => e,
         };
 
-        if !Self::is_cme_error_13(&first_err) {
+        if !Self::is_recoverable_sim_error(&first_err) {
             return Err(first_err);
         }
 
         warn!(
-            "[CPIN恢复] 端口 {} (设备 {}) 检测到 +CME ERROR: 13，触发 AT+CFUN=1,1 重启恢复",
+            "[CPIN恢复] 端口 {} (设备 {}) 检测到可恢复错误 {}，触发 AT+CFUN=1,1 重启恢复",
             self.com_port,
-            self.name
+            self.name,
+            first_err
         );
         info!(
             "[CPIN恢复] 端口 {} 正在发送恢复命令 AT+CFUN=1,1",
@@ -3619,6 +3631,20 @@ impl Modem {
 #[cfg(test)]
 mod tests {
     use super::Modem;
+
+    #[test]
+    fn recoverable_sim_error_matches_supported_codes_and_formats() {
+        for response in ["+CME ERROR: 13", "+CME ERROR:50", "+CME: ERROR 50", "+cme error 13", "Command failed: \\r\\n+CME ERROR: 50\\r\\n"] {
+            assert!(Modem::is_recoverable_sim_error(&std::io::Error::other(response)), "{}", response);
+        }
+    }
+
+    #[test]
+    fn recoverable_sim_error_rejects_other_codes() {
+        for response in ["+CME ERROR: 10", "+CME ERROR: 130", "+CME ERROR: 500", "+CMS ERROR: 50", "ERROR", "timeout"] {
+            assert!(!Modem::is_recoverable_sim_error(&std::io::Error::other(response)), "{}", response);
+        }
+    }
 
     #[test]
     fn build_ftp_apn_command_uses_configured_apn() {

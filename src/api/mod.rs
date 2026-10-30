@@ -2413,11 +2413,10 @@ async fn set_sim_phone_number(
             .into_response();
     }
 
-    // 1. Write the number into the SIM card via AT commands.
     if let Err(e) = modem_manager.set_sim_phone_number(&sim_id, &normalized).await {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Failed to write phone number to SIM: {}", e)})),
+            Json(json!({"error": format!("Failed to save phone number: {}", e)})),
         )
             .into_response();
     }

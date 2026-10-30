@@ -37,6 +37,10 @@
   let job = $state(null);
   let batchBusy = $state(false);
   let sseConn = null;
+  let batchPollTimer = null;
+  let batchStatusPending = false;
+  let batchTrackingVersion = 0;
+  let destroyed = false;
 
   const sessionPort = $derived(ports.find((p) => p.session_active)?.com_port ?? null);
   const jobRunning = $derived(job?.status === 'running');
@@ -438,8 +442,7 @@
     try {
       await apiClient.esimStartBatch({ op, items, stop_on_error: batchOptions.stop_on_error, ...options });
       connectBatchSse();
-      const snap = unwrap(await apiClient.esimGetBatch());
-      if (snap) job = snap;
+      await syncBatchStatus();
       flash($t('esim_batch_started'));
     } catch (e) {
       fail(e);
@@ -448,18 +451,49 @@
     }
   }
 
+  function stopBatchTracking() {
+    batchTrackingVersion += 1;
+    clearInterval(batchPollTimer);
+    batchPollTimer = null;
+    sseConn?.close();
+    sseConn = null;
+  }
+
+  function applyBatchSnapshot(snap) {
+    job = snap;
+    if (job?.status !== 'running') {
+      stopBatchTracking();
+      loadPorts();
+    }
+  }
+
+  async function syncBatchStatus() {
+    if (destroyed || batchStatusPending) return;
+    batchStatusPending = true;
+    const version = batchTrackingVersion;
+    try {
+      const snap = unwrap(await apiClient.esimGetBatch());
+      if (!destroyed && version === batchTrackingVersion) applyBatchSnapshot(snap);
+    } catch (_) {
+    } finally {
+      batchStatusPending = false;
+    }
+  }
+
   function connectBatchSse() {
-    if (sseConn) sseConn.close();
-    sseConn = new EventSourcePolyfill('/api/esim/batch/events', { headers: buildBasicAuthHeader(), heartbeatTimeout: 120000 });
-    sseConn.addEventListener('batch', (e) => {
+    if (destroyed) return;
+    stopBatchTracking();
+    batchPollTimer = setInterval(syncBatchStatus, 2000);
+    const connection = new EventSourcePolyfill('/api/esim/batch/events', { headers: buildBasicAuthHeader(), heartbeatTimeout: 120000 });
+    sseConn = connection;
+    connection.addEventListener('batch', (e) => {
+      if (sseConn !== connection) return;
       try {
-        job = JSON.parse(e.data);
-        if (job.status !== 'running') loadPorts();
+        applyBatchSnapshot(JSON.parse(e.data));
       } catch (_) {}
     });
-    sseConn.onerror = () => {
-      sseConn?.close();
-      sseConn = null;
+    connection.onerror = () => {
+      if (sseConn === connection) syncBatchStatus();
     };
   }
 
@@ -473,15 +507,13 @@
 
   onMount(async () => {
     await loadPorts();
-    try {
-      const snap = unwrap(await apiClient.esimGetBatch());
-      if (snap) {
-        job = snap;
-        if (snap.status === 'running') connectBatchSse();
-      }
-    } catch (_) {}
+    await syncBatchStatus();
+    if (job?.status === 'running') connectBatchSse();
   });
-  onDestroy(() => sseConn?.close());
+  onDestroy(() => {
+    destroyed = true;
+    stopBatchTracking();
+  });
 </script>
 
 <div class="flex flex-col h-dvh w-screen bg-gray-50 dark:bg-zinc-950 text-sm font-sans">

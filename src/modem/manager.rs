@@ -3144,7 +3144,7 @@ impl ModemManager {
         modem.get_sms_storage_status().await.map_err(Into::into)
     }
 
-    /// Write the user's own phone number into the SIM card and update the DB record.
+    /// Save eSIM numbers locally; physical SIMs also write the own-number phonebook.
     pub async fn set_sim_phone_number(
         &self,
         sim_id: &str,
@@ -3154,6 +3154,18 @@ impl ModemManager {
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
+
+        if modem.detect_machine_type().await == MachineType::Esim {
+            let mut card = SimCard::find_by_conditions(Some(sim_id), None, None, None)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("SIM card not found: {}", sim_id))?;
+            card.update_phone_number(Some(phone_number.to_string())).await?;
+            self.update_sim_cache(card).await;
+            log::info!("[SIM:{}] eSIM phone number saved to local database", sim_id);
+            return Ok(());
+        }
 
         log::info!("[SIM:{}] Writing phone number {} to SIM own-number phonebook", sim_id, phone_number);
         modem.write_phone_number(phone_number).await.map_err(anyhow::Error::from)?;

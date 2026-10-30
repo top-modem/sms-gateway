@@ -17,6 +17,7 @@
   const displayPort = $derived(simInfo?.com_port ?? '—');
   const displayIccid = $derived(simId ?? '—');
   const currentPhone = $derived(simInfo?.phone_number ?? '');
+  const databaseOnly = $derived(simInfo?.machine_type === 'esim');
 
   onMount(async () => {
     if (!simId) {
@@ -62,7 +63,7 @@
     loading = true;
     try {
       await apiClient.setSimPhoneNumber(simId, normalized);
-      success = $t('msg_phone_set_success');
+      success = $t(databaseOnly ? 'msg_esim_phone_set_success' : 'msg_phone_set_success');
       phoneNumber = normalized;
       // Refresh local info so the current phone display updates immediately
       const response = await apiClient.getAllSimsInfo();
@@ -90,7 +91,7 @@
     </button>
     <div class="flex items-center gap-2">
       <Icon icon="carbon:phone" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
-      <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('set_phone_title')}</h1>
+      <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t(databaseOnly ? 'set_esim_phone_title' : 'set_phone_title')}</h1>
     </div>
   </header>
 
@@ -107,8 +108,8 @@
     {:else}
       <div class="max-w-md mx-auto bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 shadow-sm p-6">
         <div class="mb-6">
-          <h2 class="text-sm font-semibold text-gray-800 dark:text-gray-100 mb-1">{$t('set_phone_subtitle')}</h2>
-          <p class="text-xs text-gray-500 dark:text-gray-400">{$t('set_phone_desc')}</p>
+          <h2 class="text-sm font-semibold text-gray-800 dark:text-gray-100 mb-1">{$t(databaseOnly ? 'set_esim_phone_subtitle' : 'set_phone_subtitle')}</h2>
+          <p class="text-xs text-gray-500 dark:text-gray-400">{$t(databaseOnly ? 'set_esim_phone_desc' : 'set_phone_desc')}</p>
         </div>
 
         <!-- SIM summary -->
@@ -146,7 +147,7 @@
                      focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
                      disabled:opacity-60 disabled:cursor-not-allowed text-sm"
             />
-            <p class="mt-1.5 text-xs text-gray-500 dark:text-gray-400">{$t('phone_input_hint')}</p>
+            <p class="mt-1.5 text-xs text-gray-500 dark:text-gray-400">{$t(databaseOnly ? 'esim_phone_input_hint' : 'phone_input_hint')}</p>
           </div>
 
           {#if error}
@@ -187,7 +188,7 @@
                 <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
                 {$t('saving')}
               {:else}
-                {$t('btn_save_number')}
+                {$t(databaseOnly ? 'btn_save_esim_number' : 'btn_save_number')}
               {/if}
             </button>
           </div>

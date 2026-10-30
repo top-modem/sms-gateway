@@ -181,7 +181,7 @@ class ApiClient {
     }
 
     /**
-     * Write the phone number into the SIM card via AT commands and persist it in the DB.
+     * Save the phone number locally; physical SIMs also write the own-number phonebook.
      * @param {string} simId - SIM card ID (ICCID)
      * @param {string} phoneNumber - Phone number to write
      */

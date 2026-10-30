@@ -51,6 +51,7 @@ tray-item = "0.10"
 webbrowser = "1.0"
 native-dialog = "0.7"
 windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+windows = { version = "0.58", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage_Streams", "Win32_System_Com"] }
 
 [dev-dependencies]
 wiremock = "0.5"

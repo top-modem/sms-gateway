@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::{Multipart, Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -29,6 +29,15 @@ pub fn routes(svc: Svc) -> Router {
         )
         .route("/esim/{com}/reset", post(reset).with_state(svc.clone()))
         .route("/esim/{com}/chip", get(chip).with_state(svc.clone()))
+        .route("/esim/{com}/inventory", get(inventory).with_state(svc.clone()))
+        .route(
+            "/esim/{com}/inventory/refresh",
+            post(inventory_refresh).with_state(svc.clone()),
+        )
+        .route(
+            "/esim/msisdn/{iccid}",
+            put(set_msisdn).with_state(svc.clone()),
+        )
         .route("/esim/{com}/profiles", get(profiles).with_state(svc.clone()))
         .route(
             "/esim/{com}/profiles/download",
@@ -113,6 +122,35 @@ async fn reset(Path(com): Path<String>, State(svc): State<Svc>) -> Result<Json<V
 
 async fn chip(Path(com): Path<String>, State(svc): State<Svc>) -> Result<Json<Value>, EsimError> {
     Ok(ok(svc.chip_info(&com).await?))
+}
+
+async fn inventory(
+    Path(com): Path<String>,
+    State(svc): State<Svc>,
+) -> Result<Json<Value>, EsimError> {
+    Ok(ok(svc.inventory(&com).await?))
+}
+
+async fn inventory_refresh(
+    Path(com): Path<String>,
+    State(svc): State<Svc>,
+) -> Result<Json<Value>, EsimError> {
+    Ok(ok(svc.refresh_inventory(&com).await?))
+}
+
+#[derive(Deserialize)]
+struct MsisdnRequest {
+    phone_number: Option<String>,
+}
+
+async fn set_msisdn(
+    Path(iccid): Path<String>,
+    State(svc): State<Svc>,
+    Json(body): Json<MsisdnRequest>,
+) -> Result<Json<Value>, EsimError> {
+    Ok(ok(svc
+        .set_profile_phone(&iccid, body.phone_number.as_deref())
+        .await?))
 }
 
 async fn profiles(
@@ -232,7 +270,9 @@ async fn provision(
 /// Scan the configured source directory for QR-image / text activation codes.
 async fn sources(State(svc): State<Svc>) -> Result<Json<Value>, EsimError> {
     svc.ready()?;
-    Ok(ok(json!(svc.scan_sources())))
+    let codes = tokio::task::spawn_blocking(move || svc.scan_sources())
+        .await.map_err(|error| EsimError::Spawn(error.to_string()))?;
+    Ok(ok(json!(codes)))
 }
 
 /// Parse uploaded QR images / text files into activation codes (no persistence).
@@ -255,7 +295,10 @@ async fn sources_upload(
             .bytes()
             .await
             .map_err(|e| EsimError::Spawn(e.to_string()))?;
-        codes.extend(crate::esim::activation::parse_file_bytes(&name, &bytes));
+        let parsed = tokio::task::spawn_blocking(move || {
+            crate::esim::activation::parse_file_bytes(&name, &bytes)
+        }).await.map_err(|error| EsimError::Spawn(error.to_string()))?;
+        codes.extend(parsed);
     }
     Ok(ok(json!(codes)))
 }

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{AcquireError, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -65,6 +65,7 @@ pub struct ModemManager {
     /// bus at once; unbounded concurrency here caused inits to stall/timeout
     /// indefinitely and left freshly-inserted SIMs stuck as "SIM REMOVED".
     init_semaphore: Arc<Semaphore>,
+    fallback_init_semaphore: Arc<Semaphore>,
     /// Background URC tasks keyed by COM port so duplicate ICCIDs stay independent.
     urc_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
     /// COM ports that are not currently usable (com_port, baud_rate)
@@ -139,7 +140,110 @@ pub struct PortRuntimeSnapshot {
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 3;
 const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 
+#[cfg(test)]
+mod recovery_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_capacity_reserves_room_for_responsive_ports() {
+        let init = Arc::new(Semaphore::new(2));
+        let fallback = Arc::new(Semaphore::new(1));
+        let first = ModemManager::acquire_recovery_capacity(&init, &fallback, false).await.unwrap();
+        let queued = tokio::spawn({
+            let init = init.clone();
+            let fallback = fallback.clone();
+            async move { ModemManager::acquire_recovery_capacity(&init, &fallback, false).await }
+        });
+        tokio::task::yield_now().await;
+        let responsive = tokio::time::timeout(
+            Duration::from_secs(1),
+            ModemManager::acquire_recovery_capacity(&init, &fallback, true),
+        ).await.expect("silent fallback must not queue ahead of a responsive port").unwrap();
+        assert!(!queued.is_finished());
+        drop(responsive);
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await.unwrap().unwrap().unwrap();
+        drop(second);
+        assert_eq!(init.available_permits(), 2);
+        assert_eq!(fallback.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_capacity_cancelled_wait_releases_fallback() {
+        let init = Arc::new(Semaphore::new(1));
+        let fallback = Arc::new(Semaphore::new(1));
+        let responsive = ModemManager::acquire_recovery_capacity(&init, &fallback, true).await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            ModemManager::acquire_recovery_capacity(&init, &fallback, false),
+        ).await.is_err());
+        assert_eq!(fallback.available_permits(), 1);
+        drop(responsive);
+        assert_eq!(init.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_capacity_preserves_the_global_limit() {
+        let init = Arc::new(Semaphore::new(1));
+        let fallback = Arc::new(Semaphore::new(1));
+        let first = ModemManager::acquire_recovery_capacity(&init, &fallback, false).await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            ModemManager::acquire_recovery_capacity(&init, &fallback, true),
+        ).await.is_err());
+        drop(first);
+        let responsive = tokio::time::timeout(
+            Duration::from_secs(1),
+            ModemManager::acquire_recovery_capacity(&init, &fallback, true),
+        ).await.unwrap().unwrap();
+        drop(responsive);
+        assert_eq!(init.available_permits(), 1);
+        assert_eq!(fallback.available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod msim_slot_tests {
+    use super::ModemManager;
+
+    #[test]
+    fn msim_slot_tracks_acknowledged_selections() {
+        for (command, expected) in [("ath1\r\n", 1), ("ATH2\r\n", 2), (" ath3 ", 3), ("ath4", 4), ("ath0", 1)] {
+            assert_eq!(ModemManager::confirmed_msim_slot(command, "\r\nOK\r\n"), Some(expected));
+        }
+    }
+
+    #[test]
+    fn msim_slot_ignores_queries_and_unrelated_commands() {
+        for command in ["ath?", "ath5", "ath10", "atl6", "AT+CFUN=1,1", "ath2\r\nath1"] {
+            assert_eq!(ModemManager::confirmed_msim_slot(command, "\r\nOK\r\n"), None);
+        }
+    }
+
+    #[test]
+    fn msim_slot_ignores_failed_or_incomplete_replies() {
+        for response in ["", "\r\nERROR\r\n", "+CME ERROR: 13", "NOT OK", "\r\nOK\r\nERROR\r\n"] {
+            assert_eq!(ModemManager::confirmed_msim_slot("ath2", response), None);
+        }
+    }
+}
+
 impl ModemManager {
+    async fn acquire_recovery_capacity(
+        init: &Arc<Semaphore>,
+        fallback: &Arc<Semaphore>,
+        responsive: bool,
+    ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), AcquireError> {
+        let fallback_permit = if responsive {
+            None
+        } else {
+            Some(fallback.clone().acquire_owned().await?)
+        };
+        let init_permit = init.clone().acquire_owned().await?;
+        Ok((init_permit, fallback_permit))
+    }
+
     fn extract_imei_from_text(text: &str) -> Option<String> {
         let tail = text.split("imei=").nth(1)?.trim();
 
@@ -688,10 +792,21 @@ impl ModemManager {
             // (each doing several AT round-trips) saturate a shared serial/USB
             // bus on large fleets, so every one of them times out and retries
             // forever, leaving freshly-inserted SIMs stuck as "SIM REMOVED".
+            let (init_permit, fallback_permit) = match tokio::time::timeout(
+                probe_interval,
+                Self::acquire_recovery_capacity(
+                    &self.init_semaphore,
+                    &self.fallback_init_semaphore,
+                    present,
+                ),
+            ).await {
+                Ok(Ok(permits)) => permits,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            };
             let port_lock = self.port_open_lock(&com_port).await;
             let _port_open_guard = port_lock.lock().await;
-            let _init_permit = self.init_semaphore.acquire().await;
-            match Self::initialize_single_modem_safe(
+            let result = Self::initialize_single_modem_safe(
                 com_port.clone(),
                 baud_rate,
                 device_id.clone(),
@@ -699,8 +814,10 @@ impl ModemManager {
                 index,
                 self.force_uk_mcc_to_46001,
             )
-            .await
-            {
+            .await;
+            drop(init_permit);
+            drop(fallback_permit);
+            match result {
                 Ok((sim_id, modem, is_new)) => {
                     let modem_arc = Arc::new(modem);
 
@@ -995,6 +1112,7 @@ impl ModemManager {
             last_known_sim_ids_by_port: Arc::new(RwLock::new(HashMap::new())),
             probe_semaphore: Arc::new(Semaphore::new(probe_concurrency)),
             init_semaphore: Arc::new(Semaphore::new(init_concurrency)),
+            fallback_init_semaphore: Arc::new(Semaphore::new(1)),
             urc_tasks: RwLock::new(HashMap::new()),
             unavailable_ports: RwLock::new(Vec::new()),
             unavailable_port_tasks: RwLock::new(HashMap::new()),
@@ -1466,6 +1584,9 @@ impl ModemManager {
             );
         }
 
+        let machine_type = modem.detect_machine_type().await;
+        log::info!("Port {} machine type: {}", port, machine_type.as_str());
+
         // Stage 3: CPIN READY is the only SIM-ready condition.
         const CPIN_READ_ATTEMPTS: u8 = 8;
         const CPIN_RETRY_DELAY_MS: u64 = 400;
@@ -1522,7 +1643,11 @@ impl ModemManager {
                     return Err(anyhow::anyhow!("No SIM detected"));
                 }
                 Err(e) => {
-                    if Modem::is_recoverable_sim_error(&e) && sim_error_recoveries < ICCID_MAX_RECOVERIES && attempt < ICCID_READ_ATTEMPTS {
+                    if Modem::is_recoverable_sim_error(&e)
+                        && sim_error_recoveries < ICCID_MAX_RECOVERIES
+                        && attempt < ICCID_READ_ATTEMPTS
+                        && modem.sim_recovery_allowed().await
+                    {
                         sim_error_recoveries = sim_error_recoveries.saturating_add(1);
                         log::warn!(
                             "[USB_REPLUG_RECOVERY] {} ICCID read failed: {} (recovery {}/{}). Sending AT+CFUN=1,1 and retrying initialization.",
@@ -2911,10 +3036,53 @@ impl ModemManager {
         self.modems.read().await.get(com_port).cloned()
     }
 
+    /// Open a configured port that has no live modem (e.g. an eSIM chip with no
+    /// enabled profile). The returned guard holds the port's open-lock so the
+    /// recovery worker waits instead of contending for the serial handle.
+    pub async fn open_standalone_modem(
+        &self,
+        com_port: &str,
+    ) -> anyhow::Result<(Arc<Modem>, tokio::sync::OwnedMutexGuard<()>)> {
+        let (index, device) = self
+            .devices
+            .iter()
+            .enumerate()
+            .find(|(_, d)| d.com_port.eq_ignore_ascii_case(com_port))
+            .ok_or_else(|| anyhow::anyhow!("Unknown configured COM port: {}", com_port))?;
+        let guard = self.port_open_lock(&device.com_port).await.lock_owned().await;
+        if self.has_active_modem_on_port(&device.com_port).await {
+            anyhow::bail!("Port {} already has a live modem", device.com_port);
+        }
+        let modem = Modem::new(
+            &device.com_port,
+            device.baud_rate,
+            &format!("standalone_{}", index),
+            index,
+            self.force_uk_mcc_to_46001,
+        )
+        .await?;
+        Ok((Arc::new(modem), guard))
+    }
+
     /// Snapshot of all currently-tracked modems (used by the eSIM service to
     /// enumerate ports and probe eSIM capability).
     pub async fn all_modems(&self) -> Vec<Arc<Modem>> {
         self.modems.read().await.values().cloned().collect()
+    }
+
+    fn confirmed_msim_slot(command: &str, response: &str) -> Option<i64> {
+        if !response.lines().any(|line| line.trim().eq_ignore_ascii_case("OK"))
+            || response.to_ascii_uppercase().contains("ERROR")
+        {
+            return None;
+        }
+        match command.trim().to_ascii_lowercase().as_str() {
+            "ath0" | "ath1" => Some(1),
+            "ath2" => Some(2),
+            "ath3" => Some(3),
+            "ath4" => Some(4),
+            _ => None,
+        }
     }
 
     pub async fn send_at_command(&self, com_port: &str, command: &str) -> anyhow::Result<String> {
@@ -2922,7 +3090,18 @@ impl ModemManager {
             .get_modem_by_com_port(com_port)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found on port: {}", com_port))?;
-        modem.send_command(command).await.map_err(Into::into)
+        let response = modem.send_command(command).await?;
+        if let Some(slot) = Self::confirmed_msim_slot(command, &response) {
+            if modem.detect_machine_type().await == MachineType::Msim {
+                crate::db::set_port_msim_slot(&modem.com_port, slot)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(
+                        "Slot {} selected on {}, but saving slot metadata failed: {}",
+                        slot, modem.com_port, error
+                    ))?;
+            }
+        }
+        Ok(response)
     }
 
     /// Force network registration (Quectel scancontrol/cops sequence) on a SIM.

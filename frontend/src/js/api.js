@@ -3,7 +3,7 @@ import FetchApi from './request';
 
 const DEFAULT_AUTH_TOKEN = 'YWRtaW46MTIzNDU2'; // admin:123456
 
-function buildBasicAuthHeader() {
+export function buildBasicAuthHeader() {
     const auth = sessionStorage.getItem('auth') || localStorage.getItem('auth');
     if (!auth) {
         return { Authorization: `Basic ${DEFAULT_AUTH_TOKEN}` };
@@ -526,10 +526,25 @@ class ApiClient {
         return FetchApi.get(`/api/esim/${com}/profiles`);
     }
 
+    /** Cached EID + profile inventory (no eSIM session needed). */
+    async esimInventory(com) {
+        return FetchApi.get(`/api/esim/${com}/inventory`);
+    }
+
+    /** Read EID + profiles from the card (enters/exits eSIM mode when needed). */
+    async esimRefreshInventory(com) {
+        return FetchApi.post(`/api/esim/${com}/inventory/refresh`);
+    }
+
+    /** Save the configured phone number of a profile (stored by ICCID). */
+    async esimSetMsisdn(iccid, phoneNumber) {
+        return FetchApi.put(`/api/esim/msisdn/${encodeURIComponent(iccid)}`, { phone_number: phoneNumber || null }, {}, 'application/json');
+    }
+
     /**
      * Download a profile.
      * @param {string} com
-     * @param {{smdp?:string, matching_id?:string, confirmation_code?:string, imei?:string, activation_code?:string}} body
+     * @param {{activation_code?:string, confirmation_code?:string, phone_number?:string, enable?:boolean}} body
      */
     async esimDownload(com, body) {
         return FetchApi.post(`/api/esim/${com}/profiles/download`, body);

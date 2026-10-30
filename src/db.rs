@@ -2815,6 +2815,179 @@ pub async fn get_latest_esim_operations_by_ports(
     Ok(out)
 }
 
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct PortHardware {
+    pub com_port: String,
+    pub machine_type: String,
+    pub type_reply: Option<String>,
+    pub eid: Option<String>,
+    pub active_slot: Option<i64>,
+    pub profiles_refreshed_at: Option<String>,
+    pub detected_at: Option<String>,
+    pub updated_at: String,
+}
+
+const PORT_HARDWARE_COLUMNS: &str = "com_port, machine_type, type_reply, eid, active_slot, profiles_refreshed_at, detected_at, updated_at";
+
+pub async fn upsert_port_machine_type(
+    com_port: &str,
+    machine_type: &str,
+    type_reply: Option<&str>,
+) -> Result<()> {
+    let pool = get_pool()?;
+    sqlx::query(
+        r#"INSERT INTO port_hardware (com_port, machine_type, type_reply, detected_at, updated_at)
+           VALUES (?, ?, ?, datetime('now'), datetime('now'))
+           ON CONFLICT(com_port) DO UPDATE SET
+               machine_type = excluded.machine_type,
+               type_reply = excluded.type_reply,
+               detected_at = excluded.detected_at,
+               updated_at = excluded.updated_at"#,
+    )
+    .bind(com_port)
+    .bind(machine_type)
+    .bind(type_reply)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_port_msim_slot(com_port: &str, slot: i64) -> Result<()> {
+    if !(1..=4).contains(&slot) {
+        return Err(anyhow::anyhow!("Multi-SIM slot must be between 1 and 4"));
+    }
+    let pool = get_pool()?;
+    sqlx::query(
+        r#"INSERT INTO port_hardware (com_port, machine_type, active_slot, updated_at)
+           VALUES (?, 'msim', ?, datetime('now'))
+           ON CONFLICT(com_port) DO UPDATE SET
+               machine_type = excluded.machine_type,
+               active_slot = excluded.active_slot,
+               updated_at = excluded.updated_at"#,
+    )
+    .bind(com_port)
+    .bind(slot)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_port_eid(com_port: &str, eid: &str) -> Result<()> {
+    let pool = get_pool()?;
+    sqlx::query(
+        r#"INSERT INTO port_hardware (com_port, machine_type, eid, updated_at)
+           VALUES (?, 'esim', ?, datetime('now'))
+           ON CONFLICT(com_port) DO UPDATE SET eid = excluded.eid, updated_at = excluded.updated_at"#,
+    )
+    .bind(com_port)
+    .bind(eid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_port_hardware(com_port: &str) -> Result<Option<PortHardware>> {
+    let pool = get_pool()?;
+    let row = sqlx::query_as::<_, PortHardware>(&format!(
+        "SELECT {} FROM port_hardware WHERE com_port = ?",
+        PORT_HARDWARE_COLUMNS
+    ))
+    .bind(com_port)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn get_port_hardware_map() -> Result<HashMap<String, PortHardware>> {
+    let pool = get_pool()?;
+    let rows = sqlx::query_as::<_, PortHardware>(&format!(
+        "SELECT {} FROM port_hardware",
+        PORT_HARDWARE_COLUMNS
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.com_port.clone(), r)).collect())
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Default)]
+pub struct EsimProfileRow {
+    pub com_port: String,
+    pub eid: Option<String>,
+    pub iccid: String,
+    pub isdp_aid: Option<String>,
+    pub profile_state: Option<String>,
+    pub nickname: Option<String>,
+    pub service_provider_name: Option<String>,
+    pub profile_name: Option<String>,
+    pub profile_class: Option<String>,
+    pub updated_at: String,
+}
+
+const ESIM_PROFILE_COLUMNS: &str = "com_port, eid, iccid, isdp_aid, profile_state, nickname, service_provider_name, profile_name, profile_class, updated_at";
+
+/// Replace the cached profile inventory of one port with a fresh `lpac profile list` result.
+pub async fn replace_esim_profiles(com_port: &str, profiles: &[EsimProfileRow]) -> Result<()> {
+    let pool = get_pool()?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM esim_profiles WHERE com_port = ?")
+        .bind(com_port)
+        .execute(&mut *tx)
+        .await?;
+    for p in profiles {
+        sqlx::query(
+            r#"INSERT INTO esim_profiles (com_port, eid, iccid, isdp_aid, profile_state, nickname,
+                   service_provider_name, profile_name, profile_class, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"#,
+        )
+        .bind(com_port)
+        .bind(&p.eid)
+        .bind(&p.iccid)
+        .bind(&p.isdp_aid)
+        .bind(&p.profile_state)
+        .bind(&p.nickname)
+        .bind(&p.service_provider_name)
+        .bind(&p.profile_name)
+        .bind(&p.profile_class)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        r#"INSERT INTO port_hardware (com_port, machine_type, profiles_refreshed_at, updated_at)
+           VALUES (?, 'esim', datetime('now'), datetime('now'))
+           ON CONFLICT(com_port) DO UPDATE SET
+               profiles_refreshed_at = excluded.profiles_refreshed_at,
+               updated_at = excluded.updated_at"#,
+    )
+    .bind(com_port)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn get_esim_profiles(com_port: &str) -> Result<Vec<EsimProfileRow>> {
+    let pool = get_pool()?;
+    let rows = sqlx::query_as::<_, EsimProfileRow>(&format!(
+        "SELECT {} FROM esim_profiles WHERE com_port = ? ORDER BY id",
+        ESIM_PROFILE_COLUMNS
+    ))
+    .bind(com_port)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn get_all_esim_profiles() -> Result<Vec<EsimProfileRow>> {
+    let pool = get_pool()?;
+    let rows = sqlx::query_as::<_, EsimProfileRow>(&format!(
+        "SELECT {} FROM esim_profiles ORDER BY com_port, id",
+        ESIM_PROFILE_COLUMNS
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn db_init() -> Result<()> {
     #[cfg(debug_assertions)]
     let db_path = "sqlite://./data/data.db";

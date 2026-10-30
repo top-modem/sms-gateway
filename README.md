@@ -56,6 +56,30 @@ cargo build --release
 
 The compiled binary will be available in `target/release/sms-gateway`.
 
+### eSIM QR Image Phone Recognition
+
+On Windows 10/11, eSIM QR imports and source-folder scans use the local Windows
+OCR engine to read a number labeled `Mobile Number`, `Phone Number`, or `MSISDN`.
+English OCR is preferred; otherwise an installed user-language OCR engine is used.
+No image is sent to an external OCR service. Windows must have an OCR language
+installed; on other platforms QR decoding still works but phone OCR is unavailable.
+
+For a single activation QR, a uniquely recognized labeled number fills the editable
+phone field in the batch-download preview. Review it before starting a download.
+SIM numbers, unlabeled digits, conflicting numbers, and images with multiple
+activation QRs are not automatically associated with a phone number. Importing an
+image alone does not download a profile or write a phone number to the database.
+The download flow stores the supplied number against the newly downloaded ICCID;
+existing profiles also have a separate phone-number edit action.
+
+The opt-in Windows image regression uses the supplied test PNG without embedding
+its activation code in the executable:
+
+```powershell
+$env:ESIM_OCR_TEST_IMAGE = (Resolve-Path .\doc\779347821.png).Path
+cargo test --release esim::activation::tests -- --include-ignored
+```
+
 ## 🚀 Running the Application
 
 ```bash

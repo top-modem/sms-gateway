@@ -23,6 +23,8 @@ pub enum EsimError {
     Spawn(String),
     /// lpac ran but returned a non-zero envelope code (or unparseable output).
     Lpac { code: i64, message: String },
+    /// The request cannot be applied (e.g. profile limit reached, no target profile).
+    Invalid(String),
 }
 
 impl std::fmt::Display for EsimError {
@@ -36,6 +38,7 @@ impl std::fmt::Display for EsimError {
             EsimError::At(m) => write!(f, "AT error: {}", m),
             EsimError::Spawn(m) => write!(f, "failed to run lpac: {}", m),
             EsimError::Lpac { code, message } => write!(f, "lpac error {}: {}", code, message),
+            EsimError::Invalid(m) => write!(f, "{}", m),
         }
     }
 }
@@ -48,7 +51,7 @@ impl IntoResponse for EsimError {
             EsimError::Disabled => StatusCode::FORBIDDEN,
             EsimError::Busy(_) | EsimError::NotInSession(_) => StatusCode::CONFLICT,
             EsimError::PortNotFound(_) => StatusCode::NOT_FOUND,
-            EsimError::NotCapable(_) => StatusCode::BAD_REQUEST,
+            EsimError::NotCapable(_) | EsimError::Invalid(_) => StatusCode::BAD_REQUEST,
             EsimError::At(_) | EsimError::Spawn(_) => StatusCode::INTERNAL_SERVER_ERROR,
             EsimError::Lpac { .. } => StatusCode::BAD_GATEWAY,
         };

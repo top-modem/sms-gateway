@@ -18,12 +18,16 @@ pub enum BatchOp {
     Delete,
     Activate,
     Deactivate,
+    Refresh,
 }
 
-/// One requested port + its activation parameters (parameters used for `download` only).
+/// One requested port + its parameters (activation fields for `download`,
+/// `iccid` to target one profile for `activate` / `deactivate` / `delete`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchReqItem {
     pub com_port: String,
+    #[serde(default)]
+    pub iccid: Option<String>,
     #[serde(default)]
     pub activation_code: Option<String>,
     #[serde(default)]
@@ -49,6 +53,9 @@ pub struct BatchRequest {
     pub replace_existing: Option<bool>,
     #[serde(default)]
     pub stop_on_error: Option<bool>,
+    /// For `delete` items without an ICCID: remove every profile on the port.
+    #[serde(default)]
+    pub all_profiles: bool,
 }
 
 /// Live status of one port within a job.

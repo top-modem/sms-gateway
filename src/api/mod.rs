@@ -1010,6 +1010,9 @@ async fn get_all_sim_info(
         }));
     }
 
+    #[cfg(not(feature = "mock-data"))]
+    add_machine_labels(&modem_manager, &mut details).await;
+
     // Sort by COM port number (COM1, COM2, ..., COM10, COM11, ...)
     details.sort_by_key(|entry| {
         entry["com_port"]
@@ -1025,6 +1028,62 @@ async fn get_all_sim_info(
         handler_start.elapsed().as_millis()
     );
     (StatusCode::OK, Json(details)).into_response()
+}
+
+/// Add machine-type fields for eSIM and Multi-SIM ports; normal ports are left untouched.
+#[cfg(not(feature = "mock-data"))]
+async fn add_machine_labels(modem_manager: &ModemManagerRef, details: &mut [serde_json::Value]) {
+    use crate::esim::{normalize_iccid, profile_display_name, profile_row_is_enabled};
+
+    let hardware = match crate::db::get_port_hardware_map().await {
+        Ok(map) => map,
+        Err(e) => {
+            log::warn!("[sims/info] failed to load port hardware: {}", e);
+            return;
+        }
+    };
+    if !hardware
+        .values()
+        .any(|h| matches!(h.machine_type.as_str(), "esim" | "msim"))
+    {
+        return;
+    }
+    let mut profiles: std::collections::HashMap<String, Vec<crate::db::EsimProfileRow>> =
+        std::collections::HashMap::new();
+    for row in crate::db::get_all_esim_profiles().await.unwrap_or_default() {
+        profiles.entry(row.com_port.clone()).or_default().push(row);
+    }
+
+    for entry in details.iter_mut() {
+        let Some(com_port) = entry["com_port"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(hw) = hardware.get(&com_port) else {
+            continue;
+        };
+        match hw.machine_type.as_str() {
+            "esim" => {
+                let esim_mode = match modem_manager.get_modem_by_com_port(&com_port).await {
+                    Some(modem) => modem.is_esim_mode().await,
+                    None => false,
+                };
+                let rows = profiles.get(&com_port).map(Vec::as_slice).unwrap_or(&[]);
+                let current = entry["sim_id"].as_str().map(normalize_iccid);
+                let active = current
+                    .and_then(|id| rows.iter().find(|r| normalize_iccid(&r.iccid) == id))
+                    .or_else(|| rows.iter().find(|r| profile_row_is_enabled(r)));
+                entry["machine_type"] = json!("esim");
+                entry["esim_mode"] = json!(esim_mode);
+                entry["esim_active_iccid"] = json!(active.map(|r| r.iccid.clone()));
+                entry["esim_active_nickname"] = json!(active.map(profile_display_name));
+            }
+            "msim" => {
+                entry["machine_type"] = json!("msim");
+                entry["msim_active_slot"] = json!(hw.active_slot);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -35,6 +35,8 @@ const TERMINATORS: &[&[u8]] = &[
     b"\r\n+CME ERROR",
     b"\r\n+CMS ERROR",
     b"\r\nESIM\r\n",
+    // Multi-SIM `ath?` reply carries no trailing OK.
+    b"\r\nMSIM",
     // AT+QFUPL "ready to receive binary data" prompt (used for MMS attachment upload).
     b"CONNECT\r\n",
 ];
@@ -143,9 +145,8 @@ pub struct Modem {
     /// file is actually written -- issuing `AT+QFDWL` right after that `OK` races the file
     /// write for larger downloads (observed on real hardware as a 0-byte file via QFDWL).
     pending_http_readfile: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<i32>>>>,
-    /// eSIM capability detection cache: `None` until `ath?` has been probed, then
-    /// `Some(true)` if the reply contains "ESIM", `Some(false)` otherwise.
-    pub esim_capable: RwLock<Option<bool>>,
+    /// Machine type from `ath?`; `None` until a probe gives a definite answer.
+    pub machine_type: RwLock<Option<MachineType>>,
     /// True while this port is in eSIM-management mode (SMS/recheck suspended).
     pub esim_mode: RwLock<bool>,
     /// Number of commands currently queued or in-flight in `command_processor`.
@@ -256,7 +257,7 @@ impl Modem {
                 timeout: Duration::from_secs(60),
                 passive: true,
             }),
-            esim_capable: RwLock::new(None),
+            machine_type: RwLock::new(None),
             esim_mode: RwLock::new(false),
             pending_commands,
         })
@@ -288,9 +289,9 @@ impl Modem {
 /// commands over the same serial port; the actual eUICC/profile work is done
 /// out-of-band via lpac over PC/SC. See esim_feature_design.txt.
 impl Modem {
-    /// Whether this port has been detected as eSIM-capable (`ath?` → contains "ESIM").
+    /// Whether this port has been detected as an eSIM machine.
     pub async fn is_esim_capable(&self) -> bool {
-        self.esim_capable.read().await.unwrap_or(false)
+        *self.machine_type.read().await == Some(MachineType::Esim)
     }
 
     /// Whether this port is currently in eSIM-management mode.
@@ -302,24 +303,49 @@ impl Modem {
         *self.esim_mode.write().await = on;
     }
 
-    /// Detect eSIM capability by sending `ath?`; the reply of an eSIM machine
-    /// contains "ESIM". A positive result is cached permanently; a negative
-    /// result (including a timed-out/failed probe, e.g. port busy during
-    /// startup) is NOT cached so a later call can retry and pick up the
-    /// correct capability instead of getting stuck as "not capable" forever.
-    pub async fn detect_esim_capability(&self) -> bool {
-        if let Some(true) = *self.esim_capable.read().await {
-            return true;
+    /// Detect the machine type with `ath?` (`ESIM`, `MSIM`, or `ERROR` for a
+    /// normal machine). Definite results are cached and persisted; an
+    /// unanswered probe falls back to the last persisted type without caching.
+    pub async fn detect_machine_type(&self) -> MachineType {
+        if let Some(cached) = *self.machine_type.read().await {
+            return cached;
         }
-        let capable =
+        // A port in eSIM mode does not answer AT commands.
+        let probed = if self.is_esim_mode().await {
+            MachineType::Unknown
+        } else {
             match tokio::time::timeout(Duration::from_secs(5), self.send_command("ath?\r\n")).await {
-                Ok(Ok(resp)) => resp.to_ascii_uppercase().contains("ESIM"),
-                _ => false,
-            };
-        if capable {
-            *self.esim_capable.write().await = Some(true);
+                Ok(Ok(resp)) => {
+                    let detected = MachineType::from_type_reply(&resp);
+                    if detected != MachineType::Unknown {
+                        let reply = Self::format_log(resp.trim());
+                        if let Err(e) = crate::db::upsert_port_machine_type(
+                            &self.com_port,
+                            detected.as_str(),
+                            Some(&reply),
+                        )
+                        .await
+                        {
+                            warn!("[{}] failed to persist machine type: {}", self.com_port, e);
+                        }
+                    }
+                    detected
+                }
+                _ => MachineType::Unknown,
+            }
+        };
+        if probed != MachineType::Unknown {
+            *self.machine_type.write().await = Some(probed);
+            return probed;
         }
-        capable
+        match crate::db::get_port_hardware(&self.com_port).await {
+            Ok(Some(hw)) => MachineType::from_db(&hw.machine_type),
+            _ => MachineType::Unknown,
+        }
+    }
+
+    pub async fn detect_esim_capability(&self) -> bool {
+        self.detect_machine_type().await == MachineType::Esim
     }
 
     /// Send a single mode-switch command (e.g. `atl6`) and require an `OK` reply.
@@ -417,6 +443,29 @@ impl Modem {
         let r = self.send_switch_command("ath0").await;
         self.set_esim_mode(false).await;
         r
+    }
+}
+
+#[cfg(test)]
+mod serial_reopen_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires MODEM_TEST_PORT and exclusive access to a port with a ready SIM"]
+    async fn serial_port_reopens_with_ready_sim() {
+        let port = std::env::var("MODEM_TEST_PORT").expect("set MODEM_TEST_PORT");
+        for cycle in 0..2 {
+            assert!(Modem::quick_probe_port(&port, 115200).await, "quick probe cycle {cycle}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let modem = Modem::new(&port, 115200, "serial_reopen_test", 0, false)
+                .await.expect("open test modem");
+            assert!(modem.is_responsive().await, "AT cycle {cycle}");
+            assert_eq!(modem.get_sim_status().await.unwrap().as_deref(), Some("READY"));
+            assert!(modem.get_sim_iccid().await.unwrap().is_some());
+            modem.shutdown().await;
+            drop(modem);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 }
 
@@ -2080,6 +2129,32 @@ impl Modem {
         matches!(code.as_str(), "13" | "50")
     }
 
+    /// Whether an `AT+CFUN=1,1` SIM recovery may run now. eSIM machines recover with
+    /// `ath0` instead, and a port is rebooted at most once per cooldown so a chip
+    /// with no SIM (e.g. an eSIM without an enabled profile) is not rebooted in a loop.
+    pub(crate) async fn sim_recovery_allowed(&self) -> bool {
+        const COOLDOWN: Duration = Duration::from_secs(600);
+        static LAST_RECOVERY: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+        > = std::sync::OnceLock::new();
+
+        if *self.machine_type.read().await == Some(MachineType::Esim) || self.is_esim_mode().await {
+            return false;
+        }
+        let mut last = LAST_RECOVERY
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match last.get(&self.com_port) {
+            Some(at) if now.duration_since(*at) < COOLDOWN => false,
+            _ => {
+                last.insert(self.com_port.clone(), now);
+                true
+            }
+        }
+    }
+
     pub async fn send_sms_text(
         &self,
         contact: &Contact,
@@ -2187,7 +2262,7 @@ impl Modem {
             Err(e) => e,
         };
 
-        if !Self::is_recoverable_sim_error(&first_err) {
+        if !Self::is_recoverable_sim_error(&first_err) || !self.sim_recovery_allowed().await {
             return Err(first_err);
         }
 

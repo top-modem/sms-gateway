@@ -58,6 +58,75 @@ fn normalize_label(label: &str) -> String {
     }
 }
 
+pub(super) fn phone_from_ocr_text(text: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let corrected_label = line.replace('0', "o").replace('I', "l").to_ascii_lowercase();
+        let value = ["mobile number", "phone number", "msisdn"]
+            .iter()
+            .find_map(|label| lower.find(label).or_else(|| corrected_label.find(label))
+                .map(|offset| &line[offset + label.len()..]));
+        let Some(value) = value else { continue };
+        let value = value.trim().trim_start_matches([':', '=', '.', '\u{ff1a}', '\u{ff0e}']).trim();
+        if !value.chars().all(|ch| ch.is_ascii_digit() || ch.is_whitespace() || "+-()".contains(ch)) {
+            continue;
+        }
+        let phone = normalize_msisdn(value);
+        if (7..=15).contains(&phone.len()) && !candidates.contains(&phone) {
+            candidates.push(phone);
+        }
+    }
+    if candidates.len() == 1 { candidates.pop() } else { None }
+}
+
+#[cfg(windows)]
+fn recognize_image_text(image: &image::GrayImage) -> anyhow::Result<String> {
+    use windows::core::HSTRING;
+    use windows::Globalization::Language;
+    use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
+    use windows::Media::Ocr::OcrEngine;
+    use windows::Storage::Streams::DataWriter;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
+    let result = (|| -> anyhow::Result<String> {
+        let language = Language::CreateLanguage(&HSTRING::from("en-US"))?;
+        let engine = if OcrEngine::IsLanguageSupported(&language)? {
+            OcrEngine::TryCreateFromLanguage(&language)?
+        } else {
+            OcrEngine::TryCreateFromUserProfileLanguages()?
+        };
+        let limit = OcrEngine::MaxImageDimension()?;
+        let resized;
+        let image = if image.width() > limit || image.height() > limit {
+            resized = image::imageops::thumbnail(image, limit, limit);
+            &resized
+        } else {
+            image
+        };
+        let writer = DataWriter::new()?;
+        writer.WriteBytes(image.as_raw())?;
+        let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+            &writer.DetachBuffer()?, BitmapPixelFormat::Gray8,
+            image.width() as i32, image.height() as i32,
+        )?;
+        let result = engine.RecognizeAsync(&bitmap)?.get()?;
+        let mut lines = Vec::new();
+        for line in result.Lines()? {
+            lines.push(line.Text()?.to_string());
+        }
+        Ok(lines.join("\n"))
+    })();
+    unsafe { CoUninitialize() };
+    result
+}
+
+#[cfg(not(windows))]
+fn recognize_image_text(_image: &image::GrayImage) -> anyhow::Result<String> {
+    anyhow::bail!("Image phone OCR requires Windows with English OCR installed")
+}
+
 /// Parse one whitespace-delimited token into an `ActivationCode`, if it is an LPA string.
 fn parse_lpa_token(tok: &str, source: &str, port_hint: Option<u32>) -> Option<ActivationCode> {
     let t = tok.trim();
@@ -97,11 +166,17 @@ pub fn decode_qr_image(bytes: &[u8], source: &str, port_hint: Option<u32>) -> Ve
         Ok(i) => i.to_luma8(),
         Err(_) => return Vec::new(),
     };
-    let mut prepared = rqrr::PreparedImage::prepare(img);
+    let mut prepared = rqrr::PreparedImage::prepare(img.clone());
     let mut out = Vec::new();
     for grid in prepared.detect_grids() {
         if let Ok((_meta, content)) = grid.decode() {
             out.extend(parse_lpa_line(&content, source, port_hint));
+        }
+    }
+    if out.len() == 1 && out[0].label.is_none() {
+        match recognize_image_text(&img) {
+            Ok(text) => out[0].label = phone_from_ocr_text(&text),
+            Err(error) => log::warn!("[eSIM] image phone OCR unavailable: {}", error),
         }
     }
     out
@@ -209,5 +284,40 @@ mod tests {
         assert_eq!(port_hint_from_stem("2"), Some(2));
         assert_eq!(port_hint_from_stem("02"), Some(2));
         assert_eq!(port_hint_from_stem("com3"), None);
+    }
+
+    #[test]
+    fn ocr_phone_uses_mobile_label_not_sim_number() {
+        assert_eq!(phone_from_ocr_text(
+            "New Mobile Number : 779347821\nPackage : PRP_16\nSim Number : 9402980000044561\nCustomer : MR"
+        ).as_deref(), Some("779347821"));
+        assert_eq!(phone_from_ocr_text("PHONE NUMBER: +94 (77) 934-7821").as_deref(), Some("94779347821"));
+        assert_eq!(phone_from_ocr_text("New M0biIe Number \u{ff0e} 779347821").as_deref(), Some("779347821"));
+        assert_eq!(phone_from_ocr_text("MOBILE NUMBER\u{ff1a} 779347821").as_deref(), Some("779347821"));
+    }
+
+    #[test]
+    fn ocr_phone_rejects_unlabelled_invalid_and_ambiguous_values() {
+        for text in [
+            "Sim Number: 9402980000044561\n779347821",
+            "Mobile Number: 77934?821",
+            "Mobile Number: 123",
+            "Mobile Number: 9402980000044561",
+            "Mobile Number: 779347821\nPhone Number: 779543395",
+        ] {
+            assert_eq!(phone_from_ocr_text(text), None, "{text}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Windows OCR and ESIM_OCR_TEST_IMAGE pointing to the supplied PNG"]
+    fn ocr_image_reads_phone_independently_of_filename() {
+        let path = std::env::var("ESIM_OCR_TEST_IMAGE").expect("set ESIM_OCR_TEST_IMAGE");
+        let bytes = std::fs::read(path).expect("read OCR image fixture");
+        let codes = parse_file_bytes("upload.png", &bytes);
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].label.as_deref(), Some("779347821"));
+        assert_eq!(codes[0].port_hint, None);
     }
 }

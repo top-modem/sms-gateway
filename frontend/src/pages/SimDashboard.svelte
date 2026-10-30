@@ -455,7 +455,7 @@
       >
         <colgroup>
           <col style="width: 48px" />
-          <col style="width: 76px" />
+          <col style="width: 116px" />
           <col style="width: 84px" />
           <col style="width: 104px" />
           <col style="width: 116px" />
@@ -565,6 +565,24 @@
                 <!-- COM Port -->
                 <td class="px-3 py-2.5 font-mono text-gray-700 dark:text-gray-200 whitespace-nowrap">
                   {info.com_port ?? '—'}
+                  {#if info.machine_type === 'esim'}
+                    <div class="mt-0.5 flex items-center gap-1 font-sans text-[11px]">
+                      <span class="rounded bg-blue-100 px-1 font-semibold text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">eSIM</span>
+                      {#if info.esim_mode}
+                        <span class="text-amber-600">{$t('dash_esim_mode')}</span>
+                      {:else}
+                        <span class="max-w-[140px] truncate text-gray-500 dark:text-gray-400" title={info.esim_active_iccid ?? ''}>{info.esim_active_nickname ?? $t('esim_no_active')}</span>
+                      {/if}
+                    </div>
+                  {:else if info.machine_type === 'msim'}
+                    <div class="mt-0.5 flex items-center gap-1 font-sans text-[11px]">
+                      <span class="rounded bg-purple-100 px-1 font-semibold text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">MSIM</span>
+                      <span class="inline-flex items-center gap-1 whitespace-nowrap text-gray-500 dark:text-gray-400">
+                        <span>{$t('dash_msim_slot')}</span>
+                        <span class="min-w-[1ch] shrink-0 font-mono font-semibold tabular-nums">{info.msim_active_slot ?? '?'}</span>
+                      </span>
+                    </div>
+                  {/if}
                 </td>
 
                 <!-- Module name -->

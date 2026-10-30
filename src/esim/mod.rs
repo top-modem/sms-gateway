@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::config::Settings;
+use crate::modem::core::Modem;
+use crate::modem::types::MachineType;
 use crate::phone_number::normalize_msisdn;
 use crate::ModemManagerRef;
 
@@ -34,17 +36,111 @@ pub struct DownloadRequest {
     pub phone_number: Option<String>,
     /// A single `LPA:1$smdp$matchingId` activation string (alternative to the fields above).
     pub activation_code: Option<String>,
+    /// Enable the downloaded profile (disabling the currently enabled one).
+    #[serde(default)]
+    pub enable: bool,
+}
+
+/// An eUICC on these machines holds at most this many profiles.
+pub const MAX_PROFILES: usize = 20;
+
+/// Canonical ICCID for comparisons: lpac and `AT+CCID` differ in case and `F` padding.
+pub fn normalize_iccid(iccid: &str) -> String {
+    iccid.trim().to_ascii_uppercase().trim_end_matches('F').to_string()
+}
+
+/// Name shown for a profile: nickname, profile name, provider, then ICCID tail.
+pub fn profile_display_name(row: &crate::db::EsimProfileRow) -> String {
+    [&row.nickname, &row.profile_name, &row.service_provider_name]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            let iccid = row.iccid.trim();
+            iccid[iccid.len().saturating_sub(6)..].to_string()
+        })
+}
+
+pub fn profile_row_is_enabled(row: &crate::db::EsimProfileRow) -> bool {
+    row.profile_state
+        .as_deref()
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "enabled" | "active"))
+        .unwrap_or(false)
+}
+
+fn str_field(profile: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| profile.get(*k).and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn profile_rows_from_list(com_port: &str, eid: Option<&str>, list: &Value) -> Vec<crate::db::EsimProfileRow> {
+    list.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    Some(crate::db::EsimProfileRow {
+                        com_port: com_port.to_string(),
+                        eid: eid.map(String::from),
+                        iccid: str_field(p, &["iccid", "ICCID"])?,
+                        isdp_aid: str_field(p, &["isdpAid", "aid"]),
+                        profile_state: str_field(p, &["profileState", "state"]),
+                        nickname: str_field(p, &["profileNickname", "nickname"]),
+                        service_provider_name: str_field(p, &["serviceProviderName", "provider"]),
+                        profile_name: str_field(p, &["profileName"]),
+                        profile_class: str_field(p, &["profileClass"]),
+                        updated_at: String::new(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_iccid_matches_modem_padding() {
+        let profile = json!({ "iccid": "8994029800000445615" });
+        assert!(EsimService::profile_matches_iccid(&profile, "8994029800000445615F"));
+        assert!(EsimService::profile_matches_iccid(&profile, " 8994029800000445615f "));
+        assert!(EsimService::profile_matches_iccid(
+            &json!({ "ICCID": "8994029800000445615F" }),
+            "8994029800000445615"
+        ));
+        assert!(!EsimService::profile_matches_iccid(&profile, "8994029800000445616F"));
+    }
+
+    #[test]
+    fn profile_iccid_rejects_missing_or_padding_only_identity() {
+        for profile in [json!({}), json!({ "iccid": "" }), json!({ "iccid": "FF" })] {
+            for iccid in ["", "F", "8994029800000445615"] {
+                assert!(!EsimService::profile_matches_iccid(&profile, iccid));
+            }
+        }
+    }
 }
 
 /// One row in the eSIM ports overview.
 #[derive(Debug, Clone, Serialize)]
 pub struct PortInfo {
     pub com_port: String,
+    pub machine_type: String,
     pub esim_capable: bool,
     pub esim_mode: bool,
     /// True if this port currently holds the machine-wide eSIM session.
     pub session_active: bool,
     pub sim_id: Option<String>,
+    pub eid: Option<String>,
+    pub profile_count: usize,
+    pub active_iccid: Option<String>,
+    pub active_name: Option<String>,
+    pub profiles_refreshed_at: Option<String>,
     pub last_op: Option<String>,
     /// `ok` when the last audited operation succeeded, otherwise `failed`.
     pub last_status: Option<String>,
@@ -60,6 +156,9 @@ pub struct EsimService {
     active: Arc<Mutex<Option<String>>>,
     /// Correlation IDs for active eSIM sessions, keyed by COM port.
     session_traces: Arc<Mutex<HashMap<String, String>>>,
+    /// Modems opened only for an eSIM session on ports without a live modem
+    /// (chips that expose no SIM until a profile is enabled).
+    standalone: Mutex<HashMap<String, (Arc<Modem>, tokio::sync::OwnedMutexGuard<()>)>>,
     lpac: Lpac,
     enabled: bool,
     default_smdp: Option<String>,
@@ -123,7 +222,8 @@ impl EsimService {
             .or_else(|| profile.get("ICCID"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        lhs.eq_ignore_ascii_case(iccid)
+        let normalized = normalize_iccid(lhs);
+        !normalized.is_empty() && normalized == normalize_iccid(iccid)
     }
 
     pub fn new(manager: ModemManagerRef, settings: &Settings) -> Self {
@@ -154,6 +254,7 @@ impl EsimService {
             manager,
             active: Arc::new(Mutex::new(None)),
             session_traces: Arc::new(Mutex::new(HashMap::new())),
+            standalone: Mutex::new(HashMap::new()),
             lpac,
             enabled: settings.esim_enabled.unwrap_or(false),
             default_smdp: settings.esim_default_smdp.clone(),
@@ -166,7 +267,7 @@ impl EsimService {
             ),
             batch: Arc::new(BatchManager::new()),
             batch_auto_enable: settings.esim_batch_auto_enable.unwrap_or(true),
-            batch_replace_existing: settings.esim_batch_replace_existing.unwrap_or(true),
+            batch_replace_existing: settings.esim_batch_replace_existing.unwrap_or(false),
             batch_stop_on_error: settings.esim_batch_stop_on_error.unwrap_or(false),
         }
     }
@@ -184,14 +285,58 @@ impl EsimService {
         self.ensure_enabled()
     }
 
-    async fn get_modem(
-        &self,
-        com_port: &str,
-    ) -> Result<Arc<crate::modem::core::Modem>, EsimError> {
-        self.manager
-            .get_modem_by_com_port(com_port)
+    async fn get_modem(&self, com_port: &str) -> Result<Arc<Modem>, EsimError> {
+        if let Some(modem) = self.manager.get_modem_by_com_port(com_port).await {
+            return Ok(modem);
+        }
+        self.standalone
+            .lock()
             .await
+            .get(com_port)
+            .map(|(modem, _)| modem.clone())
             .ok_or_else(|| EsimError::PortNotFound(com_port.to_string()))
+    }
+
+    /// Live modem of the port, or a standalone one for an eSIM port without a SIM.
+    async fn get_or_open_modem(&self, com_port: &str) -> Result<Arc<Modem>, EsimError> {
+        if let Ok(modem) = self.get_modem(com_port).await {
+            return Ok(modem);
+        }
+        let known_esim = crate::db::get_port_hardware(com_port)
+            .await
+            .ok()
+            .flatten()
+            .map(|hw| hw.machine_type == MachineType::Esim.as_str())
+            .unwrap_or(false);
+        if !known_esim {
+            return Err(EsimError::PortNotFound(com_port.to_string()));
+        }
+        let (modem, guard) = match self.manager.open_standalone_modem(com_port).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                return self
+                    .manager
+                    .get_modem_by_com_port(com_port)
+                    .await
+                    .ok_or_else(|| EsimError::At(error.to_string()));
+            }
+        };
+        log::info!("[eSIM] opened {} without a live modem for eSIM management", com_port);
+        self.standalone
+            .lock()
+            .await
+            .insert(com_port.to_string(), (modem.clone(), guard));
+        Ok(modem)
+    }
+
+    /// Close a standalone modem so the recovery worker can re-initialize the port.
+    async fn release_standalone(&self, com_port: &str) {
+        let entry = self.standalone.lock().await.remove(com_port);
+        if let Some((modem, guard)) = entry {
+            modem.shutdown().await;
+            drop(guard);
+            log::info!("[eSIM] released standalone modem on {}", com_port);
+        }
     }
 
     async fn clear_active_if_matches(&self, com_port: &str) {
@@ -206,7 +351,7 @@ impl EsimService {
     async fn clear_stale_active_session(&self) {
         let active_port = { self.active.lock().await.clone() };
         if let Some(port) = active_port {
-            let still_present = self.manager.get_modem_by_com_port(&port).await.is_some();
+            let still_present = self.get_modem(&port).await.is_ok();
             if !still_present {
                 log::warn!(
                     "[eSIM] clearing stale active session gate for missing port {}",
@@ -217,24 +362,45 @@ impl EsimService {
         }
     }
 
-    /// List every tracked port, probing eSIM capability (cached after first probe).
+    /// List every configured port; ports without a live modem use their saved machine type.
     pub async fn list_ports(&self) -> Result<Vec<PortInfo>, EsimError> {
         self.ensure_enabled()?;
         let active = self.active.lock().await.clone();
-        let modems = self.manager.all_modems().await;
+        let snapshots = self.manager.get_port_runtime_snapshots().await;
         let latest_by_port = crate::db::get_latest_esim_operations_by_ports(
-            &modems
+            &snapshots
                 .iter()
-                .map(|m| m.com_port.clone())
+                .map(|s| s.com_port.clone())
                 .collect::<Vec<_>>(),
         )
         .await
         .unwrap_or_default();
+        let hardware = crate::db::get_port_hardware_map().await.unwrap_or_default();
+        let mut cached: HashMap<String, Vec<crate::db::EsimProfileRow>> = HashMap::new();
+        for row in crate::db::get_all_esim_profiles().await.unwrap_or_default() {
+            cached.entry(row.com_port.clone()).or_default().push(row);
+        }
         let mut out = Vec::new();
-        for modem in modems {
-            let capable = modem.detect_esim_capability().await;
-            let sim_id = modem.sim_id.read().await.clone();
-            let latest = latest_by_port.get(&modem.com_port);
+        for snapshot in snapshots {
+            let com_port = snapshot.com_port;
+            let hw = hardware.get(&com_port);
+            let (machine_type, esim_mode, sim_id) = match self.get_modem(&com_port).await {
+                Ok(modem) => (
+                    modem.detect_machine_type().await,
+                    modem.is_esim_mode().await,
+                    modem.sim_id.read().await.clone(),
+                ),
+                Err(_) => (
+                    hw.map(|h| MachineType::from_db(&h.machine_type))
+                        .unwrap_or(MachineType::Unknown),
+                    false,
+                    None,
+                ),
+            };
+            let capable = machine_type == MachineType::Esim;
+            let rows = cached.get(&com_port).map(Vec::as_slice).unwrap_or(&[]);
+            let active_row = rows.iter().find(|r| profile_row_is_enabled(r));
+            let latest = latest_by_port.get(&com_port);
             let last_status = latest.map(|op| {
                 if op.result_code == Some(0)
                     || op
@@ -249,11 +415,17 @@ impl EsimService {
                 }
             });
             out.push(PortInfo {
-                com_port: modem.com_port.clone(),
+                com_port: com_port.clone(),
+                machine_type: machine_type.as_str().to_string(),
                 esim_capable: capable,
-                esim_mode: modem.is_esim_mode().await,
-                session_active: active.as_deref() == Some(modem.com_port.as_str()),
+                esim_mode,
+                session_active: active.as_deref() == Some(com_port.as_str()),
                 sim_id,
+                eid: hw.and_then(|h| h.eid.clone()),
+                profile_count: rows.len(),
+                active_iccid: active_row.map(|r| r.iccid.clone()),
+                active_name: active_row.map(profile_display_name),
+                profiles_refreshed_at: hw.and_then(|h| h.profiles_refreshed_at.clone()),
                 last_op: latest.map(|op| op.op_type.clone()),
                 last_status,
                 last_message: latest.and_then(|op| op.message.clone()),
@@ -277,21 +449,32 @@ impl EsimService {
     pub async fn enter(&self, com_port: &str) -> Result<(), EsimError> {
         self.ensure_enabled()?;
         self.clear_stale_active_session().await;
-        let modem = self.get_modem(com_port).await?;
+        if let Some(p) = self.active.lock().await.as_deref() {
+            if p != com_port {
+                return Err(EsimError::Busy(p.to_string()));
+            }
+        }
+        let modem = self.get_or_open_modem(com_port).await?;
         if !modem.detect_esim_capability().await {
+            self.release_standalone(com_port).await;
             return Err(EsimError::NotCapable(com_port.to_string()));
         }
 
         let mut already_active = false;
+        let mut busy_with = None;
         {
             let mut active = self.active.lock().await;
             match active.as_deref() {
                 Some(p) if p == com_port => {
                     already_active = true;
                 } // already ours; idempotent
-                Some(p) => return Err(EsimError::Busy(p.to_string())),
+                Some(p) => busy_with = Some(p.to_string()),
                 None => *active = Some(com_port.to_string()),
             }
+        }
+        if let Some(p) = busy_with {
+            self.release_standalone(com_port).await;
+            return Err(EsimError::Busy(p));
         }
 
         let trace_id = if already_active {
@@ -308,20 +491,18 @@ impl EsimService {
             if already_active { " (idempotent)" } else { "" }
         );
 
-        // Perform the serial mode switch. If the transition times out, reset and retry once.
+        // If the transition fails, restore factory state with ath0 and retry once.
         let mut enter_result = modem.esim_enter().await;
         if let Err(e) = &enter_result {
-            if Self::is_timeout_error(e, &["atl6", "ath7"]) {
-                log::warn!(
-                    "[eSIM][trace={}] enter timeout on {}; reset and retry once: {}",
-                    trace_id,
-                    com_port,
-                    e
-                );
-                let _ = modem.esim_reset().await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                enter_result = modem.esim_enter().await;
-            }
+            log::warn!(
+                "[eSIM][trace={}] enter failed on {}; ath0 reset and retry once: {}",
+                trace_id,
+                com_port,
+                e
+            );
+            let _ = modem.esim_reset().await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            enter_result = modem.esim_enter().await;
         }
 
         // On failure, reset back to normal mode and release the gate.
@@ -329,6 +510,7 @@ impl EsimService {
             let reset_result = modem.esim_reset().await;
             *self.active.lock().await = None;
             self.clear_session_trace(com_port).await;
+            self.release_standalone(com_port).await;
             if let Err(re) = reset_result {
                 log::warn!(
                     "[eSIM][trace={}] enter failed on {}; fallback reset also failed: {}",
@@ -418,6 +600,7 @@ impl EsimService {
         }
         self.clear_active_if_matches(com_port).await;
         self.clear_session_trace(com_port).await;
+        self.release_standalone(com_port).await;
 
         match &result {
             Ok(_) => {
@@ -482,7 +665,7 @@ impl EsimService {
             .await
             .unwrap_or_else(Self::new_trace_id);
         log::info!("[eSIM][trace={}] reset requested on {}", trace_id, com_port);
-        let modem = self.get_modem(com_port).await?;
+        let modem = self.get_or_open_modem(com_port).await?;
         let result = modem.esim_reset().await;
         {
             let mut active = self.active.lock().await;
@@ -491,6 +674,7 @@ impl EsimService {
             }
         }
         self.clear_session_trace(com_port).await;
+        self.release_standalone(com_port).await;
         match &result {
             Ok(_) => {
                 let _ = self.audit(com_port, "reset", Some(0), Some("ok")).await;
@@ -513,13 +697,130 @@ impl EsimService {
     pub async fn chip_info(&self, com_port: &str) -> Result<Value, EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
-        self.lpac.chip_info().await
+        let info = self.lpac.chip_info().await?;
+        if let Some(eid) = str_field(&info, &["eidValue", "eid", "EID"]) {
+            if let Err(e) = crate::db::set_port_eid(com_port, &eid).await {
+                log::warn!("[eSIM] failed to store EID for {}: {}", com_port, e);
+            }
+        }
+        Ok(info)
     }
 
+    /// Live `lpac profile list`; also refreshes the cached inventory of the port.
     pub async fn profiles(&self, com_port: &str) -> Result<Value, EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
-        self.lpac.profile_list().await
+        let list = self.lpac.profile_list().await?;
+        let eid = crate::db::get_port_hardware(com_port)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|h| h.eid);
+        let rows = profile_rows_from_list(com_port, eid.as_deref(), &list);
+        if let Err(e) = crate::db::replace_esim_profiles(com_port, &rows).await {
+            log::warn!("[eSIM] failed to cache profiles for {}: {}", com_port, e);
+        }
+        Ok(list)
+    }
+
+    /// Cached EID and profile inventory of a port; works without an eSIM session.
+    pub async fn inventory(&self, com_port: &str) -> Result<Value, EsimError> {
+        self.ensure_enabled()?;
+        let hw = crate::db::get_port_hardware(com_port).await.ok().flatten();
+        let rows = crate::db::get_esim_profiles(com_port).await.unwrap_or_default();
+        let phones = Self::phone_numbers_by_iccid().await;
+        let session_active = self.active.lock().await.as_deref() == Some(com_port);
+        let profiles: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "iccid": r.iccid,
+                    "isdp_aid": r.isdp_aid,
+                    "state": if profile_row_is_enabled(r) { "enabled" } else { "disabled" },
+                    "nickname": r.nickname,
+                    "profile_name": r.profile_name,
+                    "service_provider_name": r.service_provider_name,
+                    "profile_class": r.profile_class,
+                    "display_name": profile_display_name(r),
+                    "phone_number": phones.get(&normalize_iccid(&r.iccid)),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "com_port": com_port,
+            "eid": hw.as_ref().and_then(|h| h.eid.clone()),
+            "profiles_refreshed_at": hw.as_ref().and_then(|h| h.profiles_refreshed_at.clone()),
+            "max_profiles": MAX_PROFILES,
+            "session_active": session_active,
+            "profiles": profiles,
+        }))
+    }
+
+    /// Read EID and profiles from the eUICC, entering and leaving eSIM mode if needed.
+    pub async fn refresh_inventory(&self, com_port: &str) -> Result<Value, EsimError> {
+        self.ensure_enabled()?;
+        let in_session = self.active.lock().await.as_deref() == Some(com_port);
+        if !in_session {
+            self.enter(com_port).await?;
+        }
+        if let Err(e) = self.chip_info(com_port).await {
+            log::warn!("[eSIM] chip info failed during refresh on {}: {}", com_port, e);
+        }
+        let listed = self.profiles(com_port).await;
+        if !in_session {
+            self.cleanup_session(com_port).await;
+        }
+        listed?;
+        self.inventory(com_port).await
+    }
+
+    async fn phone_numbers_by_iccid() -> HashMap<String, String> {
+        crate::db::SimCard::query_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| {
+                let phone = c.phone_number.filter(|p| !p.trim().is_empty())?;
+                Some((normalize_iccid(&c.id), phone))
+            })
+            .collect()
+    }
+
+    /// Store the configured phone number of a profile in `sim_cards`, keyed by ICCID.
+    pub async fn set_profile_phone(
+        &self,
+        iccid: &str,
+        raw_phone_number: Option<&str>,
+    ) -> Result<Value, EsimError> {
+        self.ensure_enabled()?;
+        let iccid = iccid.trim();
+        if iccid.is_empty() {
+            return Err(EsimError::Invalid("ICCID is required".to_string()));
+        }
+        let phone_number = Self::normalized_phone_number(raw_phone_number);
+        let target = normalize_iccid(iccid);
+        let cards = crate::db::SimCard::query_all()
+            .await
+            .map_err(|e| EsimError::Spawn(e.to_string()))?;
+        if let Some(mut card) = cards.into_iter().find(|c| normalize_iccid(&c.id) == target) {
+            card.update_phone_number(phone_number.clone())
+                .await
+                .map_err(|e| EsimError::Spawn(e.to_string()))?;
+            self.manager.refresh_sim_cache(&[card.id.clone()]).await;
+        } else if phone_number.is_some() {
+            let now = chrono::Utc::now().naive_utc();
+            crate::db::SimCard {
+                id: iccid.to_string(),
+                phone_number: phone_number.clone(),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            }
+            .insert()
+            .await
+            .map_err(|e| EsimError::Spawn(e.to_string()))?;
+        }
+        Ok(json!({ "iccid": iccid, "phone_number": phone_number }))
     }
 
     pub async fn download(
@@ -529,6 +830,15 @@ impl EsimService {
     ) -> Result<Value, EsimError> {
         self.ensure_enabled()?;
         self.ensure_session(com_port).await?;
+        let before = self.list_profile_iccids(com_port).await?;
+        if before.len() >= MAX_PROFILES {
+            return Err(EsimError::Invalid(format!(
+                "eUICC on {} already holds {} profiles (max {})",
+                com_port,
+                before.len(),
+                MAX_PROFILES
+            )));
+        }
         let smdp = req.smdp.as_deref().or(self.default_smdp.as_deref());
         let result = self
             .lpac
@@ -543,14 +853,39 @@ impl EsimService {
         let params = serde_json::to_string(req).ok();
         self.audit_result(com_port, "download", params.as_deref(), &result)
             .await;
-        if let Ok(downloaded) = &result {
-            if let Some(iccid) = self.resolve_downloaded_iccid(com_port, downloaded).await {
-                let _ = self
-                    .persist_download_phone_number(&iccid, req.phone_number.as_deref(), com_port)
-                    .await;
+        let downloaded = result?;
+
+        let before_norm: Vec<String> = before.iter().map(|i| normalize_iccid(i)).collect();
+        let after = self.list_profile_iccids(com_port).await.unwrap_or_default();
+        let iccid = after
+            .into_iter()
+            .find(|i| !before_norm.contains(&normalize_iccid(i)))
+            .or_else(|| str_field(&downloaded, &["iccid", "ICCID"]));
+
+        let mut enabled = false;
+        let mut enable_error = None;
+        if let Some(iccid) = &iccid {
+            if req.phone_number.is_some() {
+                if let Err(e) = self.set_profile_phone(iccid, req.phone_number.as_deref()).await {
+                    log::warn!("[eSIM] failed to store phone number for {}: {}", iccid, e);
+                }
             }
+            if req.enable {
+                match self.enable(com_port, iccid, true).await {
+                    Ok(_) => enabled = true,
+                    Err(e) => enable_error = Some(e.to_string()),
+                }
+            }
+        } else if req.enable {
+            enable_error = Some("downloaded ICCID could not be determined".to_string());
         }
-        result
+
+        Ok(json!({
+            "iccid": iccid,
+            "enabled": enabled,
+            "enable_error": enable_error,
+            "result": downloaded,
+        }))
     }
 
     pub async fn enable(
@@ -572,6 +907,33 @@ impl EsimService {
             iccid
         );
         let mut result = self.lpac.profile_enable(iccid, refresh).await;
+        if result.is_err() {
+            // Only one profile may be enabled: disable the current one, then retry.
+            if let Ok(list) = self.lpac.profile_list().await {
+                let profiles = list.as_array().cloned().unwrap_or_default();
+                let target_enabled = profiles
+                    .iter()
+                    .any(|p| Self::profile_matches_iccid(p, iccid) && Self::profile_is_enabled(p));
+                let others: Vec<String> = profiles
+                    .iter()
+                    .filter(|p| Self::profile_is_enabled(p) && !Self::profile_matches_iccid(p, iccid))
+                    .filter_map(|p| str_field(p, &["iccid", "ICCID"]))
+                    .collect();
+                if !target_enabled && !others.is_empty() {
+                    log::info!(
+                        "[eSIM][trace={}] disabling {:?} on {} before enabling {}",
+                        trace_id,
+                        others,
+                        com_port,
+                        iccid
+                    );
+                    for other in &others {
+                        let _ = self.lpac.profile_disable(other, refresh).await;
+                    }
+                    result = self.lpac.profile_enable(iccid, refresh).await;
+                }
+            }
+        }
         if let Err(err) = &result {
             let orig_error = err.to_string();
             // Some modems/lpac builds return an error even when the profile has already switched.
@@ -618,6 +980,9 @@ impl EsimService {
             }
         }
         self.audit_result(com_port, "enable", Some(iccid), &result).await;
+        if result.is_ok() {
+            let _ = self.profiles(com_port).await;
+        }
         result
     }
 
@@ -686,6 +1051,9 @@ impl EsimService {
             }
         }
         self.audit_result(com_port, "disable", Some(iccid), &result).await;
+        if result.is_ok() {
+            let _ = self.profiles(com_port).await;
+        }
         result
     }
 
@@ -702,6 +1070,20 @@ impl EsimService {
             com_port,
             iccid
         );
+        let target_enabled = self
+            .lpac
+            .profile_list()
+            .await
+            .ok()
+            .and_then(|list| list.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .any(|p| Self::profile_matches_iccid(p, iccid) && Self::profile_is_enabled(p))
+            })
+            .unwrap_or(false);
+        if target_enabled {
+            let _ = self.lpac.profile_disable(iccid, true).await;
+        }
         let mut result = self.lpac.profile_delete(iccid).await;
         if let Err(err) = &result {
             let orig_error = err.to_string();
@@ -745,6 +1127,9 @@ impl EsimService {
             }
         }
         self.audit_result(com_port, "delete", Some(iccid), &result).await;
+        if result.is_ok() {
+            let _ = self.profiles(com_port).await;
+        }
         result
     }
 
@@ -759,6 +1144,9 @@ impl EsimService {
         let result = self.lpac.profile_nickname(iccid, name).await;
         self.audit_result(com_port, "nickname", Some(iccid), &result)
             .await;
+        if result.is_ok() {
+            let _ = self.profiles(com_port).await;
+        }
         result
     }
 
@@ -823,94 +1211,18 @@ impl EsimService {
         com_port: &str,
         req: &DownloadRequest,
     ) -> Result<Value, EsimError> {
-        let downloaded = self.download(com_port, req).await?;
-
-        // Best-effort: enable the freshly-downloaded profile if we can find its ICCID.
-        // Some lpac builds return success without an ICCID field, so fall back to
-        // querying current profile list in-session.
-        if let Some(iccid) = self
-            .resolve_downloaded_iccid(com_port, &downloaded)
-            .await
-        {
-            let _ = self
-                .persist_download_phone_number(&iccid, req.phone_number.as_deref(), com_port)
-                .await;
-            let _ = self.enable(com_port, &iccid, true).await;
-        }
+        let mut req = req.clone();
+        req.enable = true;
+        let downloaded = self.download(com_port, &req).await?;
 
         // Process any pending notifications (GSMA compliance), removing them.
-        if let Ok(list) = self.notification_list(com_port).await {
-            if let Some(items) = list.as_array() {
-                for item in items {
-                    if let Some(seq) = item
-                        .get("seqNumber")
-                        .and_then(|v| v.as_i64())
-                        .map(|n| n.to_string())
-                    {
-                        let _ = self.notification_process(com_port, &seq, true).await;
-                    }
-                }
-            }
-        }
+        self.process_all_notifications(com_port).await;
 
         Ok(downloaded)
     }
 
-    async fn resolve_downloaded_iccid(&self, com_port: &str, downloaded: &Value) -> Option<String> {
-        downloaded
-            .get("iccid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or(self.current_iccid(com_port).await.ok().flatten())
-    }
-
     fn normalized_phone_number(raw: Option<&str>) -> Option<String> {
         raw.map(normalize_msisdn).filter(|p| !p.is_empty())
-    }
-
-    async fn persist_download_phone_number(
-        &self,
-        iccid: &str,
-        raw_phone_number: Option<&str>,
-        com_port: &str,
-    ) -> Result<(), EsimError> {
-        let Some(phone_number) = Self::normalized_phone_number(raw_phone_number) else {
-            return Ok(());
-        };
-
-        match crate::db::SimCard::find_by_conditions(Some(iccid), None, None, None).await {
-            Ok(mut cards) if !cards.is_empty() => {
-                let mut card = cards.remove(0);
-                if card.phone_number.as_deref() != Some(phone_number.as_str()) {
-                    card.update_phone_number(Some(phone_number.clone()))
-                        .await
-                        .map_err(|e| EsimError::Spawn(e.to_string()))?;
-                    log::info!(
-                        "[eSIM] persisted downloaded phone number for {} on {}: {}",
-                        iccid,
-                        com_port,
-                        phone_number
-                    );
-                }
-            }
-            Ok(_) => {
-                log::warn!(
-                    "[eSIM] download on {} resolved ICCID {} but no sim_cards row was found for phone number persistence",
-                    com_port,
-                    iccid
-                );
-            }
-            Err(e) => {
-                log::warn!(
-                    "[eSIM] failed to look up sim_cards row for {} on {}: {}",
-                    iccid,
-                    com_port,
-                    e
-                );
-            }
-        }
-
-        Ok(())
     }
 
     async fn audit(
@@ -979,75 +1291,31 @@ impl EsimService {
         activation::scan_source_dir(&self.source_dir)
     }
 
-    // ---- Single-profile helpers (one profile per eUICC) --------------------
+    // ---- Profile helpers ---------------------------------------------------
 
     /// ICCIDs of every profile currently on the active eUICC.
     async fn list_profile_iccids(&self, com_port: &str) -> Result<Vec<String>, EsimError> {
         let list = self.profiles(com_port).await?;
         Ok(list
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p.get("iccid").and_then(|v| v.as_str()).map(String::from))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|p| str_field(p, &["iccid", "ICCID"])).collect())
             .unwrap_or_default())
     }
 
-    /// ICCID of the single profile on the eUICC, if any.
-    async fn current_iccid(&self, com_port: &str) -> Result<Option<String>, EsimError> {
-        Ok(self.list_profile_iccids(com_port).await?.into_iter().next())
-    }
-
-    /// Enable the one profile present on the eUICC.
-    async fn enable_current(&self, com_port: &str) -> Result<Option<String>, EsimError> {
-        match self.current_iccid(com_port).await? {
-            Some(iccid) => {
-                self.enable(com_port, &iccid, true).await?;
-                Ok(Some(iccid))
-            }
-            None => Err(EsimError::Lpac {
-                code: -1,
-                message: "no profile on eUICC".to_string(),
-            }),
-        }
-    }
-
-    /// Disable the one profile present on the eUICC.
-    async fn disable_current(&self, com_port: &str) -> Result<Option<String>, EsimError> {
-        match self.current_iccid(com_port).await? {
-            Some(iccid) => {
-                self.disable(com_port, &iccid, true).await?;
-                Ok(Some(iccid))
-            }
-            None => Err(EsimError::Lpac {
-                code: -1,
-                message: "no profile on eUICC".to_string(),
-            }),
-        }
-    }
-
-    /// Delete the one profile present on the eUICC.
-    async fn delete_current(&self, com_port: &str) -> Result<Option<String>, EsimError> {
-        match self.current_iccid(com_port).await? {
-            Some(iccid) => {
-                // A profile must be disabled before it can be deleted.
-                let _ = self.disable(com_port, &iccid, true).await;
-                self.delete(com_port, &iccid).await?;
-                Ok(Some(iccid))
-            }
-            None => Err(EsimError::Lpac {
-                code: -1,
-                message: "no profile to delete".to_string(),
-            }),
-        }
+    /// ICCID of the currently enabled profile, if any.
+    async fn enabled_iccid(&self, com_port: &str) -> Result<Option<String>, EsimError> {
+        let list = self.profiles(com_port).await?;
+        Ok(list.as_array().and_then(|arr| {
+            arr.iter()
+                .find(|p| Self::profile_is_enabled(p))
+                .and_then(|p| str_field(p, &["iccid", "ICCID"]))
+        }))
     }
 
     /// Remove every profile from the eUICC (used before a replace-download).
     async fn delete_all_profiles(&self, com_port: &str) {
         if let Ok(iccids) = self.list_profile_iccids(com_port).await {
             for iccid in iccids {
-                let _ = self.disable(com_port, &iccid, true).await;
                 let _ = self.delete(com_port, &iccid).await;
             }
         }
@@ -1165,13 +1433,17 @@ impl EsimService {
             self.batch.publish(snap.clone()).await;
 
             match self
-                .run_batch_item(req.op, &item, auto_enable, replace)
+                .run_batch_item(req.op, &item, auto_enable, replace, req.all_profiles)
                 .await
             {
-                Ok(iccid) => {
+                Ok(result) => {
                     snap.items[i].status = "ok".to_string();
-                    snap.items[i].iccid = iccid;
-                    snap.items[i].message = Some("ok".to_string());
+                    if req.op == BatchOp::Refresh {
+                        snap.items[i].message = result;
+                    } else {
+                        snap.items[i].iccid = result;
+                        snap.items[i].message = Some("ok".to_string());
+                    }
                 }
                 Err(e) => {
                     snap.items[i].status = "failed".to_string();
@@ -1201,17 +1473,18 @@ impl EsimService {
         item: &BatchReqItem,
         auto_enable: bool,
         replace: bool,
+        all_profiles: bool,
     ) -> Result<Option<String>, EsimError> {
         self.enter(&item.com_port).await?;
         let mut result = self
-            .batch_item_inner(op, item, auto_enable, replace)
+            .batch_item_inner(op, item, auto_enable, replace, all_profiles)
             .await;
         if Self::is_transient_lpac_readiness_error(&result) {
             // Some readers appear a little late after mode switch; retry once before exiting.
             let retry_wait_ms = self.reader_settle_ms.saturating_mul(2).max(5000);
             tokio::time::sleep(Duration::from_millis(retry_wait_ms)).await;
             result = self
-                .batch_item_inner(op, item, auto_enable, replace)
+                .batch_item_inner(op, item, auto_enable, replace, all_profiles)
                 .await;
         }
         self.cleanup_session(&item.com_port).await;
@@ -1240,6 +1513,7 @@ impl EsimService {
         item: &BatchReqItem,
         auto_enable: bool,
         replace: bool,
+        all_profiles: bool,
     ) -> Result<Option<String>, EsimError> {
         let com = &item.com_port;
         match op {
@@ -1254,20 +1528,58 @@ impl EsimService {
                     imei: item.imei.clone(),
                     phone_number: item.phone_number.clone(),
                     activation_code: item.activation_code.clone(),
+                    enable: auto_enable,
                 };
                 let downloaded = self.download(com, &req).await?;
-                let iccid = self.resolve_downloaded_iccid(com, &downloaded).await;
-                if auto_enable {
-                    if let Some(ic) = &iccid {
-                        let _ = self.enable(com, ic, true).await;
-                    }
-                }
                 self.process_all_notifications(com).await;
-                Ok(iccid)
+                if let Some(err) = downloaded.get("enable_error").and_then(|v| v.as_str()) {
+                    return Err(EsimError::Invalid(format!("downloaded but enable failed: {}", err)));
+                }
+                Ok(str_field(&downloaded, &["iccid"]))
             }
-            BatchOp::Delete => self.delete_current(com).await,
-            BatchOp::Activate => self.enable_current(com).await,
-            BatchOp::Deactivate => self.disable_current(com).await,
+            BatchOp::Activate => {
+                let target = match &item.iccid {
+                    Some(iccid) => iccid.clone(),
+                    None => {
+                        let iccids = self.list_profile_iccids(com).await?;
+                        match iccids.as_slice() {
+                            [only] => only.clone(),
+                            [] => return Err(EsimError::Invalid("no profile on eUICC".to_string())),
+                            _ => return Err(EsimError::Invalid("choose a profile to enable".to_string())),
+                        }
+                    }
+                };
+                self.enable(com, &target, true).await?;
+                Ok(Some(target))
+            }
+            BatchOp::Deactivate => {
+                let target = match &item.iccid {
+                    Some(iccid) => Some(iccid.clone()),
+                    None => self.enabled_iccid(com).await?,
+                };
+                if let Some(iccid) = &target {
+                    self.disable(com, iccid, true).await?;
+                }
+                Ok(target)
+            }
+            BatchOp::Delete => match &item.iccid {
+                Some(iccid) => {
+                    self.delete(com, iccid).await?;
+                    Ok(Some(iccid.clone()))
+                }
+                None if all_profiles => {
+                    self.delete_all_profiles(com).await;
+                    Ok(None)
+                }
+                None => Err(EsimError::Invalid("choose a profile to delete".to_string())),
+            },
+            BatchOp::Refresh => {
+                if let Err(e) = self.chip_info(com).await {
+                    log::warn!("[eSIM] chip info failed during batch refresh on {}: {}", com, e);
+                }
+                let count = self.list_profile_iccids(com).await?.len();
+                Ok(Some(format!("{} profile(s)", count)))
+            }
         }
     }
 }

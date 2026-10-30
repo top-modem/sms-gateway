@@ -31,6 +31,71 @@ impl SmsType {
     }
 }
 
+/// Hardware family of a port, detected with the vendor `ath?` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MachineType {
+    Normal,
+    Esim,
+    Msim,
+    Unknown,
+}
+
+impl MachineType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MachineType::Normal => "normal",
+            MachineType::Esim => "esim",
+            MachineType::Msim => "msim",
+            MachineType::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "normal" => MachineType::Normal,
+            "esim" => MachineType::Esim,
+            "msim" => MachineType::Msim,
+            _ => MachineType::Unknown,
+        }
+    }
+
+    /// Classify an `ath?` reply: `ESIM`, `MSIM`, or `ERROR` on a normal machine.
+    pub fn from_type_reply(reply: &str) -> Self {
+        let upper = reply.to_ascii_uppercase();
+        if upper.contains("MSIM") {
+            MachineType::Msim
+        } else if upper.contains("ESIM") {
+            MachineType::Esim
+        } else if upper.contains("ERROR") {
+            MachineType::Normal
+        } else {
+            MachineType::Unknown
+        }
+    }
+}
+
+#[cfg(test)]
+mod machine_type_tests {
+    use super::MachineType;
+
+    #[test]
+    fn classifies_type_replies() {
+        assert_eq!(MachineType::from_type_reply("\r\nESIM\r\n"), MachineType::Esim);
+        assert_eq!(MachineType::from_type_reply("\r\nMSIM"), MachineType::Msim);
+        assert_eq!(MachineType::from_type_reply("\r\nERROR\r\n"), MachineType::Normal);
+        assert_eq!(MachineType::from_type_reply("\r\nOK\r\n"), MachineType::Unknown);
+        assert_eq!(MachineType::from_type_reply(""), MachineType::Unknown);
+    }
+
+    #[test]
+    fn round_trips_db_values() {
+        for t in [MachineType::Normal, MachineType::Esim, MachineType::Msim, MachineType::Unknown] {
+            assert_eq!(MachineType::from_db(t.as_str()), t);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ATCommand {
     pub command: String,

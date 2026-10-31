@@ -13,6 +13,7 @@
   let simsInfo   = $state([]);   // from /api/sims/info  (live AT data)
   let simCards   = $state([]);   // from /api/sim-cards  (DB: ICCID/IMSI)
   let simStats   = $state([]);   // from /api/sims/stats (SMS counts)
+  let msimPorts  = $state([]);
   let loading    = $state(true);
   let error      = $state('');
   let isFetching = false;
@@ -126,6 +127,10 @@
       simsInfo  = Array.isArray(infoRes)  ? infoRes  : (infoRes?.data  ?? []);
       simCards  = Array.isArray(cardsRes) ? cardsRes : (cardsRes?.data ?? []);
       simStats  = Array.isArray(statsRes) ? statsRes : (statsRes?.data ?? []);
+      try {
+        const response = await apiClient.msimPorts();
+        msimPorts = response?.data?.data ?? [];
+      } catch (_) { msimPorts = []; }
     } catch (e) {
       error = e?.message ?? $t('err_load_sim');
     } finally {
@@ -575,13 +580,19 @@
                       {/if}
                     </div>
                   {:else if info.machine_type === 'msim'}
+                    {@const management = msimPorts.find(port => port.com_port === info.com_port)}
                     <div class="mt-0.5 flex items-center gap-1 font-sans text-[11px]">
-                      <span class="rounded bg-purple-100 px-1 font-semibold text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">MSIM</span>
-                      <span class="inline-flex items-center gap-1 whitespace-nowrap text-gray-500 dark:text-gray-400">
+                      <span class="rounded bg-teal-100 px-1 font-semibold text-teal-700 dark:bg-teal-900/40 dark:text-teal-300">MSIM</span>
+                      <span class="inline-flex items-center gap-1 whitespace-nowrap text-gray-500 dark:text-gray-400" title={management?.selection_verified ? $t('msim_current') : $t('msim_last_known')}>
                         <span>{$t('dash_msim_slot')}</span>
-                        <span class="min-w-[1ch] shrink-0 font-mono font-semibold tabular-nums">{info.msim_active_slot ?? '?'}</span>
+                        <span class="min-w-[1ch] shrink-0 font-mono font-semibold tabular-nums">{management?.active_slot ?? info.msim_active_slot ?? '?'}{management?.selection_verified ? '' : '?'}</span>
                       </span>
                     </div>
+                    {#if management?.operation?.status === 'running'}
+                      <span class="mt-0.5 block max-w-[92px] truncate font-sans text-[11px] text-amber-600" title={$t('msim_stage_' + management.operation.stage)}>
+                        {$t('msim_stage_' + management.operation.stage)}{management.operation.current_slot ? ` ${management.operation.current_slot}` : ''}
+                      </span>
+                    {/if}
                   {/if}
                 </td>
 

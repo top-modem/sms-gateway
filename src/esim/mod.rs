@@ -398,9 +398,13 @@ impl EsimService {
                 ),
             };
             let capable = machine_type == MachineType::Esim;
-            let rows = cached.get(&com_port).map(Vec::as_slice).unwrap_or(&[]);
+            let rows = if capable {
+                cached.get(&com_port).map(Vec::as_slice).unwrap_or(&[])
+            } else {
+                &[]
+            };
             let active_row = rows.iter().find(|r| profile_row_is_enabled(r));
-            let latest = latest_by_port.get(&com_port);
+            let latest = latest_by_port.get(&com_port).filter(|_| capable);
             let last_status = latest.map(|op| {
                 if op.result_code == Some(0)
                     || op
@@ -421,11 +425,11 @@ impl EsimService {
                 esim_mode,
                 session_active: active.as_deref() == Some(com_port.as_str()),
                 sim_id,
-                eid: hw.and_then(|h| h.eid.clone()),
+                eid: hw.filter(|_| capable).and_then(|h| h.eid.clone()),
                 profile_count: rows.len(),
                 active_iccid: active_row.map(|r| r.iccid.clone()),
                 active_name: active_row.map(profile_display_name),
-                profiles_refreshed_at: hw.and_then(|h| h.profiles_refreshed_at.clone()),
+                profiles_refreshed_at: hw.filter(|_| capable).and_then(|h| h.profiles_refreshed_at.clone()),
                 last_op: latest.map(|op| op.op_type.clone()),
                 last_status,
                 last_message: latest.and_then(|op| op.message.clone()),

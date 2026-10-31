@@ -120,9 +120,9 @@ pub struct Modem {
     /// handler's NO CARRIER cleanup.
     pub inbound_recording_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Reader task handle so we can abort and release COM resources on drop.
-    reader_task: JoinHandle<()>,
+    reader_task: Mutex<Option<JoinHandle<()>>>,
     /// Command processor task handle so it does not outlive modem shutdown.
-    command_task: JoinHandle<()>,
+    command_task: Mutex<Option<JoinHandle<()>>>,
     /// If true, force COPS 46001 when IMSI MCC is 234/235.
     force_uk_mcc_to_46001: bool,
     /// Oneshot sender for the in-flight MMS send, resolved by the URC handler when
@@ -241,8 +241,8 @@ impl Modem {
             inbound_auto_answer_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
             inbound_call_answered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inbound_recording_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            reader_task,
-            command_task,
+            reader_task: Mutex::new(Some(reader_task)),
+            command_task: Mutex::new(Some(command_task)),
             force_uk_mcc_to_46001,
             pending_mms: Arc::new(tokio::sync::Mutex::new(None)),
             pending_ftp_open: Arc::new(tokio::sync::Mutex::new(None)),
@@ -266,8 +266,16 @@ impl Modem {
 
 impl Drop for Modem {
     fn drop(&mut self) {
-        self.reader_task.abort();
-        self.command_task.abort();
+        if let Some(task) = self.reader_task.get_mut().take() { task.abort(); }
+        if let Some(task) = self.command_task.get_mut().take() { task.abort(); }
+    }
+}
+
+async fn stop_serial_task(task: &Mutex<Option<JoinHandle<()>>>) {
+    let mut handle = task.lock().await;
+    if let Some(task) = handle.take() {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -277,8 +285,8 @@ impl Modem {
     /// lingering clone would otherwise keep re-opening the COM port and block any
     /// attempt to re-initialize the modem on it.
     pub async fn shutdown(&self) {
-        self.reader_task.abort();
-        self.command_task.abort();
+        stop_serial_task(&self.command_task).await;
+        stop_serial_task(&self.reader_task).await;
         *self.write_half.lock().await = None;
         *self._connection_state.write().await = ConnectionState::Disconnected;
     }
@@ -304,11 +312,13 @@ impl Modem {
     }
 
     /// Detect the machine type with `ath?` (`ESIM`, `MSIM`, or `ERROR` for a
-    /// normal machine). Definite results are cached and persisted; an
+    /// normal machine). Live replies override cached types; an
     /// unanswered probe falls back to the last persisted type without caching.
     pub async fn detect_machine_type(&self) -> MachineType {
-        if let Some(cached) = *self.machine_type.read().await {
-            return cached;
+        if self.is_esim_mode().await {
+            if let Some(cached) = *self.machine_type.read().await {
+                return cached;
+            }
         }
         // A port in eSIM mode does not answer AT commands.
         let probed = if self.is_esim_mode().await {
@@ -449,6 +459,44 @@ impl Modem {
 #[cfg(test)]
 mod serial_reopen_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn msim_shutdown_waits_for_task_resources_to_drop() {
+        struct Resource(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Resource {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resource = Resource(released.clone());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = Mutex::new(Some(tokio::spawn(async move {
+            let _resource = resource;
+            let _ = started.send(());
+            futures_util::future::pending::<()>().await;
+        })));
+        ready.await.unwrap();
+        stop_serial_task(&task).await;
+        assert!(released.load(Ordering::SeqCst));
+        stop_serial_task(&task).await;
+    }
+
+    #[tokio::test]
+    async fn msim_cancelled_queued_selection_never_executes() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        drop(response_rx);
+        sender.send(ATCommand { command: "ath4\r\n".into(), response_tx,
+            _priority: 5, retries: 0, counted: true }).unwrap();
+        drop(sender);
+        let count = Arc::new(AtomicUsize::new(1));
+        let result = tokio::time::timeout(Duration::from_millis(100), Modem::command_processor(
+            receiver, Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(ReaderState { response_tx: None, raw_response_tx: None })),
+            "cancelled-selection-test".into(), count.clone(), Arc::new(Mutex::new(())),
+        )).await;
+        assert!(result.is_ok(), "a cancelled command attempted execution/retry");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     #[ignore = "requires MODEM_TEST_PORT and exclusive access to a port with a ready SIM"]
@@ -807,6 +855,10 @@ impl Modem {
     ) {
         while let Some(mut at_command) = command_rx.recv().await {
             loop {
+                if at_command.response_tx.is_closed() {
+                    if at_command.counted { pending_commands.fetch_sub(1, Ordering::SeqCst); }
+                    break;
+                }
                 match Self::execute_command_impl(
                     &write_half,
                     &reader_state,
@@ -1168,14 +1220,8 @@ impl Modem {
     }
 
     async fn send_command_priority(&self, command: &str, priority: u8) -> io::Result<String> {
-        // Fail fast instead of piling onto an already-backlogged queue. A caller's
-        // outer timeout (e.g. in the /api/sims/info handler) does not cancel a
-        // command once it's been pushed to `command_tx` -- command_processor still
-        // runs it to completion. Under repeated polling of an unresponsive modem,
-        // that means orphaned commands would otherwise accumulate forever. Rejecting
-        // new commands here once the backlog is already deep keeps that bounded and
-        // lets the caller get an immediate error instead of waiting on a queue that
-        // won't drain in time anyway.
+        // Bound concurrent callers; cancelled queued commands are discarded by
+        // command_processor before execution or retry.
         //
         // NOTE: a single /api/sims/info request legitimately fires 8 concurrent AT
         // commands per modem (see get_all_sim_info's tokio::join! of signal/network/

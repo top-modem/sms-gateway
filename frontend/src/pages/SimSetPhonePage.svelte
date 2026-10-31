@@ -17,7 +17,7 @@
   const displayPort = $derived(simInfo?.com_port ?? '—');
   const displayIccid = $derived(simId ?? '—');
   const currentPhone = $derived(simInfo?.phone_number ?? '');
-  const databaseOnly = $derived(simInfo?.machine_type === 'esim');
+  const databaseOnly = $derived(['esim', 'msim'].includes(simInfo?.machine_type));
 
   onMount(async () => {
     if (!simId) {
@@ -91,7 +91,7 @@
     </button>
     <div class="flex items-center gap-2">
       <Icon icon="carbon:phone" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
-      <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t(databaseOnly ? 'set_esim_phone_title' : 'set_phone_title')}</h1>
+      <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t(simInfo?.machine_type === 'msim' ? 'set_msim_phone_title' : databaseOnly ? 'set_esim_phone_title' : 'set_phone_title')}</h1>
     </div>
   </header>
 
@@ -109,7 +109,7 @@
       <div class="max-w-md mx-auto bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 shadow-sm p-6">
         <div class="mb-6">
           <h2 class="text-sm font-semibold text-gray-800 dark:text-gray-100 mb-1">{$t(databaseOnly ? 'set_esim_phone_subtitle' : 'set_phone_subtitle')}</h2>
-          <p class="text-xs text-gray-500 dark:text-gray-400">{$t(databaseOnly ? 'set_esim_phone_desc' : 'set_phone_desc')}</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400">{$t(simInfo?.machine_type === 'msim' ? 'set_msim_phone_desc' : databaseOnly ? 'set_esim_phone_desc' : 'set_phone_desc')}</p>
         </div>
 
         <!-- SIM summary -->

@@ -1055,37 +1055,10 @@ impl SimCard {
     ) -> Result<Self> {
         let existing = Self::find_by_conditions(Some(id), None, None, None).await?;
 
-        if let Some(mut sim_card) = existing.into_iter().next() {
-            // Update IMSI if changed. Never overwrite a non-empty phone_number —
-            // it is set on first SIM creation (below) or via explicit API calls.
-            // However, backfill phone_number when the stored value is missing
-            // (e.g. the initial AT+CNUM read failed during a SIM swap) and the
-            // modem now reports one.
-            let imsi_changed = sim_card.imsi != imsi;
-            let backfill_phone = sim_card
-                .phone_number
-                .as_deref()
-                .map(|p| p.is_empty())
-                .unwrap_or(true)
-                && phone_number.as_deref().is_some_and(|p| !p.is_empty());
-            if imsi_changed || backfill_phone {
-                if imsi_changed {
-                    sim_card.imsi = imsi.clone();
-                }
-                if backfill_phone {
-                    sim_card.phone_number = phone_number.clone();
-                }
-                let pool = get_pool()?;
-                sqlx::query(
-                    "UPDATE sim_cards SET imsi = ?, phone_number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                )
-                .bind(&sim_card.imsi)
-                .bind(&sim_card.phone_number)
-                .bind(id)
-                .execute(pool)
-                .await?;
-            }
-            return Ok(sim_card);
+        if !existing.is_empty() {
+            Self::backfill_identity_in_pool(get_pool()?, id, imsi.as_deref(), phone_number.as_deref()).await?;
+            return Self::find_by_conditions(Some(id), None, None, None).await?
+                .into_iter().next().ok_or_else(|| anyhow::anyhow!("SIM card disappeared during identity refresh"));
         }
 
         // Only create new SIM card with baseband phone_number on first initialization
@@ -1100,7 +1073,28 @@ impl SimCard {
             updated_at: now,
         };
         sim_card.insert().await?;
+        if sim_card.phone_number.as_deref().is_some_and(|phone| !phone.is_empty()) {
+            sqlx::query("UPDATE sim_cards SET phone_number_source = COALESCE(phone_number_source, 'sim_read') WHERE id = ?")
+                .bind(id).execute(get_pool()?).await?;
+        }
         Ok(sim_card)
+    }
+
+    async fn backfill_identity_in_pool(pool: &SqlitePool, id: &str, imsi: Option<&str>, phone: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE sim_cards SET imsi = COALESCE(?1, imsi),
+             phone_number = CASE WHEN COALESCE(phone_number, '') = ''
+                 AND COALESCE(phone_number_source, '') != 'manual' AND COALESCE(?2, '') != ''
+                 THEN ?2 ELSE phone_number END,
+             phone_number_source = CASE WHEN COALESCE(phone_number, '') = ''
+                 AND COALESCE(phone_number_source, '') != 'manual' AND COALESCE(?2, '') != ''
+                 THEN 'sim_read' ELSE phone_number_source END,
+             updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3 AND ((?1 IS NOT NULL AND COALESCE(imsi, '') != ?1)
+                 OR (COALESCE(phone_number, '') = '' AND COALESCE(phone_number_source, '') != 'manual'
+                     AND COALESCE(?2, '') != ''))",
+        ).bind(imsi).bind(phone).bind(id).execute(pool).await?;
+        Ok(())
     }
 }
 
@@ -2834,22 +2828,212 @@ pub async fn upsert_port_machine_type(
     machine_type: &str,
     type_reply: Option<&str>,
 ) -> Result<()> {
-    let pool = get_pool()?;
+    upsert_port_machine_type_in_pool(get_pool()?, com_port, machine_type, type_reply).await
+}
+
+async fn upsert_port_machine_type_in_pool(
+    pool: &SqlitePool,
+    com_port: &str,
+    machine_type: &str,
+    type_reply: Option<&str>,
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r#"INSERT INTO port_hardware (com_port, machine_type, type_reply, detected_at, updated_at)
            VALUES (?, ?, ?, datetime('now'), datetime('now'))
            ON CONFLICT(com_port) DO UPDATE SET
                machine_type = excluded.machine_type,
                type_reply = excluded.type_reply,
+               eid = CASE WHEN excluded.machine_type IN ('normal', 'msim') THEN NULL ELSE port_hardware.eid END,
+               profiles_refreshed_at = CASE WHEN excluded.machine_type IN ('normal', 'msim') THEN NULL ELSE port_hardware.profiles_refreshed_at END,
                detected_at = excluded.detected_at,
                updated_at = excluded.updated_at"#,
     )
     .bind(com_port)
     .bind(machine_type)
     .bind(type_reply)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    if matches!(machine_type, "normal" | "msim") {
+        sqlx::query("DELETE FROM esim_profiles WHERE com_port = ?")
+            .bind(com_port)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod hardware_type_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn msim_phone_backfill_preserves_manual_numbers_and_missing_imsi() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sim_cards (id TEXT PRIMARY KEY, imsi TEXT, phone_number TEXT,
+            phone_number_source TEXT, updated_at TEXT);
+            INSERT INTO sim_cards VALUES ('manual', 'old-imsi', '77123456', 'manual', 'old'),
+                ('cleared', 'old-imsi', NULL, 'manual', 'old'),
+                ('legacy', 'old-imsi', '77999999', NULL, 'old'),
+                ('missing', 'old-imsi', NULL, NULL, 'old');")
+            .execute(&pool).await.unwrap();
+        for id in ["manual", "cleared", "legacy", "missing"] {
+            SimCard::backfill_identity_in_pool(&pool, id, None, Some("77000000")).await.unwrap();
+        }
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, imsi, phone_number, phone_number_source FROM sim_cards ORDER BY id",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![
+            ("cleared".into(), "old-imsi".into(), None, Some("manual".into())),
+            ("legacy".into(), "old-imsi".into(), Some("77999999".into()), None),
+            ("manual".into(), "old-imsi".into(), Some("77123456".into()), Some("manual".into())),
+            ("missing".into(), "old-imsi".into(), Some("77000000".into()), Some("sim_read".into())),
+        ]);
+        SimCard::backfill_identity_in_pool(&pool, "manual", Some("new-imsi"), Some("77111111")).await.unwrap();
+        let row: (String, String) = sqlx::query_as("SELECT imsi, phone_number FROM sim_cards WHERE id = 'manual'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row, ("new-imsi".into(), "77123456".into()));
+    }
+
+    #[tokio::test]
+    async fn msim_schema_keeps_phone_identity_and_limits_slots() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sim_cards (id TEXT PRIMARY KEY, phone_number TEXT);
+            INSERT INTO sim_cards VALUES ('card-a', '77123456');")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/20261030000003_msim.sql"))
+            .execute(&pool).await.unwrap();
+        for slot in 1..=4 {
+            sqlx::query("INSERT INTO msim_slots (com_port, slot) VALUES ('COM1', ?)")
+                .bind(slot).execute(&pool).await.unwrap();
+        }
+        assert!(sqlx::query("INSERT INTO msim_slots (com_port, slot) VALUES ('COM1', 5)")
+            .execute(&pool).await.is_err());
+        let phone: String = sqlx::query_scalar("SELECT phone_number FROM sim_cards WHERE id = 'card-a'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(phone, "77123456");
+        sqlx::query("INSERT INTO msim_operations (id, com_port, status, snapshot) VALUES ('one', 'COM1', 'running', '{}')")
+            .execute(&pool).await.unwrap();
+        assert!(sqlx::query("INSERT INTO msim_operations (id, com_port, status, snapshot) VALUES ('two', 'COM1', 'running', '{}')")
+            .execute(&pool).await.is_err());
+    }
+
+    async fn seeded_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/20261030000001_port_hardware.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE esim_profiles (com_port TEXT, iccid TEXT);
+             CREATE TABLE sim_cards (id TEXT PRIMARY KEY, phone_number TEXT);
+             INSERT INTO port_hardware (com_port, machine_type, eid, profiles_refreshed_at)
+             VALUES ('COM1', 'esim', 'keep-eid', '2026-10-30'),
+                    ('COM2', 'esim', 'stale-eid', '2026-10-30');
+             INSERT INTO esim_profiles (com_port, iccid)
+             VALUES ('COM1', 'keep-card'), ('COM2', 'old-card');
+             INSERT INTO sim_cards (id, phone_number) VALUES ('old-card', '77123456');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn non_esim_detection_clears_only_the_ports_esim_cache() {
+        for machine_type in ["msim", "normal"] {
+            let pool = seeded_pool().await;
+            upsert_port_machine_type_in_pool(&pool, "COM2", machine_type, Some("MSIM"))
+                .await
+                .unwrap();
+            let hardware: (String, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT machine_type, eid, profiles_refreshed_at FROM port_hardware WHERE com_port = 'COM2'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(hardware, (machine_type.to_string(), None, None));
+            let profiles: Vec<(String, String)> = sqlx::query_as(
+                "SELECT com_port, iccid FROM esim_profiles",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(profiles, vec![("COM1".to_string(), "keep-card".to_string())]);
+            let phone: String = sqlx::query_scalar(
+                "SELECT phone_number FROM sim_cards WHERE id = 'old-card'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(phone, "77123456");
+        }
+    }
+
+    #[tokio::test]
+    async fn esim_or_uncertain_detection_preserves_the_cache() {
+        for machine_type in ["esim", "unknown"] {
+            let pool = seeded_pool().await;
+            upsert_port_machine_type_in_pool(&pool, "COM2", machine_type, None)
+                .await
+                .unwrap();
+            let hardware: (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT eid, profiles_refreshed_at FROM port_hardware WHERE com_port = 'COM2'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(hardware, (Some("stale-eid".to_string()), Some("2026-10-30".to_string())));
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM esim_profiles")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_repairs_already_classified_msim_ports() {
+        let pool = seeded_pool().await;
+        sqlx::query("UPDATE port_hardware SET machine_type = 'msim' WHERE com_port = 'COM2'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/20261030000002_port_esim_cache.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let eid: Option<String> = sqlx::query_scalar(
+            "SELECT eid FROM port_hardware WHERE com_port = 'COM2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(eid, None);
+        let profiles: Vec<(String, String)> = sqlx::query_as(
+            "SELECT com_port, iccid FROM esim_profiles",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(profiles, vec![("COM1".to_string(), "keep-card".to_string())]);
+        let phone: String = sqlx::query_scalar(
+            "SELECT phone_number FROM sim_cards WHERE id = 'old-card'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(phone, "77123456");
+    }
 }
 
 pub async fn set_port_msim_slot(com_port: &str, slot: i64) -> Result<()> {
@@ -2870,6 +3054,61 @@ pub async fn set_port_msim_slot(com_port: &str, slot: i64) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct MsimSlot {
+    pub slot: i64,
+    pub state: String,
+    pub iccid: Option<String>,
+    pub imsi: Option<String>,
+    pub last_checked_at: Option<String>,
+    pub identity_verified_at: Option<String>,
+    pub last_error: Option<String>,
+    pub phone_number: Option<String>,
+    pub phone_number_source: Option<String>,
+}
+
+pub async fn get_msim_slots(com_port: &str) -> Result<Vec<MsimSlot>> {
+    let pool = get_pool()?;
+    for slot in 1..=4 {
+        sqlx::query("INSERT OR IGNORE INTO msim_slots (com_port, slot) VALUES (?, ?)")
+            .bind(com_port).bind(slot).execute(pool).await?;
+    }
+    Ok(sqlx::query_as::<_, MsimSlot>(
+        "SELECT s.slot, s.state, s.iccid, s.imsi, s.last_checked_at,
+         s.identity_verified_at, s.last_error, c.phone_number,
+         COALESCE(c.phone_number_source, CASE WHEN c.phone_number IS NOT NULL THEN 'legacy' END) AS phone_number_source
+         FROM msim_slots s LEFT JOIN sim_cards c ON c.id = s.iccid
+         WHERE s.com_port = ? ORDER BY s.slot",
+    ).bind(com_port).fetch_all(pool).await?)
+}
+
+pub async fn save_msim_slot(
+    com_port: &str, slot: i64, state: &str,
+    iccid: Option<&str>, imsi: Option<&str>, error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO msim_slots (com_port, slot, state, iccid, imsi, last_checked_at, identity_verified_at, last_error)
+         VALUES (?, ?, ?, ?, ?, datetime('now'), CASE WHEN ? = 'present' THEN datetime('now') END, ?)
+         ON CONFLICT(com_port, slot) DO UPDATE SET state = excluded.state,
+         iccid = CASE WHEN excluded.state IN ('present', 'empty') THEN excluded.iccid ELSE msim_slots.iccid END,
+         imsi = CASE WHEN excluded.state IN ('present', 'empty') THEN excluded.imsi ELSE msim_slots.imsi END,
+         last_checked_at = excluded.last_checked_at,
+         identity_verified_at = CASE WHEN excluded.state = 'present' THEN excluded.identity_verified_at
+             WHEN excluded.state = 'empty' THEN NULL ELSE msim_slots.identity_verified_at END,
+         last_error = excluded.last_error",
+    ).bind(com_port).bind(slot).bind(state).bind(iccid).bind(imsi).bind(state).bind(error)
+        .execute(get_pool()?).await?;
+    Ok(())
+}
+
+pub async fn save_msim_phone(com_port: &str, slot: i64, iccid: &str, phone: Option<&str>) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE sim_cards SET phone_number = ?, phone_number_source = 'manual', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND EXISTS (SELECT 1 FROM msim_slots WHERE com_port = ? AND slot = ? AND iccid = ?)",
+    ).bind(phone).bind(iccid).bind(com_port).bind(slot).bind(iccid).execute(get_pool()?).await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn set_port_eid(com_port: &str, eid: &str) -> Result<()> {

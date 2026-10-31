@@ -102,6 +102,7 @@ pub struct ModemManager {
     /// Ports explicitly restarted by the operator. This blocks stale automatic
     /// probes from repromoting the old modem while its replacement initializes.
     manual_restarting_ports: RwLock<HashSet<String>>,
+    msim_managed_ports: RwLock<HashSet<String>>,
     /// Ports where CPIN is READY but ICCID changed. Hide the old identity while
     /// repeated samples confirm the new card before teardown/reinitialization.
     identity_revalidating_ports: RwLock<HashSet<String>>,
@@ -206,6 +207,45 @@ mod recovery_capacity_tests {
 #[cfg(test)]
 mod msim_slot_tests {
     use super::ModemManager;
+
+    #[tokio::test]
+    async fn msim_serial_reopen_retries_driver_release_errors() {
+        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::Other] {
+            let attempts = std::cell::Cell::new(0);
+            let result = ModemManager::open_msim_serial_with_retry(|| {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(if attempts.get() < 3 {
+                    Err(std::io::Error::from(kind))
+                } else {
+                    Ok(42)
+                })
+            }).await;
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(attempts.get(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn msim_serial_reopen_does_not_retry_other_errors() {
+        let attempts = std::cell::Cell::new(0);
+        let result: std::io::Result<()> = ModemManager::open_msim_serial_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+        }).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn msim_serial_reopen_retry_is_bounded() {
+        let attempts = std::cell::Cell::new(0);
+        let result: std::io::Result<()> = ModemManager::open_msim_serial_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::Other)))
+        }).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
+        assert_eq!(attempts.get(), 31);
+    }
 
     #[test]
     fn msim_slot_tracks_acknowledged_selections() {
@@ -629,6 +669,7 @@ impl ModemManager {
             .write()
             .await
             .insert(device.com_port.clone());
+        self.msim_managed_ports.write().await.remove(&device.com_port);
 
         self.stop_unavailable_port_worker(&device.com_port).await;
 
@@ -1130,6 +1171,7 @@ impl ModemManager {
             post_register_recovery_seq: AtomicU64::new(0),
             port_runtime_seq: AtomicU64::new(0),
             manual_restarting_ports: RwLock::new(HashSet::new()),
+            msim_managed_ports: RwLock::new(HashSet::new()),
             identity_revalidating_ports: RwLock::new(HashSet::new()),
         }
     }
@@ -2847,6 +2889,10 @@ impl ModemManager {
                 if active_ports.contains(&device.com_port) {
                     continue;
                 }
+                if self.msim_managed_ports.read().await.contains(&device.com_port)
+                    || self.manual_restarting_ports.read().await.contains(&device.com_port) {
+                    continue;
+                }
                 if self
                     .unavailable_ports
                     .read()
@@ -2882,6 +2928,7 @@ impl ModemManager {
         let mut expected_workers: HashMap<String, (u32, usize, Option<SmsStorage>)> =
             HashMap::new();
         for (com_port, baud_rate) in &unavailable_snapshot {
+            if self.msim_managed_ports.read().await.contains(com_port) { continue; }
             let device_cfg = self.devices.iter().find(|d| d.com_port == *com_port);
             let sms_storage = device_cfg
                 .and_then(|d| d.sms_storage)
@@ -2926,6 +2973,7 @@ impl ModemManager {
                 .collect()
         };
         for (com_port, baud_rate, index, sms_storage) in missing_ports {
+            if self.msim_managed_ports.read().await.contains(&com_port) { continue; }
             self.clone().add_unavailable_port(
                 com_port,
                 baud_rate,
@@ -3034,6 +3082,59 @@ impl ModemManager {
 
     pub async fn get_modem_by_com_port(&self, com_port: &str) -> Option<Arc<Modem>> {
         self.modems.read().await.get(com_port).cloned()
+    }
+
+    async fn open_msim_serial_with_retry<T, F, Fut>(mut open: F) -> std::io::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<T>>,
+    {
+        let mut retries = 0;
+        loop {
+            match open().await {
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other) && retries < 30 => {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    pub async fn open_msim_modem(
+        &self, com_port: &str,
+    ) -> anyhow::Result<(Arc<Modem>, tokio::sync::OwnedMutexGuard<()>)> {
+        let (index, device) = self.devices.iter().enumerate()
+            .find(|(_, device)| device.com_port == com_port)
+            .ok_or_else(|| anyhow::anyhow!("Unknown configured COM port: {}", com_port))?;
+        let guard = tokio::time::timeout(
+            Duration::from_secs(30), self.port_open_lock(com_port).await.lock_owned(),
+        ).await.map_err(|_| anyhow::anyhow!("Port is busy: {}", com_port))?;
+        self.msim_managed_ports.write().await.insert(com_port.to_string());
+        self.manual_restarting_ports.write().await.insert(com_port.to_string());
+        self.stop_unavailable_port_worker(com_port).await;
+        if let Some(task) = self.urc_tasks.write().await.remove(com_port) {
+            task.abort();
+        }
+        if let Some(modem) = self.modems.write().await.remove(com_port) {
+            if let Some(sim_id) = modem.sim_id.read().await.as_deref() {
+                if let Some((_, task)) = self.post_register_recovery_tasks.write().await.remove(sim_id) {
+                    task.abort();
+                }
+            }
+            modem.shutdown().await;
+        }
+        self.last_known_sim_ids_by_port.write().await.remove(com_port);
+        self.mark_port_unavailable(com_port, None).await;
+        if let Some(state) = self.port_runtime.write().await.get_mut(com_port) {
+            state.active_sim_id = None;
+            state.last_sim_id = None;
+        }
+        let name = format!("msim_{}", index);
+        let modem = Self::open_msim_serial_with_retry(|| {
+            Modem::new(com_port, device.baud_rate, &name, index, false)
+        }).await?;
+        Ok((Arc::new(modem), guard))
     }
 
     /// Open a configured port that has no live modem (e.g. an eSIM chip with no
@@ -3155,7 +3256,7 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        if modem.detect_machine_type().await == MachineType::Esim {
+        if matches!(modem.detect_machine_type().await, MachineType::Esim | MachineType::Msim) {
             let mut card = SimCard::find_by_conditions(Some(sim_id), None, None, None)
                 .await?
                 .into_iter()
@@ -3163,7 +3264,9 @@ impl ModemManager {
                 .ok_or_else(|| anyhow::anyhow!("SIM card not found: {}", sim_id))?;
             card.update_phone_number(Some(phone_number.to_string())).await?;
             self.update_sim_cache(card).await;
-            log::info!("[SIM:{}] eSIM phone number saved to local database", sim_id);
+            sqlx::query("UPDATE sim_cards SET phone_number_source = 'manual' WHERE id = ?")
+                .bind(sim_id).execute(crate::db::get_pool()?).await?;
+            log::info!("[SIM:{}] phone number saved to local database", sim_id);
             return Ok(());
         }
 

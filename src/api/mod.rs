@@ -148,6 +148,8 @@ fn resolve_runtime_fallback_status(
 mod auth;
 #[cfg(not(feature = "mock-data"))]
 pub mod esim;
+#[cfg(not(feature = "mock-data"))]
+pub mod msim;
 pub(crate) mod sse_manager;
 
 #[cfg(test)]
@@ -408,6 +410,11 @@ pub async fn run_api(
 
     #[cfg(not(feature = "mock-data"))]
     let api = api.merge(esim::routes(esim_service.clone()));
+
+    #[cfg(not(feature = "mock-data"))]
+    let api = api.merge(msim::routes(Arc::new(crate::msim::MsimService::new(
+        modem_manager.clone(), sse_manager.clone(), transcribe_cfg.clone(),
+    ).await?)));
 
     let api = api.layer(axum::middleware::from_fn_with_state(
         (username.to_string(), password.to_string()),

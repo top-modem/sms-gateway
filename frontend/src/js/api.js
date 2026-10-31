@@ -612,6 +612,14 @@ class ApiClient {
     async esimCancelBatch() {
         return FetchApi.post('/api/esim/batch/cancel');
     }
+
+    async msimPorts() { return FetchApi.get('/api/msim/ports'); }
+    async msimSlots(port) { return FetchApi.get(`/api/msim/${encodeURIComponent(port)}/slots`); }
+    async msimScan(port, payload) { return FetchApi.post(`/api/msim/${encodeURIComponent(port)}/scan`, payload); }
+    async msimSelect(port, slot, payload) { return FetchApi.post(`/api/msim/${encodeURIComponent(port)}/slots/${slot}/select`, payload); }
+    async msimPhone(port, slot, payload) { return FetchApi.put(`/api/msim/${encodeURIComponent(port)}/slots/${slot}/phone`, payload); }
+    async msimOperation(id) { return FetchApi.get(`/api/msim/operations/${encodeURIComponent(id)}`); }
+    async msimCancel(id) { return FetchApi.post(`/api/msim/operations/${encodeURIComponent(id)}/cancel`, {}); }
 }
 
 // Export as a singleton

@@ -4,7 +4,7 @@
   import { apiClient } from '../js/api.js';
   import { t } from '../js/i18n.js';
 
-  let { onBack = () => {}, onNavigateEsim = () => {} } = $props();
+  let { onBack = () => {}, onNavigateEsim = () => {}, onNavigateMsim = () => {} } = $props();
 
   // ── State ──────────────────────────────────────────────────────────────────
   let activeTab = $state('barcode'); // 'barcode' | 'import' | 'call' | 'sms' | 'ussd'
@@ -398,6 +398,11 @@
       >
         <Icon icon="carbon:sim-card" class="w-4 h-4" />
         {$t('esim_title')}
+      </button>
+      <button onclick={onNavigateMsim}
+        class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 transition">
+        <Icon icon="carbon:sim-card" class="w-4 h-4" />
+        {$t('msim_title')}
       </button>
       {#each [
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },

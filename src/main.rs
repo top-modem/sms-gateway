@@ -19,6 +19,8 @@ mod db;
 mod decode;
 #[cfg(not(feature = "mock-data"))]
 mod esim;
+#[cfg(not(feature = "mock-data"))]
+mod msim;
 mod firefox_api;
 mod firefox_upload_retry;
 mod firefox_upload_retry_worker;

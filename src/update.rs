@@ -242,6 +242,17 @@ async fn download_asset(client: &Client, url: &str, dest: &Path) -> Result<()> {
     fs::write(dest, &bytes).context("failed to write downloaded asset")
 }
 
+fn hidden_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn prepare_binary(download_path: &Path, work_dir: &Path) -> Result<PathBuf> {
     let name = download_path
         .file_name()
@@ -252,7 +263,7 @@ fn prepare_binary(download_path: &Path, work_dir: &Path) -> Result<PathBuf> {
     if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
         let extract_dir = work_dir.join("extract");
         fs::create_dir_all(&extract_dir)?;
-        let status = Command::new("tar")
+        let status = hidden_command("tar")
             .arg("-xzf")
             .arg(download_path)
             .arg("-C")
@@ -268,7 +279,7 @@ fn prepare_binary(download_path: &Path, work_dir: &Path) -> Result<PathBuf> {
     if lower.ends_with(".zip") {
         let extract_dir = work_dir.join("extract");
         fs::create_dir_all(&extract_dir)?;
-        let status = Command::new("unzip")
+        let status = hidden_command("unzip")
             .arg("-q")
             .arg(download_path)
             .arg("-d")

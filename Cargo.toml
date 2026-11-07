@@ -37,6 +37,8 @@ structopt = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
+hmac = "0.12"
+sha1 = "0.10"
 rust-embed = "8.0"
 mime_guess = "2.0"
 hex = "*"

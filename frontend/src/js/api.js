@@ -275,6 +275,18 @@ class ApiClient {
         return FetchApi.put('/api/settings/voice-otp', settings, {}, 'application/json');
     }
 
+    async getAliyunAsrSettings() {
+        return FetchApi.get('/api/settings/aliyun-asr');
+    }
+
+    async setAliyunAsrSettings(settings) {
+        return FetchApi.put('/api/settings/aliyun-asr', settings, {}, 'application/json');
+    }
+
+    async testAliyunAsr() {
+        return FetchApi.post('/api/settings/aliyun-asr/test', {});
+    }
+
     async cancelVoiceOtp(callId) {
         return FetchApi.post(`/api/calls/${encodeURIComponent(callId)}/voice-cancel`, {});
     }

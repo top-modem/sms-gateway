@@ -14,6 +14,7 @@ use modem::manager::TranscribeConfig;
 use structopt::StructOpt;
 
 mod api;
+mod aliyun_asr;
 mod config;
 mod db;
 mod decode;
@@ -339,8 +340,11 @@ fn open_browser_with_fallback(url: &str) {
         return;
     }
 
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }
 

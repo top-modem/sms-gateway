@@ -5,6 +5,17 @@ use std::time::Duration;
 use tokio::process::Command;
 use uuid::Uuid;
 
+fn hidden_command(exe: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct VoiceOtpSettings {
@@ -15,6 +26,7 @@ pub(crate) struct VoiceOtpSettings {
     pub otp_length: usize,
     pub language: String,
     pub deadline_seconds: u64,
+    pub provider: String,
 }
 
 impl Default for VoiceOtpSettings {
@@ -27,19 +39,41 @@ impl Default for VoiceOtpSettings {
             otp_length: 6,
             language: "auto".into(),
             deadline_seconds: 120,
+            provider: "local".into(),
         }
     }
 }
 
 impl VoiceOtpSettings {
+    pub(crate) const MAX_PORTS: usize = 32;
+
+    /// `com_port` holds a comma-separated list such as `COM2,COM5`.
+    pub(crate) fn ports(&self) -> impl Iterator<Item = &str> {
+        self.com_port.split(',').map(str::trim).filter(|port| !port.is_empty())
+    }
+
+    pub(crate) fn handles(&self, com_port: &str) -> bool {
+        self.enabled && self.ports().any(|port| port == com_port)
+    }
+
     pub(crate) fn answer_delay_for(&self, com_port: &str, normal_delay: u64) -> u64 {
-        if self.enabled && self.com_port == com_port { 0 } else { normal_delay }
+        if self.handles(com_port) { 0 } else { normal_delay }
     }
 
     pub fn validate(&self) -> Result<()> {
-        let port_number = self.com_port.strip_prefix("COM").and_then(|value| value.parse::<u16>().ok());
-        if !port_number.is_some_and(|number| (1..=128).contains(&number) && self.com_port == format!("COM{}", number)) {
-            bail!("Select a COM port between COM1 and COM128");
+        let ports: Vec<&str> = self.ports().collect();
+        if ports.is_empty() || ports.len() > Self::MAX_PORTS {
+            bail!("Select between 1 and {} COM ports", Self::MAX_PORTS);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for port in &ports {
+            let number = port.strip_prefix("COM").and_then(|value| value.parse::<u16>().ok());
+            if !number.is_some_and(|number| (1..=128).contains(&number) && *port == format!("COM{}", number)) {
+                bail!("Each port must be between COM1 and COM128");
+            }
+            if !seen.insert(*port) {
+                bail!("{} is listed more than once", port);
+            }
         }
         if !(3..=30).contains(&self.prompt_seconds) || !(3..=30).contains(&self.code_seconds) {
             bail!("Each recording window must be between 3 and 30 seconds");
@@ -49,6 +83,9 @@ impl VoiceOtpSettings {
         }
         if !matches!(self.language.as_str(), "auto" | "en" | "zh") {
             bail!("Voice language must be auto, en or zh");
+        }
+        if !matches!(self.provider.as_str(), "local" | "aliyun") {
+            bail!("Voice provider must be local or aliyun");
         }
         if !(30..=240).contains(&self.deadline_seconds)
             || self.deadline_seconds < self.prompt_seconds + self.code_seconds + 10
@@ -267,7 +304,7 @@ pub async fn transcribe(
         .context("failed to write temp AMR file")?;
 
     // ── Step 2: ffmpeg AMR → 16 kHz mono WAV ─────────────────────────────────
-    let ffmpeg_child = Command::new(ffmpeg_exe)
+    let ffmpeg_child = hidden_command(ffmpeg_exe)
         .args([
             "-y", // overwrite output without asking
             "-i",
@@ -325,7 +362,7 @@ pub async fn transcribe(
     ];
     whisper_args.push("-l");
     whisper_args.push(language);
-    let whisper_child = Command::new(whisper_exe)
+    let whisper_child = hidden_command(whisper_exe)
         .args(&whisper_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -369,6 +406,34 @@ pub async fn transcribe(
     Ok(transcript.trim().to_string())
 }
 
+/// Convert an AMR recording to mono 16-bit WAV at `sample_rate` for cloud recognition.
+pub(crate) async fn convert_to_wav(amr_bytes: &[u8], ffmpeg_exe: &str, sample_rate: u32) -> Result<Vec<u8>> {
+    if amr_bytes.is_empty() || amr_bytes.len() > 5 * 1024 * 1024 {
+        bail!("Recording must contain between 1 byte and 5 MB of audio");
+    }
+    let id = Uuid::new_v4().to_string();
+    let amr_path = std::env::temp_dir().join(format!("{}.amr", id));
+    let wav_path = std::env::temp_dir().join(format!("{}.wav", id));
+    let _temp_files = TempAudioFiles(vec![amr_path.clone(), wav_path.clone()]);
+    tokio::fs::write(&amr_path, amr_bytes).await.context("failed to write temp AMR file")?;
+    let rate = sample_rate.to_string();
+    let child = hidden_command(ffmpeg_exe)
+        .args(["-y", "-i", amr_path.to_str().unwrap(), "-ar", &rate, "-ac", "1", "-c:a", "pcm_s16le", wav_path.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to launch ffmpeg")?;
+    let output = match tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await {
+        Ok(result) => result.context("ffmpeg error")?,
+        Err(_) => bail!("ffmpeg timed out after 60s"),
+    };
+    if !output.status.success() {
+        bail!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    tokio::fs::read(&wav_path).await.context("failed to read converted WAV")
+}
+
 async fn cleanup(paths: &[&PathBuf]) {
     for p in paths {
         if let Err(e) = tokio::fs::remove_file(p).await {
@@ -410,6 +475,22 @@ mod voice_otp_tests {
         settings.code_seconds = 10;
         settings.com_port = "COM2\r\nATH".into();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn voice_otp_accepts_up_to_32_distinct_ports() {
+        let mut settings = VoiceOtpSettings { enabled: true, com_port: "COM2, COM5".into(), ..Default::default() };
+        assert!(settings.validate().is_ok());
+        assert!(settings.handles("COM5") && settings.handles("COM2") && !settings.handles("COM3"));
+        assert_eq!(settings.answer_delay_for("COM5", 2), 0);
+        settings.com_port = (1..=32).map(|n| format!("COM{n}")).collect::<Vec<_>>().join(",");
+        assert!(settings.validate().is_ok());
+        settings.com_port.push_str(",COM33");
+        assert!(settings.validate().is_err());
+        for invalid in ["COM2,COM2", "", "COM2,,ATH", "COM02"] {
+            settings.com_port = invalid.into();
+            assert!(settings.validate().is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

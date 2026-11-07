@@ -330,6 +330,8 @@ pub async fn run_api(
         .route("/settings/worldcode-api-key", get(get_firefox_api_key).put(set_firefox_api_key))
         .route("/settings/welcome-sms-sync", get(get_welcome_sms_sync).put(set_welcome_sms_sync))
         .route("/settings/voice-otp", get(get_voice_otp_settings).put(set_voice_otp_settings).with_state(modem_manager.clone()))
+        .route("/settings/aliyun-asr", get(get_aliyun_asr_settings).put(set_aliyun_asr_settings))
+        .route("/settings/aliyun-asr/test", post(test_aliyun_asr))
         .route("/firefox/countries", get(get_firefox_countries))
         .route(
             "/firefox/upload",
@@ -1812,6 +1814,11 @@ async fn set_voice_otp_settings(
     if settings.enabled && !manager.local_transcription_ready().await {
         return (StatusCode::CONFLICT, Json(json!({ "error": "Local ffmpeg/Whisper tools are unavailable" }))).into_response();
     }
+    if settings.enabled && settings.provider == "aliyun"
+        && !crate::aliyun_asr::AliyunAsrSettings::load().await.is_ok_and(|aliyun| aliyun.ready())
+    {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "Configure the Aliyun AppKey and token or AccessKey first" }))).into_response();
+    }
     let value = match serde_json::to_string(&settings) {
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response(),
@@ -1819,6 +1826,50 @@ async fn set_voice_otp_settings(
     match AppSetting::set("voice_otp_local_settings", Some(&value)).await {
         Ok(()) => Json(json!({ "settings": settings, "local_ready": manager.local_transcription_ready().await })).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
+async fn get_aliyun_asr_settings() -> Response {
+    match crate::aliyun_asr::AliyunAsrSettings::load().await {
+        Ok(settings) => Json(json!(settings.public())).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
+async fn set_aliyun_asr_settings(Json(update): Json<crate::aliyun_asr::AliyunAsrUpdate>) -> Response {
+    match crate::aliyun_asr::AliyunAsrSettings::apply(update).await {
+        Ok(settings) => Json(json!(settings.public())).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
+/// Sends one second of generated silence to verify the saved Aliyun credentials.
+async fn test_aliyun_asr() -> Response {
+    let result = async {
+        let settings = crate::aliyun_asr::AliyunAsrSettings::load().await?;
+        if !settings.ready() {
+            anyhow::bail!("Configure the Aliyun AppKey and token or AccessKey first");
+        }
+        let rate = settings.sample_rate as usize;
+        let mut wav = Vec::with_capacity(44 + rate * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + rate * 2) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&(rate as u32).to_le_bytes());
+        wav.extend_from_slice(&((rate * 2) as u32).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&((rate * 2) as u32).to_le_bytes());
+        wav.resize(44 + rate * 2, 0);
+        crate::aliyun_asr::recognize(&settings, wav).await
+    }.await;
+    match result {
+        Ok(text) => Json(json!({ "ok": true, "result": text })).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": error.to_string() }))).into_response(),
     }
 }
 

@@ -13,7 +13,13 @@
   let makeCallSimId = $state('');
   let making = $state(false);
   let makeError = $state('');
-  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, language: 'auto', deadline_seconds: 120 });
+  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, language: 'auto', deadline_seconds: 120, provider: 'local' });
+  let aliyun = $state({ app_key: '', region: 'cn-shanghai', sample_rate: 16000, access_key_id: '', has_token: false, has_access_key_secret: false, ready: false });
+  let aliyunToken = $state('');
+  let aliyunSecret = $state('');
+  let aliyunBusy = $state(false);
+  let aliyunMessage = $state('');
+  let aliyunError = $state('');
   let voiceReady = $state(false);
   let voiceBusy = $state(true);
   let voiceError = $state('');
@@ -67,10 +73,44 @@
       const response = await apiClient.getVoiceOtpSettings();
       voiceSettings = response.data.settings;
       voiceReady = response.data.local_ready === true;
+      aliyun = (await apiClient.getAliyunAsrSettings()).data;
     } catch (error) {
       voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
     } finally {
       voiceBusy = false;
+    }
+  }
+
+  async function saveAliyun() {
+    aliyunBusy = true;
+    aliyunError = '';
+    aliyunMessage = '';
+    try {
+      const payload = { app_key: aliyun.app_key, region: aliyun.region, sample_rate: Number(aliyun.sample_rate), access_key_id: aliyun.access_key_id };
+      if (aliyunToken.trim()) payload.token = aliyunToken.trim();
+      if (aliyunSecret.trim()) payload.access_key_secret = aliyunSecret.trim();
+      aliyun = (await apiClient.setAliyunAsrSettings(payload)).data;
+      aliyunToken = '';
+      aliyunSecret = '';
+      aliyunMessage = $t('voice_saved');
+    } catch (error) {
+      aliyunError = error?.data?.error ?? error?.message ?? $t('voice_error');
+    } finally {
+      aliyunBusy = false;
+    }
+  }
+
+  async function testAliyun() {
+    aliyunBusy = true;
+    aliyunError = '';
+    aliyunMessage = '';
+    try {
+      await apiClient.testAliyunAsr();
+      aliyunMessage = $t('aliyun_test_ok');
+    } catch (error) {
+      aliyunError = error?.data?.error ?? error?.message ?? $t('voice_error');
+    } finally {
+      aliyunBusy = false;
     }
   }
 
@@ -192,14 +232,17 @@
         <Icon icon={voiceBusy ? 'carbon:renew' : 'carbon:save'} class="w-4 h-4" />
       </button>
     </div>
-    <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 min-w-0">
+    <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-7 gap-3 min-w-0">
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
-        {$t('voice_port')}
-        <select bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
-          {#each Array.from({ length: 128 }, (_, index) => `COM${index + 1}`) as port}
-            <option value={port}>{port}</option>
-          {/each}
+        {$t('voice_provider')}
+        <select bind:value={voiceSettings.provider} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
+          <option value="local">{$t('voice_provider_local')}</option>
+          <option value="aliyun">{$t('voice_provider_aliyun')}</option>
         </select>
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0" title={$t('voice_port_hint')}>
+        {$t('voice_port')}
+        <input type="text" required pattern={'\\s*COM[1-9][0-9]{0,2}(\\s*,\\s*COM[1-9][0-9]{0,2}){0,31}\\s*'} placeholder="COM2,COM5" bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
       </label>
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
         {$t('voice_prompt_window')}
@@ -229,6 +272,68 @@
     {#if voiceSaved}<p class="text-xs text-green-600 dark:text-green-400 mt-2" role="status">{$t('voice_saved')}</p>{/if}
     {#if voiceError}<p class="text-xs text-red-600 dark:text-red-400 mt-2 break-words" role="alert">{voiceError}</p>{/if}
   </form>
+
+  {#if voiceSettings.provider === 'aliyun'}
+    <form
+      aria-label={$t('aliyun_title')}
+      class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0"
+      onsubmit={(event) => { event.preventDefault(); saveAliyun(); }}
+    >
+      <div class="flex items-center justify-between gap-3 mb-3">
+        <div class="flex items-center gap-3 min-w-0 flex-wrap">
+          <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-100">{$t('aliyun_title')}</h3>
+          <span class="text-xs {aliyun.ready ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}">
+            {aliyun.ready ? $t('aliyun_ready') : $t('aliyun_not_ready')}
+          </span>
+        </div>
+        <div class="flex gap-2 shrink-0">
+          <button type="button" onclick={testAliyun} disabled={aliyunBusy || !aliyun.ready} aria-label={$t('aliyun_test')} title={$t('aliyun_test')}
+            class="w-9 h-9 rounded-md border border-gray-200 dark:border-zinc-700 text-gray-700 dark:text-gray-200 disabled:opacity-40 flex items-center justify-center">
+            <Icon icon="carbon:connection-signal" class="w-4 h-4" />
+          </button>
+          <button type="submit" disabled={aliyunBusy} aria-label={$t('aliyun_save')} title={$t('aliyun_save')}
+            class="w-9 h-9 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 flex items-center justify-center">
+            <Icon icon={aliyunBusy ? 'carbon:renew' : 'carbon:save'} class="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+      <fieldset disabled={aliyunBusy} class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 min-w-0">
+        <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+          {$t('aliyun_app_key')}
+          <input type="text" autocomplete="off" bind:value={aliyun.app_key} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+          {$t('aliyun_token')}
+          <input type="password" autocomplete="new-password" bind:value={aliyunToken} placeholder={aliyun.has_token ? $t('aliyun_saved_secret') : ''} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+          {$t('aliyun_ak_id')}
+          <input type="text" autocomplete="off" bind:value={aliyun.access_key_id} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+          {$t('aliyun_ak_secret')}
+          <input type="password" autocomplete="new-password" bind:value={aliyunSecret} placeholder={aliyun.has_access_key_secret ? $t('aliyun_saved_secret') : ''} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+          {$t('aliyun_region')}
+          <select bind:value={aliyun.region} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
+            <option value="cn-shanghai">华东2（上海）</option>
+            <option value="cn-beijing">华北2（北京）</option>
+            <option value="cn-shenzhen">华南1（深圳）</option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+          {$t('aliyun_sample_rate')}
+          <select bind:value={aliyun.sample_rate} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
+            <option value={16000}>16000 Hz</option>
+            <option value={8000}>8000 Hz</option>
+          </select>
+        </label>
+      </fieldset>
+      {#if aliyunMessage}<p class="text-xs text-green-600 dark:text-green-400 mt-2" role="status">{aliyunMessage}</p>{/if}
+      {#if aliyunError}<p class="text-xs text-red-600 dark:text-red-400 mt-2 break-words" role="alert">{aliyunError}</p>{/if}
+    </form>
+  {/if}
 
   <!-- Make a call -->
   <div class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0">

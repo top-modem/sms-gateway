@@ -96,9 +96,25 @@ Local tool locations are:
 
 Valid configured speech-tool paths take precedence; otherwise the application
 looks for the bundled files relative to the working directory and executable.
-Keep the Whisper DLLs beside its executable. Local transcription is limited to
-one worker and one interactive trial at a time; this is not a 32-call capacity
-claim.
+Keep the Whisper DLLs beside its executable. Local Whisper transcription runs
+one recording at a time, so it is only practical for a few simultaneous calls.
+
+#### Ports and Aliyun online recognition
+
+The port setting accepts a comma-separated list of up to 32 ports (for example
+`COM2,COM5`); each listed port runs its own independent voice flow.
+
+Set "Recognition" to Aliyun online to use the Aliyun 智能语音交互 short-sentence
+(一句话识别) RESTful API, which handles many calls in parallel. In the Aliyun panel
+enter the project AppKey and either a console token (expires, for testing) or a
+RAM AccessKey ID/Secret, from which the gateway creates and renews tokens
+automatically. Choose the project region and the model sample rate (16 kHz for
+general models, 8 kHz for telephone models); the language comes from the
+project's model, not the language setting. Use "Test connection" to verify.
+Credentials stay on the gateway (`GET/PUT /api/settings/aliyun-asr`,
+`POST /api/settings/aliyun-asr/test`) and secrets are never returned to the
+browser. If an Aliyun request fails, that recording falls back to local Whisper.
+When Aliyun is selected, recordings are sent to Aliyun for recognition.
 
 The enabled voice-flow port answers without the ordinary auto-answer delay;
 other calls retain their configured delay. After answering, the flow
@@ -132,8 +148,9 @@ call test. Ordinary calls do not receive these audio changes.
 
 The call log shows stages, both transcripts, the sent digit, the resulting code,
 recording downloads, and cancellation. Codes retain leading zeroes. A restart
-marks unfinished jobs interrupted and never replays DTMF. No audio or code is
-sent to OpenAI, WorldCode, or webhooks by this flow. Other incoming calls keep
+marks unfinished jobs interrupted and never replays DTMF. Apart from the optional
+Aliyun recognition above, no audio or code is sent to OpenAI, WorldCode, or
+webhooks by this flow. Other incoming calls keep
 the existing ordinary recording behavior.
 
 The prompt window and local recognition must finish before the remote IVR

@@ -35,17 +35,14 @@ pub struct TranscribeConfig {
 
 impl TranscribeConfig {
     pub fn from_settings(s: &Settings) -> Option<Arc<Self>> {
-        match (&s.ffmpeg_exe, &s.whisper_exe, &s.whisper_model) {
-            (Some(ffmpeg), Some(whisper), Some(model)) => Some(Arc::new(Self {
-                ffmpeg_exe: ffmpeg.clone(),
-                whisper_exe: whisper.clone(),
-                whisper_model: model.clone(),
+        Some(Arc::new(Self {
+                ffmpeg_exe: crate::transcribe::resolve_local_file(s.ffmpeg_exe.as_deref(), &["tools/ffmpeg/ffmpeg.exe", "ffmpeg.exe"] )?,
+                whisper_exe: crate::transcribe::resolve_local_file(s.whisper_exe.as_deref(), &["tools/whisper/whisper-cli.exe"] )?,
+                whisper_model: crate::transcribe::resolve_local_file(s.whisper_model.as_deref(), &["tools/whisper/ggml-base.bin"] )?,
                 whisper_language: s.whisper_language.clone().unwrap_or_else(|| "auto".to_string()),
                 auto_answer_delay_secs: s.auto_answer_delay_secs.unwrap_or(2),
                 auto_answer_enabled: s.auto_answer_enabled.unwrap_or(true),
-            })),
-            _ => None,
-        }
+        }))
     }
 }
 
@@ -106,6 +103,7 @@ pub struct ModemManager {
     /// Ports where CPIN is READY but ICCID changed. Hide the old identity while
     /// repeated samples confirm the new card before teardown/reinitialization.
     identity_revalidating_ports: RwLock<HashSet<String>>,
+    transcribe_config: RwLock<Option<Arc<TranscribeConfig>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +142,22 @@ const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 #[cfg(test)]
 mod recovery_capacity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn voice_otp_tools_are_ready_before_modem_discovery() {
+        let path = std::env::temp_dir().join(format!("voice-tools-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"test tool marker").unwrap();
+        let mut config: crate::config::AppConfig = toml::from_str(
+            "[settings]\nserver_host='127.0.0.1'\nserver_port=0\nread_sms_frequency=10",
+        ).unwrap();
+        let filename = path.to_string_lossy().to_string();
+        config.settings.ffmpeg_exe = Some(filename.clone());
+        config.settings.whisper_exe = Some(filename.clone());
+        config.settings.whisper_model = Some(filename);
+        let manager = ModemManager::new(&config);
+        assert!(manager.local_transcription_ready().await);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn recovery_capacity_reserves_room_for_responsive_ports() {
@@ -1173,6 +1187,7 @@ impl ModemManager {
             manual_restarting_ports: RwLock::new(HashSet::new()),
             msim_managed_ports: RwLock::new(HashSet::new()),
             identity_revalidating_ports: RwLock::new(HashSet::new()),
+            transcribe_config: RwLock::new(TranscribeConfig::from_settings(&config.settings)),
         }
     }
 
@@ -2038,7 +2053,9 @@ impl ModemManager {
 
         modem
             .read_sms_async_insert(sms_type, sse_manager, webhook_manager)
-            .await
+            .await?;
+        self.refresh_sim_cache(&[sim_id.to_string()]).await;
+        Ok(())
     }
 
     pub async fn read_sms_sync_insert(
@@ -2051,7 +2068,9 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        modem.read_sms_sync_insert(sms_type).await
+        modem.read_sms_sync_insert(sms_type).await?;
+        self.refresh_sim_cache(&[sim_id.to_string()]).await;
+        Ok(())
     }
 
     /// Read SMS from modem, sync to DB, and return the latest incoming message from modem read.
@@ -2081,6 +2100,11 @@ impl ModemManager {
         }
 
         ModemSMS::bulk_insert(&sms_list).await?;
+
+        if let Err(error) = modem.sync_welcome_sms_identity(&sms_list).await {
+            log::warn!("[{}] Welcome SMS SIM sync failed: {}", modem.com_port, error);
+        }
+        self.refresh_sim_cache(&[sim_id.to_string()]).await;
 
         let latest = sms_list
             .into_iter()
@@ -2163,6 +2187,7 @@ impl ModemManager {
             v
         };
 
+        let sim_ids: Vec<_> = entries.iter().map(|(sim_id, _)| sim_id.clone()).collect();
         let mut futures = FuturesUnordered::new();
         for (sim_id, modem) in entries {
             let sse_manager = sse_manager.clone();
@@ -2178,6 +2203,7 @@ impl ModemManager {
         }
 
         while futures.next().await.is_some() {}
+        self.refresh_sim_cache(&sim_ids).await;
     }
 
     /// Re-check all currently active modems for SIM insertion/removal.
@@ -3251,6 +3277,7 @@ impl ModemManager {
         sim_id: &str,
         phone_number: &str,
     ) -> anyhow::Result<()> {
+        let phone_guard = SimCard::lock_phone_number(sim_id).await;
         let modem = self
             .get_modem(sim_id)
             .await
@@ -3262,10 +3289,8 @@ impl ModemManager {
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("SIM card not found: {}", sim_id))?;
-            card.update_phone_number(Some(phone_number.to_string())).await?;
+            card.update_phone_number_locked(Some(phone_number.to_string()), &phone_guard).await?;
             self.update_sim_cache(card).await;
-            sqlx::query("UPDATE sim_cards SET phone_number_source = 'manual' WHERE id = ?")
-                .bind(sim_id).execute(crate::db::get_pool()?).await?;
             log::info!("[SIM:{}] phone number saved to local database", sim_id);
             return Ok(());
         }
@@ -3277,7 +3302,7 @@ impl ModemManager {
         match SimCard::find_by_conditions(Some(sim_id), None, None, None).await {
             Ok(cards) => {
                 if let Some(mut card) = cards.into_iter().next() {
-                    if let Err(e) = card.update_phone_number(Some(phone_number.to_string())).await {
+                    if let Err(e) = card.update_phone_number_locked(Some(phone_number.to_string()), &phone_guard).await {
                         log::warn!("[SIM:{}] Wrote phone number to SIM but failed to update local DB: {}", sim_id, e);
                     } else {
                         self.update_sim_cache(card).await;
@@ -3409,6 +3434,9 @@ impl ModemManager {
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
+        if modem.voice_otp_call_id.lock().await.is_some() {
+            anyhow::bail!("An interactive voice call is still using this port");
+        }
 
         // Cancel any existing outbound poller and finalize the previous call as missed.
         // This prevents the old poller's poll_cancel_rx from firing when we replace
@@ -3552,6 +3580,66 @@ impl ModemManager {
         None
     }
 
+    async fn start_inbound_audio(
+        modem: Arc<Modem>, sim_id: String, call_id: String,
+        config: Option<Arc<TranscribeConfig>>, sse: Arc<SseManager>,
+    ) -> anyhow::Result<()> {
+        match super::voice_otp::maybe_start(modem.clone(), call_id.clone(), sim_id.clone(), config, sse).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                let progress = crate::transcribe::VoiceOtpProgress {
+                    state: "failed".into(), provider: "local".into(), error: Some(error.to_string()),
+                    ..Default::default()
+                };
+                let _ = Call::save_voice_otp(&call_id, &progress).await;
+                let _ = modem.voice_call_command(&call_id, &sim_id, "ATH\r\n", false).await;
+                modem.inject_urc(&format!("VOICE_OTP_END:{}", call_id));
+                return Err(error);
+            }
+        }
+        if let Err(error) = modem.delete_files().await {
+            log::warn!("[{}] cannot clear ordinary call files: {}", sim_id, error);
+        }
+        if let Err(error) = modem.start_recording("a.amr").await {
+            log::warn!("[{}] cannot start ordinary call recording: {}", sim_id, error);
+        }
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        *modem.inbound_recording_cancel_tx.lock().await = Some(cancel_tx);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    let _ = modem.voice_call_command(&call_id, &sim_id, "AT+QAUDRD=0\r\n", false).await;
+                    if modem.voice_call_command(&call_id, &sim_id, "ATH\r\n", false).await.is_ok() {
+                        modem.inject_urc(&format!("VOICE_OTP_END:{}", call_id));
+                    }
+                }
+                _ = cancel_rx => {}
+            }
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_voice_otp(&self, call_id: &str) -> anyhow::Result<bool> {
+        let modems: Vec<_> = self.modems.read().await.values().cloned().collect();
+        for modem in modems {
+            if modem.voice_otp_call_id.lock().await.as_deref() == Some(call_id) {
+                if let Some(sender) = modem.voice_otp_cancel_tx.lock().await.take() {
+                    let _ = sender.send(());
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) async fn local_transcription_ready(&self) -> bool {
+        self.transcribe_config.read().await.as_ref().is_some_and(|config| {
+            [&config.ffmpeg_exe, &config.whisper_exe, &config.whisper_model]
+                .iter().all(|path| std::path::Path::new(path).is_file())
+        })
+    }
+
     /// Answer the current inbound call. Mirrors the URC handler's auto-answer
     /// side effects (DB status, SSE event, recording) and coordinates with it
     /// via shared `Modem` state so the two paths never both send ATA.
@@ -3566,6 +3654,9 @@ impl ModemManager {
         // just return ERROR, so treat it as an idempotent success.
         if modem.inbound_call_answered.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if modem.voice_otp_call_id.lock().await.is_some() {
+            anyhow::bail!("A previous voice-flow job is still finishing on this port");
         }
 
         if let Err(e) = modem.answer_call().await {
@@ -3592,35 +3683,12 @@ impl ModemManager {
             sse.send_call_event(CallEvent {
                 event_type: "call_answered".into(),
                 sim_id: sim_id.to_string(),
-                call_id,
+                call_id: call_id.clone(),
                 phone: None,
                 direction: "inbound".into(),
             });
-            // ── Start downlink recording (mirrors auto-answer) ──────────────
-            if let Err(e) = modem.delete_files().await {
-                error!("[{}] failed to clear modem UFS: {}", sim_id, e);
-            }
-            match modem.start_recording("a.amr").await {
-                Ok(()) => info!("[{}] recording started -> a.amr (manual answer)", sim_id),
-                Err(e) => error!("[{}] failed to start recording: {}", sim_id, e),
-            }
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            *modem.inbound_recording_cancel_tx.lock().await = Some(cancel_tx);
-            let modem_c = modem.clone();
-            let sim_id_c = sim_id.to_string();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        info!("[{}] 30s recording limit, stopping and hanging up", sim_id_c);
-                        modem_c.stop_recording().await.ok();
-                        modem_c.hangup_call().await.ok();
-                        modem_c.inject_urc("NO CARRIER");
-                    }
-                    _ = cancel_rx => {
-                        info!("[{}] recording timer cancelled", sim_id_c);
-                    }
-                }
-            });
+            Self::start_inbound_audio(modem, sim_id.to_string(), call_id,
+                self.transcribe_config.read().await.clone(), sse).await?;
         }
 
         Ok(())
@@ -3633,7 +3701,19 @@ impl ModemManager {
             .get_modem(sim_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
+        let incoming_call = modem.inbound_call_id.lock().await.clone();
+        if incoming_call.is_some()
+            && modem.voice_otp_call_id.lock().await.as_deref() == incoming_call.as_deref()
+        {
+            if let Some(sender) = modem.voice_otp_cancel_tx.lock().await.take() {
+                let _ = sender.send(());
+            }
+            return Ok(None);
+        }
         modem.hangup_call().await?;
+        if let Some(call_id) = incoming_call {
+            modem.inject_urc(&format!("VOICE_OTP_END:{}", call_id));
+        }
         // Cancel the CLCC polling task so it does not race with our finalization below.
         if let Some(tx) = modem.outbound_poll_cancel_tx.lock().await.take() {
             let _ = tx.send(());
@@ -3661,6 +3741,7 @@ impl ModemManager {
         sse_manager: Arc<SseManager>,
         transcribe_cfg: Option<Arc<TranscribeConfig>>,
     ) {
+        *self.transcribe_config.write().await = transcribe_cfg.clone();
         let entries: Vec<(String, String, Arc<Modem>)> = {
             let modems = self.modems.read().await;
             let mut v = Vec::with_capacity(modems.len());
@@ -3709,9 +3790,13 @@ impl ModemManager {
                 }
             };
 
-            let line = line.trim().to_string();
+            let mut line = line.trim().to_string();
             if line.is_empty() {
                 continue;
+            }
+            if let Some(ended_call) = line.strip_prefix("VOICE_OTP_END:") {
+                if active_call_id.as_deref() != Some(ended_call) { continue; }
+                line = "NO CARRIER".into();
             }
 
             if line.starts_with("+CLIP:") {
@@ -3757,16 +3842,24 @@ impl ModemManager {
                             let should_auto_answer = transcribe_cfg
                                 .as_ref()
                                 .map(|cfg| cfg.auto_answer_enabled)
-                                .unwrap_or(true);
+                                .unwrap_or(true)
+                                && modem.voice_otp_call_id.lock().await.is_none();
                             if should_auto_answer {
                                 // Wait before auto-answering, but let a manual `/calls/answer`
                                 // request cancel this wait so we never send a second ATA.
                                 let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
                                 *modem.inbound_auto_answer_cancel_tx.lock().await = Some(cancel_tx);
-                                let delay_secs = transcribe_cfg
+                                let normal_delay = transcribe_cfg
                                     .as_ref()
                                     .map(|cfg| cfg.auto_answer_delay_secs)
                                     .unwrap_or(0);
+                                let delay_secs = match crate::transcribe::VoiceOtpSettings::load().await {
+                                    Ok(settings) => settings.answer_delay_for(&modem.com_port, normal_delay),
+                                    Err(error) => {
+                                        log::warn!("[URC {}] cannot load voice answer settings: {}", sim_id, error);
+                                        normal_delay
+                                    }
+                                };
                                 let mut answered_manually = false;
                                 if delay_secs > 0 {
                                     info!(
@@ -3805,35 +3898,10 @@ impl ModemManager {
                                         phone: current_phone.clone(),
                                         direction: "inbound".into(),
                                     });
-                                    // ── Start downlink recording ──────────────────────────
-                                    if let Err(e) = modem.delete_files().await {
-                                        error!("[URC {}] failed to clear modem UFS: {}", sim_id, e);
+                                    if let Err(error) = Self::start_inbound_audio(modem.clone(), sim_id.clone(), id.clone(),
+                                        transcribe_cfg.clone(), sse.clone()).await {
+                                        error!("[URC {}] cannot start call audio: {}", sim_id, error);
                                     }
-                                    match modem.start_recording("a.amr").await {
-                                        Ok(()) => info!("[URC {}] recording started -> a.amr", sim_id),
-                                        Err(e) => error!("[URC {}] failed to start recording: {}", sim_id, e),
-                                    }
-                                    info!("[URC {}] call_answered={} after start_recording", sim_id, call_answered);
-                                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-                                    *modem.inbound_recording_cancel_tx.lock().await = Some(cancel_tx);
-                                    let modem_c = modem.clone();
-                                    let sim_id_c = sim_id.clone();
-                                    tokio::spawn(async move {
-                                        tokio::select! {
-                                            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                                                info!("[URC {}] 30s recording limit, stopping and hanging up", sim_id_c);
-                                                modem_c.stop_recording().await.ok();
-                                                modem_c.hangup_call().await.ok();
-                                                // EC20F may not emit NO CARRIER after ATH — inject
-                                                // a synthetic one so the URC handler always cleans up.
-                                                modem_c.inject_urc("NO CARRIER");
-                                            }
-                                            _ = cancel_rx => {
-                                                info!("[URC {}] recording timer cancelled", sim_id_c);
-                                            }
-                                        }
-                                    });
-                                    // ─────────────────────────────────────────────────────
                                 }
                                 }
                                 }
@@ -3872,13 +3940,21 @@ impl ModemManager {
                 info!("[URC {}] {} received: call_answered={}, has_active={}, has_recording={}",
                     sim_id, line, call_answered, active_call_id.is_some(), has_recording);
                 if let Some(call_id) = active_call_id.take() {
+                    let interactive = modem.voice_otp_call_id.lock().await.as_deref() == Some(call_id.as_str());
+                    let was_answered = call_answered || modem.inbound_call_answered.load(Ordering::SeqCst);
                     *modem.inbound_call_id.lock().await = None;
                     modem.inbound_call_answered.store(false, Ordering::SeqCst);
                     if let Some(tx) = modem.inbound_auto_answer_cancel_tx.lock().await.take() {
                         let _ = tx.send(());
                     }
                     // ── Stop recording if active ──────────────────────────────
-                    if let Some(tx) = modem.inbound_recording_cancel_tx.lock().await.take() {
+                    if interactive {
+                        if !modem.voice_otp_finishing.load(Ordering::SeqCst) {
+                            if let Some(tx) = modem.inbound_recording_cancel_tx.lock().await.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    } else if let Some(tx) = modem.inbound_recording_cancel_tx.lock().await.take() {
                         modem.stop_recording().await.ok();
                         tx.send(()).ok(); // cancel the 30s timer task
                         info!("[URC {}] recording stopped", sim_id);
@@ -3926,7 +4002,7 @@ impl ModemManager {
                     // Missed = inbound call that was never answered; Busy = remote busy
                     let new_status = if line == "BUSY" {
                         "missed"
-                    } else if !call_answered {
+                    } else if !was_answered {
                         "missed"
                     } else {
                         "ended"

@@ -12,6 +12,8 @@
   let simCards = $state([]);
   let loading = $state(true);
   let error = $state('');
+  let welcomeSmsSync = $state(false);
+  let welcomeSmsSettingBusy = $state(true);
 
   // Import tab
   let fileInput = $state(null);
@@ -343,8 +345,33 @@
     }
   }
 
+  async function loadWelcomeSmsSync() {
+    try {
+      const response = await apiClient.getWelcomeSmsSync();
+      welcomeSmsSync = response?.data?.enabled === true;
+    } catch (failure) {
+      error = failure?.data?.error ?? failure?.message ?? $t('err_load_sim');
+    } finally {
+      welcomeSmsSettingBusy = false;
+    }
+  }
+
+  async function saveWelcomeSmsSync(enabled) {
+    const previous = welcomeSmsSync;
+    welcomeSmsSync = enabled;
+    welcomeSmsSettingBusy = true;
+    try {
+      await apiClient.setWelcomeSmsSync(enabled);
+    } catch (failure) {
+      welcomeSmsSync = previous;
+      error = failure?.data?.error ?? failure?.message ?? $t('phone_welcome_sms_sync_failed');
+    } finally {
+      welcomeSmsSettingBusy = false;
+    }
+  }
+
   onMount(async () => {
-    await fetchData();
+    await Promise.all([fetchData(), loadWelcomeSmsSync()]);
     if (activeTab === 'barcode') {
       await fetchBarcodeScans();
       await focusBarcodeIccidInput();
@@ -367,13 +394,26 @@
       <Icon icon="carbon:arrow-left" class="w-4 h-4" />
       <span class="text-xs font-semibold">{$t('btn_back')}</span>
     </button>
-    <Icon icon="carbon:phone-voice" class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+    <img src="/cow.png" alt="App" class="w-5 h-5 rounded-sm object-contain" />
     <h1 class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('phone_number_title')}</h1>
   </header>
 
   <!-- ── Tabs ───────────────────────────────────────────────────────────────── -->
   <div class="px-4 pt-4 bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800">
     <div class="flex gap-1 overflow-x-auto">
+      <label
+        class="flex items-center gap-2 px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 border-transparent
+               text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 transition"
+      >
+        <input
+          type="checkbox"
+          class="accent-blue-600"
+          checked={welcomeSmsSync}
+          disabled={welcomeSmsSettingBusy}
+          onchange={(event) => saveWelcomeSmsSync(event.currentTarget.checked)}
+        />
+        {$t('phone_welcome_sms_sync')}
+      </label>
       {#each [
         { id: 'barcode', label: $t('phone_tab_barcode'), icon: 'carbon:scan' },
         { id: 'import', label: $t('phone_tab_import'), icon: 'carbon:document-import' },

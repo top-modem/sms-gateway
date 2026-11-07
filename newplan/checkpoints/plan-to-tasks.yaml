@@ -1,0 +1,7 @@
+plan_items:
+  P1: [T001, T008, T009]
+  P2: [T002, T003]
+  P3: [T004, T005, T008]
+  P4: [T003, T005, T008, T009]
+  P5: [T006, T007, T008]
+status: proposed_voice_only

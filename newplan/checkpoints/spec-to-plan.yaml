@@ -1,0 +1,11 @@
+requirements:
+  REQ-001: [P2, P5]
+  REQ-002: [P3]
+  REQ-003: [P1, P2, P3]
+  REQ-004: [P3]
+  REQ-005: [P3]
+  REQ-006: [P4, P5]
+  REQ-007: [P5]
+  REQ-008: [P2, P3, P4, P5]
+  REQ-009: [P1, P4]
+status: proposed_voice_only

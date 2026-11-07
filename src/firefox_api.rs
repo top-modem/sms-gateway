@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-const API_BASE: &str = "http://ks.firefox.fun/ksapi.ashx";
-const USER_API_BASE: &str = "https://www.firefox.fun/yhapi.ashx";
+const API_BASE: &str = "https://www.worldcode.win/ksapi.ashx";
+const USER_API_BASE: &str = "https://www.worldcode.win/yhapi.ashx";
+pub const API_KEY_SETTING: &str = "worldcode_api_key";
 
-/// Country list parsed from 火狐狸-API上卡协议文档.pdf.
+/// Country list for the WorldCode seller API.
 /// Format: (country_id, dial_prefix, display_name)
 pub const COUNTRIES: &[(&str, &str, &str)] = &[
     ("afg", "+93", "Afghanistan"),
@@ -131,6 +132,7 @@ pub const COUNTRIES: &[(&str, &str, &str)] = &[
     ("mtq", "+596", "Martinique"),
     ("niu", "+683", "Niue"),
     ("cod", "+243", "Zaire"),
+    ("vgb", "+1284", "British Virgin Islands"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -149,11 +151,11 @@ pub fn countries() -> Vec<CountryInfo> {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct UserItemPrice {
-    #[serde(rename = "Item_ID")]
+    #[serde(rename = "Item_ID", deserialize_with = "string_or_number")]
     pub item_id: String,
     #[serde(rename = "Item_Name")]
     pub item_name: String,
-    #[serde(rename = "Item_UPrice")]
+    #[serde(rename = "Item_UPrice", deserialize_with = "string_or_number")]
     pub item_uprice: String,
     #[serde(rename = "Country_ID")]
     pub country_id: Option<String>,
@@ -161,53 +163,57 @@ pub struct UserItemPrice {
     pub country_title: Option<String>,
 }
 
+fn string_or_number<'de, Deserializer>(deserializer: Deserializer) -> std::result::Result<String, Deserializer::Error>
+where
+    Deserializer: serde::Deserializer<'de>,
+{
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        _ => Err(serde::de::Error::custom("expected a string or number")),
+    }
+}
+
+fn seller_request(client: &reqwest::Client, method: reqwest::Method, api_key: &str) -> reqwest::RequestBuilder {
+    client.request(method, API_BASE).query(&[("key", api_key)])
+}
+
+fn user_catalog_request(client: &reqwest::Client, keyword: Option<&str>) -> reqwest::RequestBuilder {
+    client.get(USER_API_BASE).query(&[("act", "getItem"), ("key", keyword.unwrap_or("").trim())])
+}
+
 pub async fn get_user_item_prices(
     client: &reqwest::Client,
-    token: Option<&str>,
-    key: Option<&str>,
+    keyword: Option<&str>,
 ) -> Result<Vec<UserItemPrice>> {
-    let mut query: Vec<(&str, String)> = vec![("act", "getItem".to_string())];
-
-    if let Some(v) = token {
-        if !v.trim().is_empty() {
-            query.push(("token", v.trim().to_string()));
-        }
-    }
-
-    if let Some(v) = key {
-        if !v.trim().is_empty() {
-            query.push(("key", v.trim().to_string()));
-        }
-    }
-
-    let response = client
-        .get(USER_API_BASE)
-        .query(&query)
+    let response = user_catalog_request(client, keyword)
         .send()
         .await
-        .context("Failed to request 火狐狸 user item catalog")?;
+        .map_err(reqwest::Error::without_url)
+        .context("Failed to request WorldCode user item catalog")?;
 
     let status = response.status();
     let text = response
         .text()
         .await
-        .context("Failed to read 火狐狸 user item catalog response")?;
+        .map_err(reqwest::Error::without_url)
+        .context("Failed to read WorldCode user item catalog response")?;
 
     if !status.is_success() {
-        bail!("火狐狸 user API returned HTTP {}: {}", status, text);
+        bail!("WorldCode user API returned HTTP {}", status);
     }
 
     let raw = text.trim();
     let payload = if let Some(rest) = raw.strip_prefix("1|") {
         rest
     } else if let Some(rest) = raw.strip_prefix("0|") {
-        bail!("火狐狸 user API getItem failed: {}", rest);
+        bail!("WorldCode user API getItem failed: {}", rest);
     } else {
         raw
     };
 
     let items: Vec<UserItemPrice> = serde_json::from_str(payload)
-        .with_context(|| format!("Failed to parse 火狐狸 user getItem payload: {}", payload))?;
+        .context("Failed to parse WorldCode user getItem payload")?;
 
     Ok(items)
 }
@@ -219,27 +225,27 @@ async fn do_post<T: Serialize, R: serde::de::DeserializeOwned>(
     api_key: &str,
     payload: &T,
 ) -> Result<R> {
-    let url = format!("{}?key={}", API_BASE, api_key);
-    let response = client
-        .post(&url)
+    let response = seller_request(client, reqwest::Method::POST, api_key)
         .header("Content-Type", "application/json")
         .json(payload)
         .send()
         .await
-        .context("Failed to send request to 火狐狸 platform")?;
+        .map_err(reqwest::Error::without_url)
+        .context("Failed to send request to WorldCode platform")?;
 
     let status = response.status();
     let text = response
         .text()
         .await
-        .context("Failed to read 火狐狸 platform response")?;
+        .map_err(reqwest::Error::without_url)
+        .context("Failed to read WorldCode platform response")?;
 
     if !status.is_success() {
-        anyhow::bail!("火狐狸 platform returned HTTP {}: {}", status, text);
+        anyhow::bail!("WorldCode platform returned HTTP {}", status);
     }
 
     serde_json::from_str(&text)
-        .with_context(|| format!("Failed to parse 火狐狸 response: {}", text))
+        .context("Failed to parse WorldCode response")
 }
 
 async fn do_get<R: serde::de::DeserializeOwned>(
@@ -247,26 +253,26 @@ async fn do_get<R: serde::de::DeserializeOwned>(
     api_key: &str,
     query: &[(&str, &str)],
 ) -> Result<R> {
-    let url = format!("{}?key={}", API_BASE, api_key);
-    let response = client
-        .get(&url)
+    let response = seller_request(client, reqwest::Method::GET, api_key)
         .query(query)
         .send()
         .await
-        .context("Failed to send GET request to 火狐狸 platform")?;
+        .map_err(reqwest::Error::without_url)
+        .context("Failed to send GET request to WorldCode platform")?;
 
     let status = response.status();
     let text = response
         .text()
         .await
-        .context("Failed to read 火狐狸 platform response")?;
+        .map_err(reqwest::Error::without_url)
+        .context("Failed to read WorldCode platform response")?;
 
     if !status.is_success() {
-        anyhow::bail!("火狐狸 platform returned HTTP {}: {}", status, text);
+        anyhow::bail!("WorldCode platform returned HTTP {}", status);
     }
 
     serde_json::from_str(&text)
-        .with_context(|| format!("Failed to parse 火狐狸 response: {}", text))
+        .context("Failed to parse WorldCode response")
 }
 
 // ─── Shared response type (code + data) ─────────────────────────────────
@@ -662,4 +668,66 @@ pub async fn upload_sms(
     }
 
     Ok(first_ok)
+}
+
+#[cfg(test)]
+mod worldcode_tests {
+    use super::*;
+
+    #[test]
+    fn worldcode_seller_requests_encode_keys_and_keep_documented_payloads() {
+        let client = reqwest::Client::new();
+        let payload = PhoneAddBatchRequest {
+            act: "PhoneAddBatch",
+            PhoneList: vec![PhoneAddEntry {
+                Country_ID: "vgb", Phone_Num: "1234567", Phone_ComName: "", Provi_Name: "", City_Name: "",
+            }],
+        };
+        let request = seller_request(&client, reqwest::Method::POST, "test&key=+#value")
+            .json(&payload).build().unwrap();
+        assert_eq!(request.url().scheme(), "https");
+        assert_eq!(request.url().host_str(), Some("www.worldcode.win"));
+        assert_eq!(request.url().path(), "/ksapi.ashx");
+        assert_eq!(request.url().query_pairs().collect::<Vec<_>>(), vec![("key".into(), "test&key=+#value".into())]);
+        let body: serde_json::Value = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({"act":"PhoneAddBatch", "PhoneList":[{
+            "Country_ID":"vgb", "Phone_Num":"1234567", "Phone_ComName":"", "Provi_Name":"", "City_Name":""
+        }]}));
+        let get = seller_request(&client, reqwest::Method::GET, "test-key")
+            .query(&[("act", "GetWaitPhoneList")]).build().unwrap();
+        assert!(get.url().query_pairs().any(|(name, value)| name == "act" && value == "GetWaitPhoneList"));
+        assert_eq!(API_KEY_SETTING, "worldcode_api_key");
+    }
+
+    #[test]
+    fn worldcode_price_catalog_is_public_and_key_is_a_keyword() {
+        let request = user_catalog_request(&reqwest::Client::new(), Some(" WhatsApp & Telegram "))
+            .build().unwrap();
+        assert_eq!(request.url().host_str(), Some("www.worldcode.win"));
+        assert_eq!(request.url().path(), "/yhapi.ashx");
+        assert_eq!(request.url().query_pairs().collect::<Vec<_>>(), vec![
+            ("act".into(), "getItem".into()), ("key".into(), "WhatsApp & Telegram".into()),
+        ]);
+    }
+
+    #[test]
+    fn worldcode_catalog_accepts_string_and_numeric_prices() {
+        for payload in [
+            r#"{"Item_ID":"1000","Item_Name":"WhatsApp","Item_UPrice":"0.25","Country_ID":"eng"}"#,
+            r#"{"Item_ID":1000,"Item_Name":"WhatsApp","Item_UPrice":0.25,"Country_ID":"eng"}"#,
+        ] {
+            let price: UserItemPrice = serde_json::from_str(payload).unwrap();
+            assert_eq!(price.item_id, "1000");
+            assert_eq!(price.item_uprice, "0.25");
+        }
+    }
+
+    #[test]
+    fn worldcode_country_catalog_includes_british_virgin_islands() {
+        let country = countries().into_iter().find(|country| country.id == "vgb").unwrap();
+        assert_eq!(country.prefix, "+1284");
+        assert_eq!(country.name, "British Virgin Islands");
+        let unique: std::collections::HashSet<_> = COUNTRIES.iter().map(|(id, _, _)| id).collect();
+        assert_eq!(unique.len(), COUNTRIES.len());
+    }
 }

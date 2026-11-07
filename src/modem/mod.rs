@@ -6,6 +6,8 @@ pub mod manager;
 pub mod mock_manager;
 pub mod pdu;
 pub mod types;
+#[cfg(not(feature = "mock-data"))]
+mod voice_otp;
 
 #[cfg(not(feature = "mock-data"))]
 pub use manager::ModemManager;

@@ -1,0 +1,1 @@
+ALTER TABLE firefox_upload_retry_queue ADD COLUMN platform TEXT NOT NULL DEFAULT 'firefox';

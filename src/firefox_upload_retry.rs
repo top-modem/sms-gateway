@@ -64,9 +64,9 @@ impl FirefoxUploadRetryItem {
         sqlx::query(
             r#"
             INSERT INTO firefox_upload_retry_queue
-            (id, sms_id, phone_number, country_id, message, retry_count, max_retries,
+            (id, sms_id, phone_number, country_id, message, retry_count, max_retries, platform,
              next_retry_at, last_error, last_response_code, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'worldcode', ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&item.id)
@@ -93,7 +93,7 @@ impl FirefoxUploadRetryItem {
         let items = sqlx::query_as::<_, Self>(
             r#"
             SELECT * FROM firefox_upload_retry_queue
-            WHERE next_retry_at <= ? AND retry_count < max_retries
+            WHERE platform = 'worldcode' AND next_retry_at <= ? AND retry_count < max_retries
             ORDER BY next_retry_at ASC
             LIMIT ?
             "#,
@@ -233,4 +233,36 @@ pub struct QueueStats {
     pub total_items: i32,
     pub ready_for_retry: i32,
     pub dead_letter_items: i32,
+}
+
+#[cfg(test)]
+mod worldcode_retry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worldcode_retry_does_not_replay_legacy_firefox_messages() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE firefox_upload_retry_queue (
+            id TEXT PRIMARY KEY, sms_id INTEGER, phone_number TEXT, country_id TEXT, message TEXT,
+            retry_count INTEGER, max_retries INTEGER, next_retry_at TEXT, last_error TEXT,
+            last_response_code TEXT, created_at TEXT, updated_at TEXT);")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/20261106000002_worldcode_retry_provider.sql"))
+            .execute(&pool).await.unwrap();
+        let mut current = FirefoxUploadRetryItem::new(1, "7848998171".into(), "eng".into(), "test".into(), "test".into(), None);
+        current.next_retry_at = Utc::now().naive_utc() - Duration::minutes(1);
+        FirefoxUploadRetryItem::insert(&pool, &current).await.unwrap();
+        let mut legacy = current.clone();
+        legacy.id = Uuid::new_v4().to_string();
+        FirefoxUploadRetryItem::insert(&pool, &legacy).await.unwrap();
+        sqlx::query("UPDATE firefox_upload_retry_queue SET platform = 'firefox' WHERE id = ?")
+            .bind(&legacy.id).execute(&pool).await.unwrap();
+        let ready = FirefoxUploadRetryItem::get_ready_for_retry(&pool, 10).await.unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, current.id);
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firefox_upload_retry_queue WHERE id = ?")
+            .bind(&legacy.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(retained, 1);
+    }
 }

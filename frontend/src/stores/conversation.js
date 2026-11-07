@@ -39,7 +39,10 @@ const getAuthHeader = () => {
 const connectSSE = () => {
     if (eventSource) {
         eventSource.close();
+        eventSource = null;
     }
+    // Hidden tabs release the connection; Chrome allows only six per site.
+    if (document.hidden) return;
 
     const authHeader = getAuthHeader();
     if (!authHeader.Authorization) {
@@ -47,6 +50,7 @@ const connectSSE = () => {
         sseConnected.set(false);
         if (!reconnectTimeout) {
             reconnectTimeout = setTimeout(() => {
+                reconnectTimeout = null;
                 connectSSE();
             }, RECONNECT_DELAY);
         }
@@ -80,6 +84,7 @@ const connectSSE = () => {
         if (!reconnectTimeout) {
             console.log(`SSE: Attempting to reconnect in ${RECONNECT_DELAY / 1000} seconds...`);
             reconnectTimeout = setTimeout(() => {
+                reconnectTimeout = null;
                 connectSSE();
             }, RECONNECT_DELAY);
         }
@@ -130,6 +135,20 @@ const connectSSE = () => {
     });
 
 };
+
+export const disconnectConversationSSE = () => {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+    sseConnected.set(false);
+};
+
+export const reconnectConversationSSE = () => connectSSE();
 
 export const initConversation = () => {
     conversationLoading.set(true);

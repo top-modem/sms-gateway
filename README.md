@@ -80,6 +80,79 @@ $env:ESIM_OCR_TEST_IMAGE = (Resolve-Path .\doc\779347821.png).Path
 cargo test --release esim::activation::tests -- --include-ignored
 ```
 
+### Local Voice-Code Trial
+
+The Calls view includes an opt-in, local-only two-stage voice-code flow. It uses
+whisper.cpp, not an OpenAI API or a local ChatGPT server. The default test port is
+COM2, with independent 10-second prompt/code recordings, a six-digit code,
+automatic language detection, and a 120-second deadline. Save the settings before
+calling; only the selected enabled port uses the interactive flow.
+
+Local tool locations are:
+
+- `tools/whisper/whisper-cli.exe` and `tools/whisper/ggml-base.bin`
+- `tools/ffmpeg/ffmpeg.exe` for AMR conversion
+- `tools/lpac/lpac.exe` for the separate eSIM operations
+
+Valid configured speech-tool paths take precedence; otherwise the application
+looks for the bundled files relative to the working directory and executable.
+Keep the Whisper DLLs beside its executable. Local transcription is limited to
+one worker and one interactive trial at a time; this is not a 32-call capacity
+claim.
+
+The enabled voice-flow port answers without the ordinary auto-answer delay;
+other calls retain their configured delay. After answering, the flow
+records/downloads/transcribes the prompt while the call remains connected.
+Record enough of the repeated prompt to capture both complete instructions.
+The full recording is transcribed in one local pass, and each recognized
+press instruction is compared. At least two clear readings of the same digit
+are required before DTMF. Quoted digits are accepted, but conflicting choices
+and multi-digit instructions are rejected. Each reading and the comparison
+result are shown in the call log. This is transcript-level consistency checking,
+not a claim of two independent ASR engines or guaranteed recognition accuracy.
+The second recording starts before the digit is sent.
+The call stays connected for the full configured second recording window after
+DTMF, then the flow hangs up and transcribes the final audio. If the remote
+party ends the call during this window, the flow safely finalizes the owned
+recording and transcribes it instead of discarding it as a cancelled job.
+Explicit user cancellation remains separate and stops processing. Finalizing
+an ended recording requires the same SIM and no new active call.
+A direct unambiguous code skips DTMF and the second recording. Incomplete or
+conflicting prompt readings leave the call connected for review without sending
+a digit; remote hangup, explicit cancellation, or the configured deadline ends
+that wait. Deadline expiry or a changed call/SIM stops the flow safely.
+
+The OTP flow reads and preserves the modem's microphone mute state, then mutes
+uplink microphone speech before live file transfers. Downlink recording and
+network-generated DTMF remain separate. The previous state is restored before
+owned-call hangup or guarded ended-call cleanup. Unsupported mute control is
+logged without inventing an audio setting. This is a scoped mitigation for
+caller-side noise after an in-call download; its actual effect requires a real
+call test. Ordinary calls do not receive these audio changes.
+
+The call log shows stages, both transcripts, the sent digit, the resulting code,
+recording downloads, and cancellation. Codes retain leading zeroes. A restart
+marks unfinished jobs interrupted and never replays DTMF. No audio or code is
+sent to OpenAI, WorldCode, or webhooks by this flow. Other incoming calls keep
+the existing ordinary recording behavior.
+
+The prompt window and local recognition must finish before the remote IVR
+hangs up; increasing the application's deadline cannot extend a call ended by
+the remote party. Use a complete first prompt and the matching language when
+tuning a short IVR. The flow never sends a delayed digit to an ended or changed
+call.
+
+The control API is authenticated: `GET/PUT /api/settings/voice-otp`,
+`POST /api/calls/{id}/voice-cancel`, and
+`GET /api/calls/{id}/recording?stage=prompt|code`.
+
+Run `cargo test voice_otp` for hardware-free parsing, persistence, ordering,
+cancellation, and restart checks. The opt-in `voice_otp_local_whisper_pipeline`
+test uses `VOICE_OTP_SMOKE_PROMPT` and `VOICE_OTP_SMOKE_CODE` WAV paths to exercise
+the actual local tools. Real in-call AMR download, recording restart, DTMF
+delivery, and timing still require the approved COM2 call test; the application
+does not initiate that test call.
+
 ## 🚀 Running the Application
 
 ```bash

@@ -101,6 +101,8 @@
     try {
       const payload = unwrap(await apiClient.esimListPorts());
       ports = Array.isArray(payload) ? payload : [];
+      const capablePorts = new Set(ports.filter((port) => port.esim_capable).map((port) => port.com_port));
+      selected = new Set([...selected].filter((com) => capablePorts.has(com)));
     } catch (e) {
       fail(e);
     } finally {
@@ -134,6 +136,9 @@
     }
     if (p.session_active || p.esim_mode) {
       return { status: 'session', label: $t('esim_status_session'), detail: $t('esim_mode_esim') };
+    }
+    if (!p.esim_capable && p.machine_type === 'esim') {
+      return { status: 'unverified', label: $t('esim_status_unverified'), detail: '' };
     }
     if (p.last_status) {
       const st = String(p.last_status).toLowerCase() === 'ok' ? 'ok' : 'failed';
@@ -181,6 +186,11 @@
     if (sessionPort === com) return;
     await apiClient.esimEnter(com);
     await loadPorts();
+  }
+
+  async function verifyAndManage(com) {
+    const result = await runOp(com, 'refresh', () => apiClient.esimRefreshInventory(com));
+    if (result) await openManage(com);
   }
 
   async function openManage(com) {
@@ -615,7 +625,7 @@
                 <td class="px-3 py-2 font-medium text-slate-800">{p.com_port}</td>
                 <td class="px-3 py-2">
                   {#if !p.esim_capable}
-                    <span class="text-xs text-slate-400">{p.machine_type}</span>
+                    <span class="text-xs text-slate-400">{p.machine_type === 'esim' ? $t('esim_cached_type') : p.machine_type}</span>
                   {:else}
                     <span class="rounded-full px-2 py-0.5 text-xs {p.esim_mode ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600'}">
                       {p.esim_mode ? $t('esim_mode_esim') : $t('esim_mode_normal')}
@@ -641,9 +651,15 @@
                   {/if}
                 </td>
                 <td class="px-3 py-2 whitespace-nowrap">
-                  <button class="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100 disabled:opacity-50" onclick={() => openManage(p.com_port)} disabled={!p.esim_capable || locked}>
-                    {$t('esim_manage')}
-                  </button>
+                  {#if !p.esim_capable && p.machine_type === 'esim'}
+                    <button class="inline-flex items-center gap-1 rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100 disabled:opacity-50" onclick={() => verifyAndManage(p.com_port)} disabled={locked || !!sessionPort}>
+                      <Icon icon="carbon:search" class="h-3.5 w-3.5" />{$t('esim_verify_manage')}
+                    </button>
+                  {:else}
+                    <button class="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100 disabled:opacity-50" onclick={() => openManage(p.com_port)} disabled={!p.esim_capable || locked}>
+                      {$t('esim_manage')}
+                    </button>
+                  {/if}
                   <button class="ml-1 rounded bg-slate-500 px-2 py-1 text-xs text-white hover:bg-slate-400 disabled:opacity-50" onclick={() => resetPort(p.com_port)} disabled={!p.esim_capable || locked}>
                     {$t('esim_status_action_reset')}
                   </button>

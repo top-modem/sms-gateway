@@ -61,6 +61,61 @@ pub fn normalize_msisdn(raw: &str) -> String {
     digits.trim_start_matches('0').to_string()
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct WelcomeSmsIdentity {
+    pub operator: &'static str,
+    pub phone_number: String,
+}
+
+pub(crate) fn parse_welcome_sms(message: &str) -> Option<WelcomeSmsIdentity> {
+    static THREE_WELCOME: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)\A\s*Hi\s+there,\s*welcome\s+to\s+Three\.\s+Your\s+number\s+for\s+this\s+SIM\s+is\s+(0[0-9]{10})\.(?:\s|\z)")
+            .expect("valid Three welcome SMS pattern")
+    });
+    let captures = THREE_WELCOME.captures(message).ok()??;
+    Some(WelcomeSmsIdentity {
+        operator: "Three",
+        phone_number: normalize_msisdn(captures.get(1)?.as_str()),
+    })
+}
+
+#[cfg(test)]
+mod welcome_sms_tests {
+    use super::*;
+
+    #[test]
+    fn welcome_sms_three_sample_extracts_operator_and_own_number() {
+        let sms = "Hi there, welcome to Three.\n\nYour number for this SIM is 07848998171.\n\nTo start using your number, you'll need to top up. You'll be charged 35p per minute for calls, 15p per text, and 10p per MB of data.";
+        assert_eq!(parse_welcome_sms(sms), Some(WelcomeSmsIdentity {
+            operator: "Three",
+            phone_number: "7848998171".to_string(),
+        }));
+    }
+
+    #[test]
+    fn welcome_sms_accepts_case_and_line_ending_variations() {
+        assert_eq!(
+            parse_welcome_sms("  HI THERE, WELCOME TO THREE.\r\n\r\nYour number for this SIM is 07848998171.\r\n"),
+            parse_welcome_sms("Hi there, welcome to Three. Your number for this SIM is 07848998171."),
+        );
+        assert!(parse_welcome_sms("Hi there, welcome to Three. Your number for this SIM is 07848998171.").is_some());
+    }
+
+    #[test]
+    fn welcome_sms_rejects_unrelated_or_malformed_numbers() {
+        for sms in [
+            "Your verification code is 07848998171.",
+            "Hi there, welcome to Another. Your number for this SIM is 07848998171.",
+            "Hi there, welcome to Three. Call support on 07848998171.",
+            "Hi there, welcome to Three. Your number for this SIM is 0784899817.",
+            "Hi there, welcome to Three. Your number for this SIM is 078489981711.",
+            "Forwarded: Hi there, welcome to Three. Your number for this SIM is 07848998171.",
+        ] {
+            assert!(parse_welcome_sms(sms).is_none(), "unexpected match: {sms}");
+        }
+    }
+}
+
 /// Batch import phone numbers from `(iccid, msisdn)` pairs.
 pub async fn import_phone_numbers(
     mm: Arc<ModemManager>,

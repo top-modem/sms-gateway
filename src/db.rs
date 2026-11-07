@@ -8,7 +8,7 @@ use sqlx::Row;
 use sqlx::{migrate, Sqlite, Transaction};
 use sqlx::{FromRow, QueryBuilder};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use uuid::Uuid;
 
 const MAX_BATCH_SIZE: usize = 500;
@@ -100,6 +100,8 @@ pub struct SimCard {
     pub id: String, // ICCID
     pub imsi: Option<String>,
     pub phone_number: Option<String>, // Phone number from SIM
+    pub phone_number_source: Option<String>,
+    pub operator_name: Option<String>,
     pub alias: Option<String>,        // User-defined alias
     pub country_code: Option<String>, // 火狐狸 platform country code
     // Note: port_path removed - SIM to port mapping is runtime only
@@ -132,6 +134,7 @@ pub struct Call {
     pub status: String,    // "ringing" | "active" | "ended" | "missed"
     pub started_at: NaiveDateTime,
     pub ended_at: Option<NaiveDateTime>,
+    pub voice_otp: Option<String>,
 }
 
 impl Call {
@@ -185,7 +188,7 @@ impl Call {
     pub async fn query_by_sim(sim_id: &str, limit: i64) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let calls = sqlx::query_as(
-            r#"SELECT id, sim_id, phone, direction, status, started_at, ended_at
+                r#"SELECT id, sim_id, phone, direction, status, started_at, ended_at, voice_otp
                FROM calls WHERE sim_id = ? ORDER BY started_at DESC LIMIT ?"#,
         )
         .bind(sim_id)
@@ -198,7 +201,7 @@ impl Call {
     pub async fn query_all(limit: i64, offset: i64) -> Result<(Vec<Self>, i64)> {
         let pool = get_pool()?;
         let calls = sqlx::query_as(
-            r#"SELECT id, sim_id, phone, direction, status, started_at, ended_at
+                r#"SELECT id, sim_id, phone, direction, status, started_at, ended_at, voice_otp
                FROM calls ORDER BY started_at DESC LIMIT ? OFFSET ?"#,
         )
         .bind(limit)
@@ -216,7 +219,7 @@ impl Call {
     pub async fn find_active_inbound(sim_id: &str) -> Result<Option<Self>> {
         let pool = get_pool()?;
         let call = sqlx::query_as(
-            r#"SELECT id, sim_id, phone, direction, status, started_at, ended_at
+                r#"SELECT id, sim_id, phone, direction, status, started_at, ended_at, voice_otp
                FROM calls WHERE sim_id = ? AND direction = 'inbound'
                AND status IN ('ringing', 'active')
                ORDER BY started_at DESC LIMIT 1"#,
@@ -236,6 +239,43 @@ impl Call {
             .execute(pool)
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn save_voice_otp(id: &str, progress: &crate::transcribe::VoiceOtpProgress) -> Result<()> {
+        Self::save_voice_otp_in_pool(get_pool()?, id, progress).await
+    }
+
+    async fn save_voice_otp_in_pool(pool: &SqlitePool, id: &str, progress: &crate::transcribe::VoiceOtpProgress) -> Result<()> {
+        sqlx::query("UPDATE calls SET voice_otp = ? WHERE id = ?")
+            .bind(serde_json::to_string(progress)?)
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn interrupt_voice_otp_in_pool(pool: &SqlitePool) -> Result<()> {
+        sqlx::query("UPDATE calls SET voice_otp = json_set(voice_otp, '$.state', 'interrupted',
+                '$.error', 'Gateway restarted before the local voice flow completed'),
+                status = CASE WHEN status IN ('active', 'ringing') THEN 'ended' ELSE status END,
+                ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP)
+            WHERE voice_otp IS NOT NULL AND json_valid(voice_otp)
+                AND json_extract(voice_otp, '$.state') NOT IN ('completed', 'failed', 'cancelled', 'interrupted')")
+            .execute(pool).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn save_prompt_recording(id: &str, data: &[u8]) -> Result<()> {
+        sqlx::query("UPDATE calls SET prompt_recording = ? WHERE id = ?")
+            .bind(data).bind(id).execute(get_pool()?).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_prompt_recording(id: &str) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT prompt_recording FROM calls WHERE id = ? AND prompt_recording IS NOT NULL",
+        ).bind(id).fetch_optional(get_pool()?).await?;
+        Ok(row.map(|(data,)| data))
     }
 
     /// Fetch the raw recording blob for a call. Returns `None` if no recording exists.
@@ -883,7 +923,7 @@ impl SimCard {
     ) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let mut query = String::from(
-            "SELECT id, imsi, phone_number, alias, country_code, created_at, updated_at FROM sim_cards WHERE 1=1",
+            "SELECT id, imsi, phone_number, phone_number_source, operator_name, alias, country_code, created_at, updated_at FROM sim_cards WHERE 1=1",
         );
         let mut binds = Vec::new();
 
@@ -928,15 +968,43 @@ impl SimCard {
 
     /// 3. 更新手机号
     pub async fn update_phone_number(&mut self, phone_number: Option<String>) -> Result<()> {
+        let guard = Self::lock_phone_number(&self.id).await;
+        self.update_phone_number_locked(phone_number, &guard).await
+    }
+
+    pub(crate) async fn lock_phone_number(id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        static LOCKS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+            LazyLock::new(Default::default);
+        let lock = {
+            let mut locks = LOCKS.lock().unwrap_or_else(|error| error.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    pub(crate) async fn update_phone_number_locked(
+        &mut self,
+        phone_number: Option<String>,
+        _guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<()> {
         let pool = get_pool()?;
-        self.phone_number = phone_number.clone();
         sqlx::query(
-            "UPDATE sim_cards SET phone_number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE sim_cards SET phone_number = ?, phone_number_source = 'manual', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(&phone_number)
         .bind(&self.id)
         .execute(pool)
         .await?;
+        self.phone_number = phone_number;
+        self.phone_number_source = Some("manual".to_string());
         Ok(())
     }
 
@@ -978,12 +1046,14 @@ impl SimCard {
 
         for chunk in sim_cards.chunks(MAX_BATCH_SIZE) {
             let mut query_builder = QueryBuilder::new(
-                "INSERT INTO sim_cards (id, imsi, phone_number, alias, country_code, created_at, updated_at) ",
+                "INSERT INTO sim_cards (id, imsi, phone_number, phone_number_source, operator_name, alias, country_code, created_at, updated_at) ",
             );
             query_builder.push_values(chunk, |mut b, sim_card| {
                 b.push_bind(&sim_card.id)
                     .push_bind(&sim_card.imsi)
                     .push_bind(&sim_card.phone_number)
+                    .push_bind(&sim_card.phone_number_source)
+                    .push_bind(&sim_card.operator_name)
                     .push_bind(&sim_card.alias)
                     .push_bind(&sim_card.country_code)
                     .push_bind(sim_card.created_at)
@@ -1005,7 +1075,7 @@ impl SimCard {
     pub async fn query_all() -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let sim_cards = sqlx::query_as::<_, SimCard>(
-            "SELECT id, imsi, phone_number, alias, country_code, created_at, updated_at FROM sim_cards ORDER BY created_at"
+            "SELECT id, imsi, phone_number, phone_number_source, operator_name, alias, country_code, created_at, updated_at FROM sim_cards ORDER BY created_at"
         )
         .fetch_all(pool)
         .await?;
@@ -1035,7 +1105,7 @@ impl SimCard {
 
         let pool = get_pool()?;
         let mut query_builder = QueryBuilder::new(
-            "SELECT id, imsi, phone_number, alias, country_code, created_at, updated_at FROM sim_cards WHERE id IN ("
+            "SELECT id, imsi, phone_number, phone_number_source, operator_name, alias, country_code, created_at, updated_at FROM sim_cards WHERE id IN ("
         );
         let mut separated = query_builder.separated(", ");
         for id in ids {
@@ -1066,7 +1136,9 @@ impl SimCard {
         let sim_card = SimCard {
             id: id.to_string(),
             imsi,
+            phone_number_source: phone_number.as_deref().filter(|phone| !phone.is_empty()).map(|_| "sim_read".to_string()),
             phone_number,
+            operator_name: None,
             alias: None,
             country_code: None,
             created_at: now,
@@ -1078,6 +1150,31 @@ impl SimCard {
                 .bind(id).execute(get_pool()?).await?;
         }
         Ok(sim_card)
+    }
+
+    pub(crate) fn accepts_welcome_sms_number(&self, phone: &str) -> bool {
+        !matches!(self.phone_number_source.as_deref(), Some("manual" | "welcome_sms"))
+            && self.phone_number.as_deref().is_none_or(|current| {
+                current.trim().is_empty()
+                    || crate::phone_number::normalize_msisdn(current) == phone
+            })
+    }
+
+    pub(crate) async fn save_welcome_sms_identity(&self, phone: &str, operator: &str) -> Result<bool> {
+        Self::save_welcome_sms_identity_in_pool(get_pool()?, self, phone, operator).await
+    }
+
+    async fn save_welcome_sms_identity_in_pool(pool: &SqlitePool, card: &Self, phone: &str, operator: &str) -> Result<bool> {
+        if !card.accepts_welcome_sms_number(phone) {
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            "UPDATE sim_cards SET phone_number = ?, phone_number_source = 'welcome_sms',
+             operator_name = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND phone_number IS ? AND phone_number_source IS ?",
+        ).bind(phone).bind(operator).bind(&card.id)
+            .bind(&card.phone_number).bind(&card.phone_number_source).execute(pool).await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn backfill_identity_in_pool(pool: &SqlitePool, id: &str, imsi: Option<&str>, phone: Option<&str>) -> Result<()> {
@@ -2869,6 +2966,115 @@ mod hardware_type_tests {
     use super::*;
 
     #[tokio::test]
+    async fn voice_otp_progress_migration_preserves_existing_call_audio() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE calls (id TEXT PRIMARY KEY, recording BLOB, transcript TEXT);
+            INSERT INTO calls VALUES ('existing', X'010203', 'existing transcript');")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/20261106000003_local_voice_otp.sql"))
+            .execute(&pool).await.unwrap();
+        let progress = crate::transcribe::VoiceOtpProgress {
+            state: "completed".into(), provider: "local".into(), otp: Some("005861".into()),
+            ..Default::default()
+        };
+        Call::save_voice_otp_in_pool(&pool, "existing", &progress).await.unwrap();
+        let row: (Vec<u8>, String, String) = sqlx::query_as(
+            "SELECT recording, transcript, voice_otp FROM calls WHERE id = 'existing'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(row.0, vec![1, 2, 3]);
+        assert_eq!(row.1, "existing transcript");
+        let restored: crate::transcribe::VoiceOtpProgress = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(restored.otp.as_deref(), Some("005861"));
+    }
+
+    #[tokio::test]
+    async fn voice_otp_restart_marks_only_unfinished_jobs_interrupted() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE calls (id TEXT PRIMARY KEY, status TEXT, ended_at TEXT, voice_otp TEXT);
+            INSERT INTO calls VALUES ('running', 'active', NULL, '{\"state\":\"transcribing_prompt\",\"provider\":\"local\"}'),
+                ('done', 'ended', 'old', '{\"state\":\"completed\",\"otp\":\"005861\"}'),
+                ('ordinary', 'ended', 'old', NULL);")
+            .execute(&pool).await.unwrap();
+        Call::interrupt_voice_otp_in_pool(&pool).await.unwrap();
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, json_extract(voice_otp, '$.state') FROM calls ORDER BY id",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![
+            ("done".into(), "ended".into(), Some("completed".into())),
+            ("ordinary".into(), "ended".into(), None),
+            ("running".into(), "ended".into(), Some("interrupted".into())),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn welcome_sms_identity_lock_excludes_same_card_but_not_other_cards() {
+        let guard = SimCard::lock_phone_number("welcome-lock-card").await;
+        let mut same_card = Box::pin(SimCard::lock_phone_number("welcome-lock-card"));
+        assert!(futures::poll!(&mut same_card).is_pending());
+        let other_card = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            SimCard::lock_phone_number("welcome-lock-other-card"),
+        ).await.expect("different SIM numbers must not share a lock");
+        drop(other_card);
+        drop(guard);
+        assert!(futures::poll!(&mut same_card).is_ready());
+    }
+
+    #[tokio::test]
+    async fn welcome_sms_identity_preserves_manual_conflicting_and_repeated_numbers() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sim_cards (id TEXT PRIMARY KEY, phone_number TEXT,
+            phone_number_source TEXT, updated_at TEXT);
+            INSERT INTO sim_cards VALUES ('unknown', NULL, NULL, 'old'),
+                ('manual', '7848998171', 'manual', 'old'),
+                ('cleared', NULL, 'manual', 'old'),
+                ('conflict', '7700000000', 'sim_read', 'old'),
+                ('same', '07848998171', 'sim_read', 'old');")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/20261106000001_welcome_sms_identity.sql"))
+            .execute(&pool).await.unwrap();
+        for (id, phone, source, expected) in [
+            ("unknown", None, None, true),
+            ("manual", Some("7848998171"), Some("manual"), false),
+            ("cleared", None, Some("manual"), false),
+            ("conflict", Some("7700000000"), Some("sim_read"), false),
+            ("same", Some("07848998171"), Some("sim_read"), true),
+        ] {
+            let card = SimCard {
+                id: id.to_string(), phone_number: phone.map(String::from),
+                phone_number_source: source.map(String::from), ..Default::default()
+            };
+            assert_eq!(SimCard::save_welcome_sms_identity_in_pool(&pool, &card, "7848998171", "Three").await.unwrap(), expected);
+            assert!(!SimCard::save_welcome_sms_identity_in_pool(&pool, &card, "7848998171", "Three").await.unwrap());
+        }
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, phone_number, phone_number_source, operator_name FROM sim_cards ORDER BY id",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![
+            ("cleared".into(), None, Some("manual".into()), None),
+            ("conflict".into(), Some("7700000000".into()), Some("sim_read".into()), None),
+            ("manual".into(), Some("7848998171".into()), Some("manual".into()), None),
+            ("same".into(), Some("7848998171".into()), Some("welcome_sms".into()), Some("Three".into())),
+            ("unknown".into(), Some("7848998171".into()), Some("welcome_sms".into()), Some("Three".into())),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn welcome_sms_identity_does_not_race_a_manual_edit() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sim_cards (id TEXT PRIMARY KEY, phone_number TEXT,
+            phone_number_source TEXT, operator_name TEXT, updated_at TEXT);
+            INSERT INTO sim_cards VALUES ('card', NULL, 'manual', NULL, 'old');")
+            .execute(&pool).await.unwrap();
+        let before_edit = SimCard { id: "card".into(), ..Default::default() };
+        assert!(!SimCard::save_welcome_sms_identity_in_pool(&pool, &before_edit, "7848998171", "Three").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn msim_phone_backfill_preserves_manual_numbers_and_missing_imsi() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
             .connect("sqlite::memory:").await.unwrap();
@@ -3104,6 +3310,7 @@ pub async fn save_msim_slot(
 }
 
 pub async fn save_msim_phone(com_port: &str, slot: i64, iccid: &str, phone: Option<&str>) -> Result<bool> {
+    let _phone_guard = SimCard::lock_phone_number(iccid).await;
     let result = sqlx::query(
         "UPDATE sim_cards SET phone_number = ?, phone_number_source = 'manual', updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND EXISTS (SELECT 1 FROM msim_slots WHERE com_port = ? AND slot = ? AND iccid = ?)",
@@ -3269,6 +3476,7 @@ pub async fn db_init() -> Result<()> {
         .await?;
 
     migrate!("./migrations").run(&pool).await?;
+    Call::interrupt_voice_otp_in_pool(&pool).await?;
 
     POOL.set(pool)
         .map_err(|_| anyhow::anyhow!("Failed to initialize database connection pool"))?;

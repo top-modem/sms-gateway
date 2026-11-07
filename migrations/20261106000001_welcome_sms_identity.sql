@@ -1,0 +1,1 @@
+ALTER TABLE sim_cards ADD COLUMN operator_name TEXT;

@@ -4,7 +4,7 @@
   import { callLog, callActions, incomingCall, activeCall, callSseConnected } from '../../stores/calls.js';
   import { simCards } from '../../stores/simcards.js';
   import { formatDate } from '../../js/dateFormat.js';
-  import { apiClient } from '../../js/api.js';
+  import { apiClient, buildBasicAuthHeader } from '../../js/api.js';
   import { t } from '../../js/i18n.js';
 
   let { filterSimId = null } = $props();
@@ -13,6 +13,11 @@
   let makeCallSimId = $state('');
   let making = $state(false);
   let makeError = $state('');
+  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, language: 'auto', deadline_seconds: 120 });
+  let voiceReady = $state(false);
+  let voiceBusy = $state(true);
+  let voiceError = $state('');
+  let voiceSaved = $state(false);
 
   let sims = $derived($simCards);
   let log = $derived($callLog);
@@ -22,6 +27,7 @@
 
   onMount(() => {
     callActions.refreshLog();
+    loadVoiceSettings();
     if (filterSimId) {
       makeCallSimId = filterSimId;
       return;
@@ -53,6 +59,69 @@
       makeError = e?.data?.message ?? 'Call failed';
     } finally {
       making = false;
+    }
+  }
+
+  async function loadVoiceSettings() {
+    try {
+      const response = await apiClient.getVoiceOtpSettings();
+      voiceSettings = response.data.settings;
+      voiceReady = response.data.local_ready === true;
+    } catch (error) {
+      voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
+    } finally {
+      voiceBusy = false;
+    }
+  }
+
+  async function saveVoiceSettings() {
+    voiceBusy = true;
+    voiceError = '';
+    voiceSaved = false;
+    try {
+      const response = await apiClient.setVoiceOtpSettings({ ...voiceSettings });
+      voiceSettings = response.data.settings;
+      voiceReady = response.data.local_ready === true;
+      voiceSaved = true;
+    } catch (error) {
+      voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
+    } finally {
+      voiceBusy = false;
+    }
+  }
+
+  function voiceProgress(value) {
+    try { return value ? JSON.parse(value) : null; }
+    catch { return null; }
+  }
+
+  function voiceRunning(progress) {
+    return progress && !['completed', 'failed', 'cancelled', 'interrupted'].includes(progress.state);
+  }
+
+  async function cancelVoice(callId) {
+    try {
+      await apiClient.cancelVoiceOtp(callId);
+      await callActions.refreshLog();
+    } catch (error) {
+      voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
+    }
+  }
+
+  async function downloadVoice(callId, stage) {
+    try {
+      const response = await fetch(`/api/calls/${encodeURIComponent(callId)}/recording?stage=${stage}`, { headers: buildBasicAuthHeader() });
+      if (!response.ok) throw new Error($t('voice_error'));
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${callId}-${stage}.amr`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      voiceError = error?.message ?? $t('voice_error');
     }
   }
 
@@ -102,6 +171,65 @@
     </p>
   </div>
 
+  <form
+    aria-label={$t('voice_local_title')}
+    class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0"
+    onsubmit={(event) => { event.preventDefault(); saveVoiceSettings(); }}
+  >
+    <div class="flex items-center justify-between gap-3 mb-3">
+      <div class="flex items-center gap-3 min-w-0 flex-wrap">
+        <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-100">{$t('voice_local_title')}</h3>
+        <span class="text-xs {voiceReady ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}">
+          {voiceReady ? $t('voice_ready') : $t('voice_unavailable')}
+        </span>
+        <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+          <input type="checkbox" bind:checked={voiceSettings.enabled} disabled={voiceBusy || (!voiceReady && !voiceSettings.enabled)} class="accent-blue-600" />
+          {$t('voice_enable')}
+        </label>
+      </div>
+      <button type="submit" disabled={voiceBusy} aria-label={$t('voice_save')} title={$t('voice_save')}
+        class="w-9 h-9 shrink-0 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 flex items-center justify-center">
+        <Icon icon={voiceBusy ? 'carbon:renew' : 'carbon:save'} class="w-4 h-4" />
+      </button>
+    </div>
+    <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 min-w-0">
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+        {$t('voice_port')}
+        <select bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
+          {#each Array.from({ length: 128 }, (_, index) => `COM${index + 1}`) as port}
+            <option value={port}>{port}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+        {$t('voice_prompt_window')}
+        <input type="number" min="3" max="30" step="1" required bind:value={voiceSettings.prompt_seconds} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+        {$t('voice_code_window')}
+        <input type="number" min="3" max="30" step="1" required bind:value={voiceSettings.code_seconds} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+        {$t('voice_length')}
+        <input type="number" min="4" max="8" step="1" required bind:value={voiceSettings.otp_length} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+        {$t('voice_language')}
+        <select bind:value={voiceSettings.language} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
+          <option value="auto">{$t('voice_language_auto')}</option>
+          <option value="en">English</option>
+          <option value="zh">中文</option>
+        </select>
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
+        {$t('voice_deadline')}
+        <input type="number" min="30" max="240" step="1" required bind:value={voiceSettings.deadline_seconds} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+      </label>
+    </fieldset>
+    {#if voiceSaved}<p class="text-xs text-green-600 dark:text-green-400 mt-2" role="status">{$t('voice_saved')}</p>{/if}
+    {#if voiceError}<p class="text-xs text-red-600 dark:text-red-400 mt-2 break-words" role="alert">{voiceError}</p>{/if}
+  </form>
+
   <!-- Make a call -->
   <div class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0">
     <p class="text-xs font-medium text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wide">{$t('make_a_call')}</p>
@@ -145,7 +273,9 @@
       </div>
     {:else}
       {#each filteredLog as call (call.id)}
-        <div class="flex items-center gap-3 px-4 py-3 hover:bg-gray-50 dark:hover:bg-zinc-800/40 transition-colors">
+        {@const voice = voiceProgress(call.voice_otp)}
+        <div class="px-4 py-3 hover:bg-gray-50 dark:hover:bg-zinc-800/40 transition-colors">
+          <div class="flex items-center gap-3">
           <!-- Direction + status icon -->
           <div class="relative shrink-0 w-10 h-10 rounded-full bg-gray-100 dark:bg-zinc-800 flex items-center justify-center">
             <Icon icon={statusIcon(call.status)} class="w-5 h-5 {statusColor(call.status)}" />
@@ -171,6 +301,49 @@
           <p class="text-xs text-gray-400 dark:text-zinc-500 shrink-0">
             {formatDate(call.started_at)}
           </p>
+          </div>
+          {#if voice}
+            <div class="mt-3 pl-0 sm:pl-[52px] min-w-0">
+              <div class="flex items-center gap-3 flex-wrap text-xs text-gray-600 dark:text-gray-300">
+                <span class={voice.error ? 'text-red-600 dark:text-red-400' : 'text-blue-600 dark:text-blue-400'}>{$t(`voice_state_${voice.state}`)}</span>
+                {#if voice.dtmf}<span>{$t('voice_dtmf')}: <span class="font-mono">{voice.dtmf}</span></span>{/if}
+                {#if voice.otp}<span class="text-sm font-semibold text-green-700 dark:text-green-400">{$t('voice_code')}: <span class="font-mono">{voice.otp}</span></span>{/if}
+                {#if voice.prompt_transcript}
+                  <button type="button" onclick={() => downloadVoice(call.id, 'prompt')} aria-label={$t('voice_download_prompt')} title={$t('voice_download_prompt')} class="w-8 h-8 rounded-md border border-gray-200 dark:border-zinc-700 flex items-center justify-center">
+                    <Icon icon="carbon:download" class="w-4 h-4" />
+                  </button>
+                {/if}
+                {#if voice.code_transcript || voice.otp}
+                  <button type="button" onclick={() => downloadVoice(call.id, 'code')} aria-label={$t('voice_download_code')} title={$t('voice_download_code')} class="w-8 h-8 rounded-md border border-gray-200 dark:border-zinc-700 flex items-center justify-center">
+                    <Icon icon="carbon:document-download" class="w-4 h-4" />
+                  </button>
+                {/if}
+                {#if voiceRunning(voice)}
+                  <button type="button" onclick={() => cancelVoice(call.id)} aria-label={$t('voice_cancel')} title={$t('voice_cancel')} class="w-8 h-8 rounded-md border border-red-200 dark:border-red-900 text-red-600 flex items-center justify-center">
+                    <Icon icon="carbon:stop" class="w-4 h-4" />
+                  </button>
+                {/if}
+              </div>
+              {#if voice.error}<p class="mt-1 text-xs text-red-600 dark:text-red-400 break-words">{voice.error}</p>{/if}
+              {#if voice.prompt_comparison}
+                <p class="mt-2 text-xs {voice.prompt_comparison === 'matched' ? 'text-green-700 dark:text-green-400' : 'text-amber-700 dark:text-amber-400'}">
+                  {$t('voice_prompt_comparison')}: {$t(`voice_comparison_${voice.prompt_comparison}`)}
+                </p>
+                {#each voice.prompt_readings ?? [] as reading, index}
+                  <p class="mt-1 text-xs text-gray-600 dark:text-gray-300">
+                    {$t('voice_prompt_reading')} {index + 1}: <span class="font-mono font-semibold">{reading}</span>
+                  </p>
+                {/each}
+              {/if}
+              {#if voice.prompt_transcript || voice.code_transcript}
+                <details class="mt-2 text-xs text-gray-600 dark:text-gray-300">
+                  <summary class="cursor-pointer">{$t('voice_transcripts')}</summary>
+                  {#if voice.prompt_transcript}<p class="mt-2 whitespace-pre-wrap break-words"><span class="font-semibold">{$t('voice_prompt_transcript')}: </span>{voice.prompt_transcript}</p>{/if}
+                  {#if voice.code_transcript}<p class="mt-2 whitespace-pre-wrap break-words"><span class="font-semibold">{$t('voice_code_transcript')}: </span>{voice.code_transcript}</p>{/if}
+                </details>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/each}
     {/if}

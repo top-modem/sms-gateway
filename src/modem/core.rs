@@ -119,6 +119,11 @@ pub struct Modem {
     /// manually-started recording is still stopped/downloaded by the URC
     /// handler's NO CARRIER cleanup.
     pub inbound_recording_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    pub voice_otp_call_id: tokio::sync::Mutex<Option<String>>,
+    voice_otp_microphone_state: tokio::sync::Mutex<Option<(String, bool)>>,
+    pub voice_otp_cancel_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub voice_otp_finishing: std::sync::atomic::AtomicBool,
+    pub voice_otp_dtmf_sent: std::sync::atomic::AtomicBool,
     /// Reader task handle so we can abort and release COM resources on drop.
     reader_task: Mutex<Option<JoinHandle<()>>>,
     /// Command processor task handle so it does not outlive modem shutdown.
@@ -241,6 +246,11 @@ impl Modem {
             inbound_auto_answer_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
             inbound_call_answered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inbound_recording_cancel_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            voice_otp_call_id: tokio::sync::Mutex::new(None),
+            voice_otp_microphone_state: tokio::sync::Mutex::new(None),
+            voice_otp_cancel_tx: tokio::sync::Mutex::new(None),
+            voice_otp_finishing: std::sync::atomic::AtomicBool::new(false),
+            voice_otp_dtmf_sent: std::sync::atomic::AtomicBool::new(false),
             reader_task: Mutex::new(Some(reader_task)),
             command_task: Mutex::new(Some(command_task)),
             force_uk_mcc_to_46001,
@@ -315,6 +325,17 @@ impl Modem {
     /// normal machine). Live replies override cached types; an
     /// unanswered probe falls back to the last persisted type without caching.
     pub async fn detect_machine_type(&self) -> MachineType {
+        let probed = self.probe_machine_type().await;
+        if probed != MachineType::Unknown {
+            return probed;
+        }
+        match crate::db::get_port_hardware(&self.com_port).await {
+            Ok(Some(hw)) => MachineType::from_db(&hw.machine_type),
+            _ => MachineType::Unknown,
+        }
+    }
+
+    pub async fn probe_machine_type(&self) -> MachineType {
         if self.is_esim_mode().await {
             if let Some(cached) = *self.machine_type.read().await {
                 return cached;
@@ -346,16 +367,12 @@ impl Modem {
         };
         if probed != MachineType::Unknown {
             *self.machine_type.write().await = Some(probed);
-            return probed;
         }
-        match crate::db::get_port_hardware(&self.com_port).await {
-            Ok(Some(hw)) => MachineType::from_db(&hw.machine_type),
-            _ => MachineType::Unknown,
-        }
+        probed
     }
 
     pub async fn detect_esim_capability(&self) -> bool {
-        self.detect_machine_type().await == MachineType::Esim
+        self.probe_machine_type().await == MachineType::Esim
     }
 
     /// Send a single mode-switch command (e.g. `atl6`) and require an `OK` reply.
@@ -906,6 +923,17 @@ impl Modem {
         // Held for the whole write+response round trip so no other sender can
         // steal this command's response out of `reader_state.response_tx`.
         let _command_guard = command_lock.lock().await;
+        Self::execute_command_locked(write_half, reader_state, command, name, timeout_dur, &_command_guard).await
+    }
+
+    async fn execute_command_locked(
+        write_half: &Arc<Mutex<Option<WriteHalf<SerialStream>>>>,
+        reader_state: &Arc<Mutex<ReaderState>>,
+        command: &str,
+        name: &str,
+        timeout_dur: Duration,
+        _guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> io::Result<String> {
         let (tx, rx) = tokio::sync::oneshot::channel::<io::Result<String>>();
         {
             let mut write_guard = write_half.lock().await;
@@ -1472,11 +1500,20 @@ impl Modem {
                         sse_manager.send(conversations);
                     }
                 }
-                Err(e) => log::error!("Insert SMS error: {}", e),
+                Err(e) => {
+                    log::error!("Insert SMS error: {}", e);
+                    return false;
+                }
             }
+            true
         };
 
-        tokio::join!(webhook_future, db_future);
+        let (_, sms_saved) = tokio::join!(webhook_future, db_future);
+        if sms_saved {
+            if let Err(error) = self.sync_welcome_sms_identity(&sms_list).await {
+                log::warn!("[{}] Welcome SMS SIM sync failed: {}", self.com_port, error);
+            }
+        }
 
         // ── Upload received SMS to 火狐狸 platform ────────────────
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
@@ -1525,7 +1562,7 @@ impl Modem {
                             }
 
                             if let Some(country_id) = country_id {
-                            match crate::db::AppSetting::get("firefox_api_key").await {
+                            match crate::db::AppSetting::get(crate::firefox_api::API_KEY_SETTING).await {
                                 Ok(Some(api_key)) => {
                                     match reqwest::Client::builder()
                                         .timeout(std::time::Duration::from_secs(10))
@@ -1903,13 +1940,13 @@ impl Modem {
                                 }
                                 Ok(None) => {
                                     log::warn!(
-                                        "[{}] Skipping 火狐狸 SMS upload: app_settings.firefox_api_key is not set",
+                                        "[{}] Skipping WorldCode SMS upload: app_settings.worldcode_api_key is not set",
                                         sim_id
                                     );
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "[{}] Skipping 火狐狸 SMS upload: failed to read firefox_api_key: {}",
+                                        "[{}] Skipping WorldCode SMS upload: failed to read worldcode_api_key: {}",
                                         sim_id,
                                         e
                                     );
@@ -2081,8 +2118,11 @@ impl Modem {
     }
 
     pub async fn get_sim_iccid(&self) -> io::Result<Option<String>> {
-        self.get_modem_info("AT+CCID\r\n", |response| {
-            response
+        self.get_modem_info("AT+CCID\r\n", Self::parse_iccid).await
+    }
+
+    fn parse_iccid(response: &str) -> Option<String> {
+        response
                 .lines()
                 .find(|line| {
                     line.contains("CCID:")
@@ -2099,8 +2139,6 @@ impl Modem {
                         line.trim().to_string()
                     }
                 })
-        })
-        .await
     }
 
     pub async fn get_sim_imsi(&self) -> io::Result<Option<String>> {
@@ -2252,6 +2290,72 @@ impl Modem {
         Ok(())
     }
 
+    pub(super) async fn sync_welcome_sms_identity(&self, sms_list: &[ModemSMS]) -> anyhow::Result<()> {
+        let candidates: Vec<_> = sms_list.iter().filter(|sms| !sms.send)
+            .filter_map(|sms| crate::phone_number::parse_welcome_sms(&sms.message).map(|identity| (sms, identity)))
+            .collect();
+        let Some((sms, identity)) = candidates.first() else { return Ok(()); };
+        if crate::db::AppSetting::get("welcome_sms_phone_sync_enabled").await?.as_deref() != Some("true") {
+            return Ok(());
+        }
+        if candidates.iter().any(|(_, candidate)| candidate.phone_number != identity.phone_number) {
+            anyhow::bail!("Conflicting welcome SMS numbers; no SIM write performed");
+        }
+        let Some(sim_id) = self.sim_id.read().await.clone() else { return Ok(()); };
+        let _phone_guard = SimCard::lock_phone_number(&sim_id).await;
+        let current_sim = self.sim_id.read().await;
+        let esim_mode = self.esim_mode.read().await;
+        if sms.sim_id != sim_id || current_sim.as_deref() != Some(sim_id.as_str()) || *esim_mode {
+            return Ok(());
+        }
+        let Some(card) = SimCard::find_by_conditions(Some(&sim_id), None, None, None).await?.into_iter().next() else {
+            return Ok(());
+        };
+        if !card.accepts_welcome_sms_number(&identity.phone_number) {
+            return Ok(());
+        }
+        let command_guard = self.command_lock.lock().await;
+        let type_reply = self.send_command_exclusive("ath?\r\n", &command_guard).await?;
+        let machine_type = MachineType::from_type_reply(&type_reply);
+        let iccid_reply = self.send_command_exclusive("AT+CCID\r\n", &command_guard).await?;
+        let current_iccid = Self::parse_iccid(&iccid_reply)
+            .ok_or_else(|| anyhow::anyhow!("Cannot verify receiving SIM ICCID"))?;
+        if crate::esim::normalize_iccid(&current_iccid) != crate::esim::normalize_iccid(&sim_id) {
+            anyhow::bail!("Receiving SIM identity changed; no SIM write performed");
+        }
+        match machine_type {
+            MachineType::Normal | MachineType::Msim => {
+                for command in [
+                    "AT$QCPBMPREF=1\r\n".to_string(),
+                    "AT+CPBS=\"ON\"\r\n".to_string(),
+                    format!("AT+CPBW=1,\"+{}\",145\r\n", identity.phone_number),
+                ] {
+                    let response = self.send_command_exclusive(&command, &command_guard).await?;
+                    if !response.contains("OK\r\n") {
+                        anyhow::bail!("Welcome SMS phonebook command rejected; identity not saved");
+                    }
+                }
+            }
+            MachineType::Esim => {}
+            MachineType::Unknown => anyhow::bail!("Cannot verify machine type; no SIM write performed"),
+        }
+        drop(command_guard);
+        if card.save_welcome_sms_identity(&identity.phone_number, identity.operator).await? {
+            log::info!("[{}] Welcome SMS identity saved: operator={}", self.com_port, identity.operator);
+        }
+        Ok(())
+    }
+
+    async fn send_command_exclusive(
+        &self,
+        command: &str,
+        guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> io::Result<String> {
+        Self::execute_command_locked(
+            &self.write_half, &self.reader_state, command, &self.name, Duration::from_secs(8), guard,
+        ).await
+    }
+
     pub async fn read_sms_sync_insert(&self, _sms_type: SmsType) -> anyhow::Result<()> {
         let (sms_list, mms_found) = self.read_sms(SmsType::All).await?;
         if !sms_list.is_empty() || mms_found {
@@ -2261,6 +2365,9 @@ impl Modem {
         }
         if !sms_list.is_empty() {
             ModemSMS::bulk_insert(&sms_list).await?;
+            if let Err(error) = self.sync_welcome_sms_identity(&sms_list).await {
+                log::warn!("[{}] Welcome SMS SIM sync failed: {}", self.com_port, error);
+            }
         }
         Ok(())
     }
@@ -2516,6 +2623,141 @@ impl Modem {
         Ok(())
     }
 
+    pub(super) async fn voice_call_command(
+        &self,
+        call_id: &str,
+        sim_id: &str,
+        command: &str,
+        verify_voice: bool,
+    ) -> io::Result<()> {
+        let current_call = self.inbound_call_id.lock().await;
+        let current_sim = self.sim_id.read().await;
+        if current_call.as_deref() != Some(call_id)
+            || current_sim.as_deref() != Some(sim_id)
+            || !self.inbound_call_answered.load(std::sync::atomic::Ordering::SeqCst)
+            || *self.esim_mode.read().await
+        {
+            return Err(io::Error::other("The owned incoming call is no longer active"));
+        }
+        let guard = self.command_lock.lock().await;
+        if verify_voice {
+            let response = self.send_command_exclusive("AT+CLCC\r\n", &guard).await?;
+            let active_voice = response.lines().filter_map(|line| line.trim().strip_prefix("+CLCC:"))
+                .any(|line| {
+                    let fields: Vec<_> = line.split(',').map(str::trim).collect();
+                    fields.get(1) == Some(&"1") && fields.get(2) == Some(&"0") && fields.get(3) == Some(&"0")
+                });
+            if !active_voice {
+                return Err(io::Error::other("No active incoming voice call for DTMF"));
+            }
+        }
+        if command == "ATH\r\n" {
+            self.restore_voice_microphone_locked(call_id, &guard).await;
+        }
+        if command.starts_with("AT+QAUDRD=1") {
+            // A recording left running by a previous call makes the next start fail.
+            let _ = self.send_command_exclusive("AT+QAUDRD=0\r\n", &guard).await;
+        }
+        let response = self.send_command_exclusive(command, &guard).await?;
+        if !response.contains("OK\r\n") {
+            return Err(io::Error::other(format!(
+                "Modem rejected {}: {}",
+                Self::format_log(command).trim(),
+                Self::format_log(&response).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn quiet_voice_microphone(&self, call_id: &str, sim_id: &str) -> io::Result<()> {
+        let current_call = self.inbound_call_id.lock().await;
+        let current_sim = self.sim_id.read().await;
+        if current_call.as_deref() != Some(call_id)
+            || current_sim.as_deref() != Some(sim_id)
+            || !self.inbound_call_answered.load(std::sync::atomic::Ordering::SeqCst)
+            || *self.esim_mode.read().await
+        {
+            return Err(io::Error::other("Cannot mute a changed or inactive voice call"));
+        }
+        let guard = self.command_lock.lock().await;
+        let reply = self.send_command_exclusive("AT+CMUT?\r\n", &guard).await?;
+        let previous = Self::parse_voice_microphone_state(&reply)?;
+        *self.voice_otp_microphone_state.lock().await = Some((call_id.to_string(), previous));
+        if !previous {
+            let reply = self.send_command_exclusive("AT+CMUT=1\r\n", &guard).await?;
+            if !reply.contains("OK\r\n") {
+                return Err(io::Error::other("The modem rejected uplink microphone muting"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn parse_voice_microphone_state(reply: &str) -> io::Result<bool> {
+        if !reply.contains("OK\r\n") {
+            return Err(io::Error::other("Cannot read the previous microphone mute state"));
+        }
+        match reply.lines().find_map(|line| line.trim().strip_prefix("+CMUT:")).map(str::trim) {
+            Some("0") => Ok(false),
+            Some("1") => Ok(true),
+            _ => Err(io::Error::other("Unknown microphone mute state")),
+        }
+    }
+
+    async fn restore_voice_microphone_locked(&self, call_id: &str, guard: &tokio::sync::MutexGuard<'_, ()>) {
+        let mut saved = self.voice_otp_microphone_state.lock().await;
+        if let Some((owner, previous)) = saved.as_ref() {
+            if owner != call_id { return; }
+            if !previous {
+                match self.send_command_exclusive("AT+CMUT=0\r\n", guard).await {
+                    Ok(reply) if reply.contains("OK\r\n") => {}
+                    _ => log::warn!("[{}] microphone restore was not acknowledged for the ended voice call", self.com_port),
+                }
+            }
+            *saved = None;
+        }
+    }
+
+    pub(super) async fn send_voice_dtmf(&self, call_id: &str, sim_id: &str, digit: char) -> io::Result<()> {
+        let command = Self::voice_dtmf_command(digit)?;
+        if self.voice_otp_dtmf_sent.compare_exchange(
+            false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
+        ).is_err() {
+            return Err(io::Error::other("DTMF has already been attempted for this call"));
+        }
+        self.voice_call_command(call_id, sim_id, &command, true).await
+    }
+
+    pub(super) async fn stop_ended_voice_recording(&self, call_id: &str, sim_id: &str) -> io::Result<()> {
+        let current_call = self.inbound_call_id.lock().await;
+        let current_sim = self.sim_id.read().await;
+        if current_call.is_some()
+            || current_sim.as_deref() != Some(sim_id)
+            || self.voice_otp_call_id.lock().await.as_deref() != Some(call_id)
+            || self.outbound_call_id.lock().await.is_some()
+            || *self.esim_mode.read().await
+        {
+            return Err(io::Error::other("Cannot finalize audio for a changed call or SIM"));
+        }
+        let guard = self.command_lock.lock().await;
+        let calls = self.send_command_exclusive("AT+CLCC\r\n", &guard).await?;
+        if !calls.contains("OK\r\n") || calls.lines().any(|line| line.trim().starts_with("+CLCC:")) {
+            return Err(io::Error::other("A new call prevents finalizing the ended call recording"));
+        }
+        self.restore_voice_microphone_locked(call_id, &guard).await;
+        let response = self.send_command_exclusive("AT+QAUDRD=0\r\n", &guard).await?;
+        if !response.contains("OK\r\n") && !response.contains("ERROR") {
+            return Err(io::Error::other("Cannot confirm the ended call recording is stopped"));
+        }
+        Ok(())
+    }
+
+    fn voice_dtmf_command(digit: char) -> io::Result<String> {
+        if !digit.is_ascii_digit() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Only one DTMF digit 0-9 is allowed"));
+        }
+        Ok(format!("AT+VTS=\"{}\",2\r\n", digit))
+    }
+
     /// Inject a synthetic URC line into the URC channel.
     /// Used by the 30s recording timer to guarantee the URC handler processes
     /// call-end cleanup even when the modem doesn't emit NO CARRIER after ATH.
@@ -2528,6 +2770,7 @@ impl Modem {
     /// Protocol: modem responds `CONNECT\r\n`, then streams binary data, then
     /// `\r\n+QFDWL: <size>,<checksum>\r\nOK\r\n` when done.
     pub async fn download_file(&self, filename: &str) -> io::Result<Vec<u8>> {
+        let _command_guard = self.command_lock.lock().await;
         let (raw_tx, raw_rx) = tokio::sync::oneshot::channel::<io::Result<Vec<u8>>>();
         let command = format!("AT+QFDWL=\"{}\"\r\n", filename);
 

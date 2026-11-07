@@ -327,6 +327,9 @@ pub async fn run_api(
         // ── 火狐狸 platform integration routes ─────────────────────────────
         .route("/settings/firefox-api-key", get(get_firefox_api_key))
         .route("/settings/firefox-api-key", put(set_firefox_api_key))
+        .route("/settings/worldcode-api-key", get(get_firefox_api_key).put(set_firefox_api_key))
+        .route("/settings/welcome-sms-sync", get(get_welcome_sms_sync).put(set_welcome_sms_sync))
+        .route("/settings/voice-otp", get(get_voice_otp_settings).put(set_voice_otp_settings).with_state(modem_manager.clone()))
         .route("/firefox/countries", get(get_firefox_countries))
         .route(
             "/firefox/upload",
@@ -389,6 +392,7 @@ pub async fn run_api(
             "/calls/{id}/transcript",
             get(get_call_transcript),
         )
+        .route("/calls/{id}/voice-cancel", post(cancel_voice_otp).with_state(modem_manager.clone()))
         // ── MMS routes (EC20/EC25 via AT+QMMSEDIT/AT+QMMSEND) ────────────
         .route(
             "/mms",
@@ -1752,8 +1756,18 @@ async fn get_calls(Query(q): Query<CallsQuery>) -> Response {
     }
 }
 
-async fn get_call_recording(Path(id): Path<String>) -> Response {
-    match Call::get_recording(&id).await {
+#[derive(Deserialize)]
+struct CallRecordingQuery {
+    stage: Option<String>,
+}
+
+async fn get_call_recording(Path(id): Path<String>, Query(query): Query<CallRecordingQuery>) -> Response {
+    let result = match query.stage.as_deref() {
+        None | Some("code") => Call::get_recording(&id).await,
+        Some("prompt") => Call::get_prompt_recording(&id).await,
+        _ => return (StatusCode::BAD_REQUEST, "Recording stage must be prompt or code").into_response(),
+    };
+    match result {
         Ok(Some(data)) => (
             StatusCode::OK,
             [
@@ -1778,6 +1792,41 @@ async fn get_call_transcript(Path(id): Path<String>) -> Response {
             .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_voice_otp_settings(State(manager): State<ModemManagerRef>) -> Response {
+    match crate::transcribe::VoiceOtpSettings::load().await {
+        Ok(settings) => Json(json!({ "settings": settings, "local_ready": manager.local_transcription_ready().await })).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
+async fn set_voice_otp_settings(
+    State(manager): State<ModemManagerRef>,
+    Json(settings): Json<crate::transcribe::VoiceOtpSettings>,
+) -> Response {
+    if let Err(error) = settings.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response();
+    }
+    if settings.enabled && !manager.local_transcription_ready().await {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "Local ffmpeg/Whisper tools are unavailable" }))).into_response();
+    }
+    let value = match serde_json::to_string(&settings) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response(),
+    };
+    match AppSetting::set("voice_otp_local_settings", Some(&value)).await {
+        Ok(()) => Json(json!({ "settings": settings, "local_ready": manager.local_transcription_ready().await })).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
+async fn cancel_voice_otp(Path(id): Path<String>, State(manager): State<ModemManagerRef>) -> Response {
+    match manager.cancel_voice_otp(&id).await {
+        Ok(true) => StatusCode::ACCEPTED.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
     }
 }
 
@@ -2461,8 +2510,28 @@ async fn set_sim_phone_number(
 
 // ─── 火狐狸 platform integration handlers ─────────────────────────────────────
 
+async fn get_welcome_sms_sync() -> Response {
+    match AppSetting::get("welcome_sms_phone_sync_enabled").await {
+        Ok(value) => (StatusCode::OK, Json(json!({ "enabled": value.as_deref() == Some("true") }))).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WelcomeSmsSyncSetting {
+    enabled: bool,
+}
+
+async fn set_welcome_sms_sync(Json(request): Json<WelcomeSmsSyncSetting>) -> Response {
+    let value = if request.enabled { "true" } else { "false" };
+    match AppSetting::set("welcome_sms_phone_sync_enabled", Some(value)).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "enabled": request.enabled }))).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
+    }
+}
+
 async fn get_firefox_api_key() -> Response {
-    match AppSetting::get("firefox_api_key").await {
+    match AppSetting::get(firefox_api::API_KEY_SETTING).await {
         Ok(value) => (StatusCode::OK, Json(json!({ "api_key": value }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2487,7 +2556,7 @@ async fn set_firefox_api_key(Json(request): Json<SetFirefoxApiKeyRequest>) -> Re
             .into_response();
     }
 
-    match AppSetting::set("firefox_api_key", Some(api_key)).await {
+    match AppSetting::set(firefox_api::API_KEY_SETTING, Some(api_key)).await {
         Ok(()) => (StatusCode::OK, Json(json!({"message": "API key saved"}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2654,7 +2723,7 @@ async fn firefox_upload(
 // ─── Helper: read api key + build http client ────────────────────────────
 
 async fn get_firefox_client() -> Result<(String, reqwest::Client), Response> {
-    let api_key = AppSetting::get("firefox_api_key")
+    let api_key = AppSetting::get(firefox_api::API_KEY_SETTING)
         .await
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to read API key: {}", e)}))).into_response()
@@ -3080,7 +3149,7 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
 
     let mut wait_count_by_phone: HashMap<String, i64> = HashMap::new();
     let mut wait_count_by_sim: HashMap<String, i64> = HashMap::new();
-    if let Ok(Some(api_key)) = AppSetting::get("firefox_api_key").await {
+    if let Ok(Some(api_key)) = AppSetting::get(firefox_api::API_KEY_SETTING).await {
         if !api_key.trim().is_empty() {
             if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
                 if let Ok(wait_resp) = firefox_api::get_wait_phone_list(&client, &api_key).await {

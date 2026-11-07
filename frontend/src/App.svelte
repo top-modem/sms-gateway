@@ -1,8 +1,8 @@
 <script>
   import { fly } from "svelte/transition";
   import { quartOut } from "svelte/easing";
-  import { initConversation } from "./stores/conversation";
-  import { connectCallSSE, disconnectCallSSE } from "./stores/calls.js";
+  import { initConversation, disconnectConversationSSE, reconnectConversationSSE } from "./stores/conversation";
+  import { connectCallSSE, disconnectCallSSE, callActions } from "./stores/calls.js";
   import Dashboard from "./pages/Dashboard.svelte";
   import SimDashboard from "./pages/SimDashboard.svelte";
   import CallLogPage from "./pages/CallLogPage.svelte";
@@ -82,7 +82,21 @@
     initConversation();
     connectCallSSE();
 
+    const handleVisibility = () => {
+      if (document.hidden) {
+        disconnectConversationSSE();
+        disconnectCallSSE();
+      } else {
+        reconnectConversationSSE();
+        connectCallSSE();
+        callActions.refreshLog();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      disconnectConversationSSE();
       disconnectCallSSE();
     };
   });

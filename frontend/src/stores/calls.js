@@ -88,6 +88,9 @@ const handleCallEvent = (/** @type {CallEvent} */ event) => {
             incomingCall.set(null);
             activeCall.set(event);
             break;
+        case 'voice_otp_progress':
+            callActions.refreshLog();
+            break;
         case 'call_ended':
             incomingCall.set(null);
             activeCall.set(null);
@@ -100,6 +103,9 @@ const handleCallEvent = (/** @type {CallEvent} */ event) => {
 
 export const connectCallSSE = () => {
     if (eventSource) eventSource.close();
+    eventSource = null;
+    // Hidden tabs release the connection; Chrome allows only six per site.
+    if (document.hidden) return;
 
     const authHeader = getAuthHeader();
     if (!authHeader.Authorization) return;

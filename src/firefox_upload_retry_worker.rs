@@ -166,7 +166,7 @@ async fn process_retry_queue() -> anyhow::Result<()> {
     );
 
     // Get API key
-    let api_key = match crate::db::AppSetting::get("firefox_api_key").await {
+    let api_key = match crate::db::AppSetting::get(crate::firefox_api::API_KEY_SETTING).await {
         Ok(Some(key)) => key,
         _ => {
             warn!("[Firefox Upload Retry] API key not configured, skipping retry batch");

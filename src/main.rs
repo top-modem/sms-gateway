@@ -254,7 +254,7 @@ async fn firefox_item_catalog_sync_worker() {
 
 async fn sync_firefox_item_catalog_if_due() -> anyhow::Result<()> {
     let now = Utc::now().naive_utc();
-    let last_sync = db::AppSetting::get("firefox_item_catalog_last_sync_at")
+    let last_sync = db::AppSetting::get("worldcode_item_catalog_last_sync_at")
         .await?
         .and_then(|v| NaiveDateTime::parse_from_str(v.trim(), "%Y-%m-%d %H:%M:%S").ok());
 
@@ -264,12 +264,11 @@ async fn sync_firefox_item_catalog_if_due() -> anyhow::Result<()> {
         }
     }
 
-    let token = db::AppSetting::get("firefox_user_token").await.ok().flatten();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let items = firefox_api::get_user_item_prices(&client, token.as_deref(), None).await?;
+    let items = firefox_api::get_user_item_prices(&client, None).await?;
     if items.is_empty() {
         log::warn!("[火狐狸价目] 同步返回空列表，保留本地数据");
         return Ok(());
@@ -298,7 +297,7 @@ async fn sync_firefox_item_catalog_if_due() -> anyhow::Result<()> {
     db::upsert_firefox_item_prices(&upserts).await?;
 
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    db::AppSetting::set("firefox_item_catalog_last_sync_at", Some(&timestamp)).await?;
+    db::AppSetting::set("worldcode_item_catalog_last_sync_at", Some(&timestamp)).await?;
 
     log::info!("[火狐狸价目] 同步完成: {} 项", upserts.len());
     Ok(())
@@ -506,7 +505,7 @@ async fn firefox_poll_worker(modem_manager: ModemManagerRef) {
             continue;
         }
 
-        let api_key = match db::AppSetting::get("firefox_api_key").await {
+        let api_key = match db::AppSetting::get(firefox_api::API_KEY_SETTING).await {
             Ok(Some(key)) => key,
             _ => continue,
         };

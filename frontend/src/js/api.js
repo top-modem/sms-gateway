@@ -220,7 +220,7 @@ class ApiClient {
      * Get the stored 火狐狸 platform API key.
      */
     async getFirefoxApiKey() {
-        return FetchApi.get('/api/settings/firefox-api-key');
+        return FetchApi.get('/api/settings/worldcode-api-key');
     }
 
     /**
@@ -228,7 +228,7 @@ class ApiClient {
      * @param {string} apiKey
      */
     async setFirefoxApiKey(apiKey) {
-        return FetchApi.put('/api/settings/firefox-api-key', { api_key: apiKey }, {}, 'application/json');
+        return FetchApi.put('/api/settings/worldcode-api-key', { api_key: apiKey }, {}, 'application/json');
     }
 
     /**
@@ -267,7 +267,27 @@ class ApiClient {
         return FetchApi.get('/api/calls', params);
     }
 
+    async getVoiceOtpSettings() {
+        return FetchApi.get('/api/settings/voice-otp');
+    }
+
+    async setVoiceOtpSettings(settings) {
+        return FetchApi.put('/api/settings/voice-otp', settings, {}, 'application/json');
+    }
+
+    async cancelVoiceOtp(callId) {
+        return FetchApi.post(`/api/calls/${encodeURIComponent(callId)}/voice-cancel`, {});
+    }
+
     // ── Phone number management ─────────────────────────────────────────────
+
+    async getWelcomeSmsSync() {
+        return FetchApi.get('/api/settings/welcome-sms-sync');
+    }
+
+    async setWelcomeSmsSync(enabled) {
+        return FetchApi.put('/api/settings/welcome-sms-sync', { enabled }, {}, 'application/json');
+    }
 
     async importPhoneNumbers(entries) {
         return FetchApi.post('/api/phone-numbers/import', { entries });

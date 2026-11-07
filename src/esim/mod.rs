@@ -100,9 +100,36 @@ fn profile_rows_from_list(com_port: &str, eid: Option<&str>, list: &Value) -> Ve
         .unwrap_or_default()
 }
 
+fn port_capability(live_type: MachineType, cached_type: Option<&str>) -> (MachineType, bool) {
+    let display_type = if live_type == MachineType::Unknown {
+        cached_type.map(MachineType::from_db).unwrap_or(MachineType::Unknown)
+    } else {
+        live_type
+    };
+    (display_type, live_type == MachineType::Esim)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn esim_capability_cache_does_not_authorize_an_unverified_port() {
+        for cached in [Some("esim"), Some("msim"), Some("normal"), None] {
+            let (display, capable) = port_capability(MachineType::Unknown, cached);
+            assert!(!capable);
+            assert_eq!(display, cached.map(MachineType::from_db).unwrap_or(MachineType::Unknown));
+        }
+    }
+
+    #[test]
+    fn esim_capability_requires_live_esim_even_without_sim_identity() {
+        for live in [MachineType::Esim, MachineType::Msim, MachineType::Normal] {
+            let (display, capable) = port_capability(live, Some("esim"));
+            assert_eq!(display, live);
+            assert_eq!(capable, live == MachineType::Esim);
+        }
+    }
 
     #[test]
     fn profile_iccid_matches_modem_padding() {
@@ -299,33 +326,35 @@ impl EsimService {
 
     /// Live modem of the port, or a standalone one for an eSIM port without a SIM.
     async fn get_or_open_modem(&self, com_port: &str) -> Result<Arc<Modem>, EsimError> {
-        if let Ok(modem) = self.get_modem(com_port).await {
-            return Ok(modem);
-        }
-        let known_esim = crate::db::get_port_hardware(com_port)
-            .await
-            .ok()
-            .flatten()
-            .map(|hw| hw.machine_type == MachineType::Esim.as_str())
-            .unwrap_or(false);
-        if !known_esim {
-            return Err(EsimError::PortNotFound(com_port.to_string()));
-        }
-        let (modem, guard) = match self.manager.open_standalone_modem(com_port).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                return self
+        let modem = if let Ok(modem) = self.get_modem(com_port).await {
+            modem
+        } else {
+            let known_esim = crate::db::get_port_hardware(com_port)
+                .await
+                .ok()
+                .flatten()
+                .map(|hw| hw.machine_type == MachineType::Esim.as_str())
+                .unwrap_or(false);
+            if !known_esim {
+                return Err(EsimError::PortNotFound(com_port.to_string()));
+            }
+            match self.manager.open_standalone_modem(com_port).await {
+                Ok((modem, guard)) => {
+                    log::info!("[eSIM] opened {} without a live modem for eSIM verification", com_port);
+                    self.standalone.lock().await.insert(com_port.to_string(), (modem.clone(), guard));
+                    modem
+                }
+                Err(error) => self
                     .manager
                     .get_modem_by_com_port(com_port)
                     .await
-                    .ok_or_else(|| EsimError::At(error.to_string()));
+                    .ok_or_else(|| EsimError::At(error.to_string()))?,
             }
         };
-        log::info!("[eSIM] opened {} without a live modem for eSIM management", com_port);
-        self.standalone
-            .lock()
-            .await
-            .insert(com_port.to_string(), (modem.clone(), guard));
+        if !modem.detect_esim_capability().await {
+            self.release_standalone(com_port).await;
+            return Err(EsimError::NotCapable(com_port.to_string()));
+        }
         Ok(modem)
     }
 
@@ -386,18 +415,17 @@ impl EsimService {
             let hw = hardware.get(&com_port);
             let (machine_type, esim_mode, sim_id) = match self.get_modem(&com_port).await {
                 Ok(modem) => (
-                    modem.detect_machine_type().await,
+                    modem.probe_machine_type().await,
                     modem.is_esim_mode().await,
                     modem.sim_id.read().await.clone(),
                 ),
                 Err(_) => (
-                    hw.map(|h| MachineType::from_db(&h.machine_type))
-                        .unwrap_or(MachineType::Unknown),
+                    MachineType::Unknown,
                     false,
                     None,
                 ),
             };
-            let capable = machine_type == MachineType::Esim;
+            let (machine_type, capable) = port_capability(machine_type, hw.map(|h| h.machine_type.as_str()));
             let rows = if capable {
                 cached.get(&com_port).map(Vec::as_slice).unwrap_or(&[])
             } else {
@@ -459,10 +487,6 @@ impl EsimService {
             }
         }
         let modem = self.get_or_open_modem(com_port).await?;
-        if !modem.detect_esim_capability().await {
-            self.release_standalone(com_port).await;
-            return Err(EsimError::NotCapable(com_port.to_string()));
-        }
 
         let mut already_active = false;
         let mut busy_with = None;

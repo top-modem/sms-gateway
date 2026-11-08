@@ -5,7 +5,16 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 const SETTING_KEY: &str = "aliyun_asr_settings";
-const REGIONS: [&str; 3] = ["cn-shanghai", "cn-beijing", "cn-shenzhen"];
+const REGIONS: [&str; 4] = ["cn-shanghai", "cn-beijing", "cn-shenzhen", "ap-southeast-1"];
+
+/// CreateToken endpoint, API version and RegionId: mainland regions share Shanghai; Singapore is separate.
+fn token_service(region: &str) -> (&'static str, &'static str, &'static str) {
+    if region == "ap-southeast-1" {
+        ("https://nlsmeta.ap-southeast-1.aliyuncs.com/", "2019-07-17", "ap-southeast-1")
+    } else {
+        ("https://nls-meta.cn-shanghai.aliyuncs.com/", "2019-02-28", "cn-shanghai")
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -82,7 +91,7 @@ impl AliyunAsrSettings {
             Ok(value.to_string())
         };
         if !REGIONS.contains(&update.region.as_str()) {
-            bail!("Region must be cn-shanghai, cn-beijing or cn-shenzhen");
+            bail!("Region must be cn-shanghai, cn-beijing, cn-shenzhen or ap-southeast-1");
         }
         if !matches!(update.sample_rate, 8000 | 16000) {
             bail!("Sample rate must be 8000 or 16000");
@@ -105,7 +114,12 @@ fn client() -> Result<reqwest::Client> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    // Drop idle pooled connections before the gateway closes them, so a reused socket is never stale.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .pool_idle_timeout(Duration::from_secs(20))
+        .build()?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
@@ -129,20 +143,21 @@ async fn access_token(settings: &AliyunAsrSettings) -> Result<String> {
     if let Some((token, expires)) = cache.as_ref() {
         if *expires - 300 > now { return Ok(token.clone()); }
     }
+    let (endpoint, version, region_id) = token_service(&settings.region);
     let params: std::collections::BTreeMap<&str, String> = [
         ("AccessKeyId", settings.access_key_id.clone()),
         ("Action", "CreateToken".into()),
         ("Format", "JSON".into()),
-        ("RegionId", "cn-shanghai".into()),
+        ("RegionId", region_id.into()),
         ("SignatureMethod", "HMAC-SHA1".into()),
         ("SignatureNonce", uuid::Uuid::new_v4().to_string()),
         ("SignatureVersion", "1.0".into()),
         ("Timestamp", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        ("Version", "2019-02-28".into()),
+        ("Version", version.into()),
     ].into_iter().collect();
     let query = canonical_query(&params);
-    let url = format!("https://nls-meta.cn-shanghai.aliyuncs.com/?{}&Signature={}",
-        query, urlencoding::encode(&pop_signature(&settings.access_key_secret, &query)));
+    let url = format!("{}?{}&Signature={}",
+        endpoint, query, urlencoding::encode(&pop_signature(&settings.access_key_secret, &query)));
     let response = client()?.get(url).send().await.map_err(reqwest::Error::without_url)
         .context("Failed to request Aliyun access token")?;
     let status = response.status();
@@ -173,18 +188,32 @@ pub(crate) async fn recognize(settings: &AliyunAsrSettings, wav: Vec<u8>) -> Res
     let url = format!(
         "https://nls-gateway-{}.aliyuncs.com/stream/v1/asr?appkey={}&format=wav&sample_rate={}&enable_punctuation_prediction=true&enable_inverse_text_normalization=true",
         settings.region, urlencoding::encode(&settings.app_key), settings.sample_rate);
-    let response = client()?.post(url)
-        .header("X-NLS-Token", token)
-        .header("Content-Type", "application/octet-stream")
-        .body(wav)
-        .send().await.map_err(reqwest::Error::without_url)
-        .context("Failed to reach Aliyun speech recognition")?;
+    let mut attempt = 0;
+    let response = loop {
+        attempt += 1;
+        let sent = client()?.post(&url)
+            .header("X-NLS-Token", &token)
+            .header("Content-Type", "application/octet-stream")
+            .body(wav.clone())
+            .send().await.map_err(reqwest::Error::without_url);
+        match sent {
+            Ok(response) => break response,
+            Err(error) if attempt < 2 && !error.is_timeout() => {
+                log::warn!("Aliyun request failed ({}), retrying once", error);
+            }
+            Err(error) => return Err(anyhow::Error::new(error).context("Failed to reach Aliyun speech recognition")),
+        }
+    };
     let body: serde_json::Value = response.json().await.map_err(reqwest::Error::without_url)
         .context("Invalid Aliyun recognition response")?;
     let status = body.get("status").and_then(|v| v.as_i64()).unwrap_or_default();
+    if status == 40000001 {
+        *TOKEN_CACHE.lock().await = None;
+        bail!("Aliyun token is invalid or expired: enter a new token or an AccessKey ID/Secret for automatic renewal");
+    }
     if status != 20000000 {
-        if status == 40000001 { *TOKEN_CACHE.lock().await = None; }
-        bail!("Aliyun ASR error {}: {}", status, body.get("message").and_then(|v| v.as_str()).unwrap_or(""));
+        let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("").replace(token.as_str(), "***");
+        bail!("Aliyun ASR error {}: {}", status, message);
     }
     Ok(body.get("result").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
 }
@@ -204,6 +233,20 @@ mod tests {
         let query = canonical_query(&params);
         assert_eq!(query, "AccessKeyId=my_access_key_id&Action=CreateToken&Format=JSON&RegionId=cn-shanghai&SignatureMethod=HMAC-SHA1&SignatureNonce=b924c8c3-6d03-4c5d-ad36-d984d3116788&SignatureVersion=1.0&Timestamp=2019-04-18T08%3A32%3A31Z&Version=2019-02-28");
         assert_eq!(pop_signature("my_access_key_secret", &query), "hHq4yNsPitlfDJ2L0nQPdugdEzM=");
+    }
+
+    #[test]
+    fn singapore_token_request_matches_international_documented_signature() {
+        let (endpoint, version, region_id) = token_service("ap-southeast-1");
+        assert_eq!(endpoint, "https://nlsmeta.ap-southeast-1.aliyuncs.com/");
+        let params: std::collections::BTreeMap<&str, String> = [
+            ("AccessKeyId", "my_access_key_id"), ("Action", "CreateToken"), ("Format", "JSON"),
+            ("RegionId", region_id), ("SignatureMethod", "HMAC-SHA1"),
+            ("SignatureNonce", "b924c8c3-6d03-4c5d-ad36-d984d3116788"), ("SignatureVersion", "1.0"),
+            ("Timestamp", "2019-04-18T08:32:31Z"), ("Version", version),
+        ].into_iter().map(|(k, v)| (k, v.to_string())).collect();
+        assert_eq!(pop_signature("my_access_key_secret", &canonical_query(&params)), "4TdrOuLHXJU+5C6s927Wkq2h+wc=");
+        assert_eq!(token_service("cn-beijing").2, "cn-shanghai");
     }
 
     #[test]

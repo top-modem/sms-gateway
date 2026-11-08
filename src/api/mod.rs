@@ -1904,7 +1904,7 @@ async fn test_aliyun_asr() -> Response {
     }.await;
     match result {
         Ok(text) => Json(json!({ "ok": true, "result": text })).into_response(),
-        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": error.to_string() }))).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "error": format!("{:#}", error) }))).into_response(),
     }
 }
 

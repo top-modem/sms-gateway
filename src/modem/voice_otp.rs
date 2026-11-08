@@ -296,13 +296,13 @@ pub(super) async fn maybe_start(
             progress.state = if error.is::<VoiceCancelled>() || error.is::<RemoteCallEnded>()
                 || (!modem.voice_otp_finishing.load(Ordering::SeqCst) && io.active().await.is_err())
                 { "cancelled" } else { "failed" }.into();
-            progress.error = Some(error.to_string());
+            progress.error = Some(format!("{:#}", error));
             if let Err(persist_error) = io.progress(&progress).await {
                 log::error!("[Voice {}] cannot save failure: {}", modem.com_port, persist_error);
             }
             if io.active().await.is_ok() {
                 let _ = io.stop().await;
-                log::warn!("[Voice {}] call={} failed, keeping the call connected: {}", modem.com_port, call_id, error);
+                log::warn!("[Voice {}] call={} failed, keeping the call connected: {:#}", modem.com_port, call_id, error);
                 let wait_until = Instant::now() + Duration::from_secs(settings.deadline_seconds);
                 let ended = cancellable(std::future::pending::<Result<()>>(), &mut cancellation, wait_until).await;
                 if ended.as_ref().is_err_and(|error| !error.is::<RemoteCallEnded>()) && io.active().await.is_ok() {

@@ -305,6 +305,7 @@
             <option value="cn-shanghai">华东2（上海）</option>
             <option value="cn-beijing">华北2（北京）</option>
             <option value="cn-shenzhen">华南1（深圳）</option>
+            <option value="ap-southeast-1">新加坡</option>
           </select>
         </label>
         <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">

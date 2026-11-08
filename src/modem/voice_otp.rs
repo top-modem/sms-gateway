@@ -68,6 +68,7 @@ struct LocalCall {
     sim_id: String,
     config: Arc<TranscribeConfig>,
     sse: Arc<SseManager>,
+    started: std::time::Instant,
 }
 
 impl CallIo for LocalCall {
@@ -110,7 +111,8 @@ impl CallIo for LocalCall {
     async fn transcribe(&self, audio: &[u8]) -> Result<String> {
         let started = std::time::Instant::now();
         let text = crate::aliyun_asr::transcribe(audio, &self.config.ffmpeg_exe).await?;
-        log::info!("[Voice {}] Aliyun recognition took {} ms", self.modem.com_port, started.elapsed().as_millis());
+        log::info!("[Voice {}] Aliyun recognition took {} ms for {} bytes: {:?}",
+            self.modem.com_port, started.elapsed().as_millis(), audio.len(), text);
         Ok(text)
     }
 
@@ -126,7 +128,12 @@ impl CallIo for LocalCall {
                 Call::save_transcript(&self.call_id, text).await?;
             }
         }
-        log::info!("[Voice {}] call={} state={}", self.modem.com_port, self.call_id, progress.state);
+        log::info!(
+            "[Voice {}] call={} t={}ms state={} readings={:?} comparison={:?} dtmf={:?} otp={:?} prompt={:?} code={:?} error={:?}",
+            self.modem.com_port, self.call_id, self.started.elapsed().as_millis(), progress.state,
+            progress.prompt_readings, progress.prompt_comparison, progress.dtmf, progress.otp,
+            progress.prompt_transcript, progress.code_transcript, progress.error,
+        );
         self.sse.send_call_event(CallEvent {
             event_type: "voice_otp_progress".into(), sim_id: self.sim_id.clone(),
             call_id: self.call_id.clone(), phone: None, direction: "inbound".into(),
@@ -285,7 +292,7 @@ pub(super) async fn maybe_start(
     *modem.voice_otp_cancel_tx.lock().await = Some(user_cancel_tx);
     let mut cancellation = VoiceCancellation { remote: Some(cancel_rx), user: user_cancel_rx };
     drop(owned_call);
-    let io = LocalCall { modem: modem.clone(), call_id: call_id.clone(), sim_id, config, sse };
+    let io = LocalCall { modem: modem.clone(), call_id: call_id.clone(), sim_id, config, sse, started: std::time::Instant::now() };
     let token: String = call_id.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
     let prompt_file = format!("vp{}.amr", token);
     let code_file = format!("vc{}.amr", token);

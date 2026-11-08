@@ -2597,6 +2597,10 @@ impl Modem {
         }
         .await;
         *self.ussd_reply_tx.lock().await = None;
+        match &result {
+            Ok(text) => info!("[USSD {}] {} reply: {:?}", self.com_port, code, text),
+            Err(error) => warn!("[USSD {}] {} failed: {}", self.com_port, code, error),
+        }
         result
     }
 
@@ -2644,6 +2648,7 @@ impl Modem {
     /// USSD only works on 2G/3G: switch to GSM (then WCDMA), send the code, then restore LTE.
     pub async fn send_ussd_on_legacy_network(&self, code: &str) -> Result<String, String> {
         let original = self.nwscanmode().await.map_err(|e| format!("读取网络模式失败: {}", e))?;
+        info!("[USSD {}] original nwscanmode={}, switching to 2G/3G for {}", self.com_port, original, code);
         let mut result = Err("无法注册到 2G/3G 网络".to_string());
         for (mode, label) in [(1u8, "2G"), (2u8, "3G")] {
             if let Err(e) = self.set_nwscanmode(mode).await {
@@ -2670,6 +2675,8 @@ impl Modem {
         };
         if !restored {
             warn!("[USSD {}] not yet registered on 4G after restoring nwscanmode {}", self.com_port, restore);
+        } else {
+            info!("[USSD {}] restored nwscanmode {} and registered on 4G", self.com_port, restore);
         }
         result.map(|text| if restored { text } else { format!("{} (已恢复网络模式，4G 尚未注册)", text) })
     }

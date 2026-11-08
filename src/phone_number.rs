@@ -392,6 +392,7 @@ where
     }))
     .buffer_unordered(NUMBER_LOOKUP_CONCURRENCY);
     while let Some(result) = results.next().await {
+        log::info!("[{}] {} {:?}: number={:?} {}", task_type, result.com_port, result.status, result.phone_number, result.message);
         let mut t = task.write().await;
         if result.status == PhoneResultStatus::Failed {
             t.errors.push(format!("{}: {}", result.com_port, result.message));
@@ -454,6 +455,8 @@ pub async fn free_sms_batch(mm: Arc<ModemManager>, task: TaskHandle) {
         let route = free_sms_route(spn.as_deref(), imsi.as_deref())
             .ok_or_else(|| format!("不支持的运营商 (SPN: {}, IMSI: {})", spn.as_deref().unwrap_or("-"),
                 imsi.as_deref().map(|i| i.chars().take(5).collect::<String>()).unwrap_or_else(|| "-".into())))?;
+        log::info!("[FreeSMS {}] SPN={:?} IMSI prefix={:?} -> {} '{}' to {}", info.com_port, spn,
+            imsi.as_deref().map(|i| i.chars().take(5).collect::<String>()), route.operator, route.body, route.to);
         let before = Sms::max_id().await.map_err(|e| format!("读取短信记录失败: {}", e))?;
         let contact = Contact { id: route.to.to_string(), name: route.to.to_string() };
         mm.send_sms(&info.sim_id, &contact, route.body)
@@ -463,6 +466,9 @@ pub async fn free_sms_batch(mm: Arc<ModemManager>, task: TaskHandle) {
             sleep(Duration::from_secs(4)).await;
             let _ = mm.read_sms_sync_insert(&info.sim_id, SmsType::RecUnread).await;
             let replies = Sms::incoming_after_id(&info.sim_id, before).await.unwrap_or_default();
+            for (sender, message) in &replies {
+                log::info!("[FreeSMS {}] reply from {}: {:?}", info.com_port, sender, message);
+            }
             if let Some(phone) = replies.iter().find_map(|(_, message)| extract_phone_from_ussd(message)) {
                 return Ok(Some(phone));
             }

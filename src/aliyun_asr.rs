@@ -207,14 +207,16 @@ pub(crate) async fn recognize(settings: &AliyunAsrSettings, wav: Vec<u8>) -> Res
     let body: serde_json::Value = response.json().await.map_err(reqwest::Error::without_url)
         .context("Invalid Aliyun recognition response")?;
     let status = body.get("status").and_then(|v| v.as_i64()).unwrap_or_default();
+    let task_id = body.get("task_id").and_then(|v| v.as_str()).unwrap_or("-");
     if status == 40000001 {
         *TOKEN_CACHE.lock().await = None;
-        bail!("Aliyun token is invalid or expired: enter a new token or an AccessKey ID/Secret for automatic renewal");
+        bail!("Aliyun token is invalid or expired (task_id {}): enter a new token or an AccessKey ID/Secret for automatic renewal", task_id);
     }
     if status != 20000000 {
         let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("").replace(token.as_str(), "***");
-        bail!("Aliyun ASR error {}: {}", status, message);
+        bail!("Aliyun ASR error {} (task_id {}): {}", status, task_id, message);
     }
+    log::debug!("Aliyun ASR ok: region={} task_id={} attempts={}", settings.region, task_id, attempt);
     Ok(body.get("result").and_then(|v| v.as_str()).unwrap_or("").trim().to_string())
 }
 

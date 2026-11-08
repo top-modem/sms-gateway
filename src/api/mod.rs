@@ -694,7 +694,7 @@ async fn get_all_sim_info(
     let port_snapshots = modem_manager.get_port_runtime_snapshots().await;
     let manual_restarting_ports = modem_manager.get_manual_restarting_ports().await;
     let identity_revalidating_ports = modem_manager.get_identity_revalidating_ports().await;
-    log::warn!(
+    log::debug!(
         "[sims/info] snapshots fetched after {}ms",
         handler_start.elapsed().as_millis()
     );
@@ -718,13 +718,16 @@ async fn get_all_sim_info(
                 // otherwise each block for the full 5s timeout, stalling this endpoint
                 // (and every page that calls it) for as long as any port has an eSIM
                 // session open.
-                let esim_active = match modem_manager.get_modem_by_com_port(&com_port).await {
-                    Some(modem) => modem.is_esim_mode().await,
-                    None => false,
+                let (esim_active, voice_busy) = match modem_manager.get_modem_by_com_port(&com_port).await {
+                    Some(modem) => (modem.is_esim_mode().await, modem.voice_otp_call_id.lock().await.is_some()),
+                    None => (false, false),
                 };
 
                 fn skip<T>() -> Result<anyhow::Result<T>, tokio::time::error::Elapsed> {
                     Ok(Err(anyhow::anyhow!("eSIM session active")))
+                }
+                fn busy<T>() -> Result<anyhow::Result<T>, tokio::time::error::Elapsed> {
+                    Ok(Err(anyhow::anyhow!("Port busy with voice call")))
                 }
 
                     let (
@@ -736,7 +739,18 @@ async fn get_all_sim_info(
                     sim_status_result,
                     memory_status_result,
                     imei_result,
-                ) = if esim_active {
+                ) = if voice_busy {
+                    (
+                        busy::<Option<crate::modem::types::SignalQuality>>(),
+                        busy::<Option<crate::modem::types::NetworkRegistrationStatus>>(),
+                        busy::<Option<crate::modem::types::OperatorInfo>>(),
+                        busy::<Option<crate::modem::types::ModemInfo>>(),
+                        busy::<Option<String>>(),
+                        busy::<Option<String>>(),
+                        busy::<Option<String>>(),
+                        busy::<Option<String>>(),
+                    )
+                } else if esim_active {
                     (
                         skip::<Option<crate::modem::types::SignalQuality>>(),
                         skip::<Option<crate::modem::types::NetworkRegistrationStatus>>(),
@@ -867,12 +881,16 @@ async fn get_all_sim_info(
         .collect();
 
     let modem_results = join_all(modem_futures).await;
-    log::warn!(
+    log::debug!(
         "[sims/info] join_all completed after {}ms",
         handler_start.elapsed().as_millis()
     );
 
     // 构建响应数据
+    // Last good row per port, reused when a busy port's live AT queries time out.
+    static LAST_GOOD_ROWS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (std::time::Instant, String, serde_json::Value)>>> =
+        std::sync::LazyLock::new(Default::default);
+    const LAST_GOOD_MAX_AGE: Duration = Duration::from_secs(120);
     let mut details = Vec::new();
     const STATUS_TRACE_PORTS: [&str; 3] = ["COM91", "COM92", "COM96"];
     for (
@@ -891,7 +909,7 @@ async fn get_all_sim_info(
         sms_center_data,
         _sms_center_error,
         sim_status_data,
-        _sim_status_error,
+        sim_status_error,
         memory_status_data,
         _memory_status_error,
         imei_data,
@@ -938,6 +956,7 @@ async fn get_all_sim_info(
             );
         }
 
+        let live_signal = signal_data.is_some();
         details.push(json!({
             "available": available,
             "sim_id": json_sim_id,
@@ -955,6 +974,18 @@ async fn get_all_sim_info(
             "memory_status": if has_sim { memory_status_data.as_ref().and_then(|s| s.as_ref()).map(|s| format_memory_status(s)) } else { None },
             "phone_number": if has_sim { phone_number } else { None }
         }));
+        let port_busy = sim_status_error.as_deref()
+            .is_some_and(|error| error.contains("timeout") || error.contains("busy"));
+        let mut last_good = LAST_GOOD_ROWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if has_sim && live_signal {
+            last_good.insert(com_port.clone(), (std::time::Instant::now(), sim_id.clone(), details.last().unwrap().clone()));
+        } else if port_busy {
+            if let Some((saved_at, saved_sim, row)) = last_good.get(&com_port) {
+                if *saved_sim == sim_id && saved_at.elapsed() < LAST_GOOD_MAX_AGE {
+                    *details.last_mut().unwrap() = row.clone();
+                }
+            }
+        }
     }
 
     let active_ports: std::collections::HashSet<String> = details
@@ -967,6 +998,19 @@ async fn get_all_sim_info(
         }
 
         let has_historical_sim = snapshot.last_sim_id.is_some();
+        if identity_revalidating_ports.contains(&snapshot.com_port)
+            && !manual_restarting_ports.contains(&snapshot.com_port)
+        {
+            let known_sim = snapshot.active_sim_id.as_ref().or(snapshot.last_sim_id.as_ref());
+            let reused = LAST_GOOD_ROWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&snapshot.com_port)
+                .filter(|(saved_at, saved_sim, _)| Some(saved_sim) == known_sim && saved_at.elapsed() < LAST_GOOD_MAX_AGE)
+                .map(|(_, _, row)| row.clone());
+            if let Some(row) = reused {
+                details.push(row);
+                continue;
+            }
+        }
         let available = snapshot.active_sim_id.is_some()
             && !manual_restarting_ports.contains(&snapshot.com_port)
             && !identity_revalidating_ports.contains(&snapshot.com_port)
@@ -1040,7 +1084,7 @@ async fn get_all_sim_info(
             .unwrap_or(u32::MAX)
     });
 
-    log::warn!(
+    log::debug!(
         "[sims/info] handler total {}ms",
         handler_start.elapsed().as_millis()
     );

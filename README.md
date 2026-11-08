@@ -160,7 +160,21 @@ cancellation, and restart checks. Real in-call AMR download, recording restart,
 DTMF delivery, and timing require a real call test; the application
 does not initiate that test call.
 
-## 🚀 Running the Application
+## � Logs for Bug Reports
+
+Logs are written to `logs/` beside the executable (`<name>_rCURRENT.log` is the
+running file; older files rotate daily and the last 7 are kept). Each line has a
+local timestamp with UTC offset, level, module and source line; every start writes
+a `===== ... starting` banner with the version. Panics are logged with a backtrace.
+
+Useful prefixes: `[Voice COMx]` (each voice-OTP step with elapsed ms, transcripts,
+readings, sent digit, OTP and error), `[USSD COMx]` (network-mode switch, raw reply,
+4G restore), `[FreeSMS COMx]` (operator choice and replies), `[ussd]` / `[free_sms]`
+(per-port result). Aliyun failures include the Aliyun `task_id`. For more detail,
+start with `--log-level debug`. When reporting a problem, send the log files and the
+time it happened.
+
+## �🚀 Running the Application
 
 ```bash
 # Run with default settings

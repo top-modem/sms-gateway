@@ -120,6 +120,16 @@ async fn run_gateway(param: &Param) -> anyhow::Result<()> {
     if let Err(err) = log_init(&param.log_path, &param.log_level) {
         return Err(err);
     };
+    log::info!(
+        "===== {} {} starting: log level {}, config {}, exe {:?}, os {} =====",
+        env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), param.log_level,
+        param.config_file.display(), std::env::current_exe().ok(), std::env::consts::OS
+    );
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("PANIC: {}\n{}", info, std::backtrace::Backtrace::force_capture());
+        default_panic(info);
+    }));
     if let Err(err) = db_init().await {
         return Err(err.into());
     }
@@ -1047,6 +1057,7 @@ fn log_init(log_path: &PathBuf, log_level: &LevelFilter) -> anyhow::Result<()> {
 
     let _ = Logger::try_with_str(format!("{}", log_level))?
         .log_to_file(file_spec)
+        .format_for_files(flexi_logger::detailed_format)
         .duplicate_to_stderr(Duplicate::All)
         .format_for_stderr(colored_detailed_format)
         .format_for_stdout(colored_detailed_format)

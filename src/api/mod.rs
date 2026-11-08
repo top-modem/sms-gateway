@@ -323,6 +323,10 @@ pub async fn run_api(
             "/phone-numbers/ussd",
             post(phone_numbers_ussd).with_state(modem_manager.clone()),
         )
+        .route(
+            "/phone-numbers/free-sms",
+            post(phone_numbers_free_sms).with_state(modem_manager.clone()),
+        )
         .route("/phone-numbers/status", get(phone_numbers_status))
         // ── 火狐狸 platform integration routes ─────────────────────────────
         .route("/settings/firefox-api-key", get(get_firefox_api_key))
@@ -1674,9 +1678,37 @@ async fn phone_numbers_ussd(
     Json(payload): Json<PhoneNumberUssdRequest>,
 ) -> Response {
     let task = get_phone_number_task().clone();
-    let code = payload.code;
+    let code = payload.code.trim().to_string();
+    if code.is_empty() || code.len() > 32 || !code.chars().all(|c| c.is_ascii_digit() || matches!(c, '*' | '#' | '+')) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "USSD code may only contain digits, *, # and +"}))).into_response();
+    }
+    if !claim_phone_number_task(&task, "ussd").await {
+        return (StatusCode::CONFLICT, Json(json!({"error": "Another phone-number task is running"}))).into_response();
+    }
     tokio::spawn(ussd_batch(mm, task, code));
     (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_free_sms(State(mm): State<ModemManagerRef>) -> Response {
+    let task = get_phone_number_task().clone();
+    if !claim_phone_number_task(&task, "free_sms").await {
+        return (StatusCode::CONFLICT, Json(json!({"error": "Another phone-number task is running"}))).into_response();
+    }
+    tokio::spawn(crate::phone_number::free_sms_batch(mm, task));
+    (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn claim_phone_number_task(task: &TaskHandle, task_type: &str) -> bool {
+    let mut t = task.write().await;
+    if t.running {
+        return false;
+    }
+    t.running = true;
+    t.task_type = task_type.to_string();
+    t.done = 0;
+    t.total = 0;
+    t.results.clear();
+    true
 }
 
 async fn phone_numbers_status() -> Response {

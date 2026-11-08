@@ -573,6 +573,24 @@ impl Sms {
         Ok(sms_list)
     }
 
+    /// Incoming SMS on a SIM with id greater than `after_id`, joined with the sender name.
+    pub async fn incoming_after_id(sim_id: &str, after_id: i64) -> Result<Vec<(String, String)>> {
+        let pool = get_pool()?;
+        Ok(sqlx::query_as(
+            "SELECT COALESCE(c.name, s.contact_id), s.message FROM sms s LEFT JOIN contacts c ON c.id = s.contact_id \
+             WHERE s.sim_id = ? AND s.send = 0 AND s.id > ? ORDER BY s.id",
+        )
+        .bind(sim_id)
+        .bind(after_id)
+        .fetch_all(pool)
+        .await?)
+    }
+
+    pub async fn max_id() -> Result<i64> {
+        let pool = get_pool()?;
+        Ok(sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM sms").fetch_one(pool).await?.unwrap_or(0))
+    }
+
     pub async fn find_latest_incoming_by_sim_id(sim_id: &str) -> Result<Option<Self>> {
         let pool = get_pool()?;
         let sms = sqlx::query_as(

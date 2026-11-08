@@ -124,6 +124,8 @@ pub struct Modem {
     pub voice_otp_cancel_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     pub voice_otp_finishing: std::sync::atomic::AtomicBool,
     pub voice_otp_dtmf_sent: std::sync::atomic::AtomicBool,
+    /// Receives the `+CUSD:` URC, which arrives after the AT+CUSD command's OK.
+    pub ussd_reply_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
     /// Reader task handle so we can abort and release COM resources on drop.
     reader_task: Mutex<Option<JoinHandle<()>>>,
     /// Command processor task handle so it does not outlive modem shutdown.
@@ -251,6 +253,7 @@ impl Modem {
             voice_otp_cancel_tx: tokio::sync::Mutex::new(None),
             voice_otp_finishing: std::sync::atomic::AtomicBool::new(false),
             voice_otp_dtmf_sent: std::sync::atomic::AtomicBool::new(false),
+            ussd_reply_tx: tokio::sync::Mutex::new(None),
             reader_task: Mutex::new(Some(reader_task)),
             command_task: Mutex::new(Some(command_task)),
             force_uk_mcc_to_46001,
@@ -974,6 +977,7 @@ impl Modem {
                 || trimmed.starts_with("VOICE CALL: END")
                 || trimmed.starts_with("+CLIP:")
                 || trimmed.starts_with("+CEND:")
+                || trimmed.starts_with("+CUSD:")
             {
                 debug!("Re-forwarding embedded URC [{}]: {}", name, trimmed);
                 let _ = urc_tx.send(trimmed.to_string());
@@ -2565,35 +2569,124 @@ impl Modem {
         Ok(())
     }
 
-    /// Send a USSD code and wait for the response.
+    /// Send a USSD code and wait for the network's `+CUSD:` reply.
     /// Returns the decoded response text.
     pub async fn send_ussd(&self, code: &str) -> io::Result<String> {
-        let command = format!("AT+CUSD=1,\"{}\"\r\n", code);
-        let response = self.send_command_with_ok(&command).await?;
+        if code.is_empty() || code.len() > 32 || !code.chars().all(|c| c.is_ascii_digit() || matches!(c, '*' | '#' | '+')) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "USSD code may only contain digits, *, # and +"));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.ussd_reply_tx.lock().await = Some(tx);
+        let result = async {
+            // The modem runs with AT+CSCS="UCS2", so the USSD string is UCS2 hex.
+            let encoded = string_to_ucs2_pub(code).map_err(io::Error::other)?;
+            let response = self
+                .send_command_outer_timeout(&format!("AT+CUSD=1,\"{}\",15\r\n", encoded), 30)
+                .await?;
+            if !response.contains("OK") {
+                return Err(io::Error::other(format!("AT+CUSD failed: {}", Self::format_log(&response))));
+            }
+            let line = match response.lines().find(|line| line.trim_start().starts_with("+CUSD:")) {
+                Some(line) => line.to_string(),
+                None => tokio::time::timeout(Duration::from_secs(30), rx)
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "No USSD reply within 30s"))?
+                    .map_err(|_| io::Error::other("USSD reply channel closed"))?,
+            };
+            parse_cusd(&line)
+        }
+        .await;
+        *self.ussd_reply_tx.lock().await = None;
+        result
+    }
 
-        let ussd_response = response
+    /// Deliver a `+CUSD:` URC to a pending `send_ussd`; returns false when nobody waits.
+    pub async fn deliver_ussd_reply(&self, line: &str) -> bool {
+        match self.ussd_reply_tx.lock().await.take() {
+            Some(tx) => tx.send(line.to_string()).is_ok(),
+            None => false,
+        }
+    }
+
+    async fn nwscanmode(&self) -> io::Result<u8> {
+        let response = self.send_command_with_ok("AT+QCFG=\"nwscanmode\"\r\n").await?;
+        response
             .lines()
-            .find(|line| line.starts_with("+CUSD:"))
-            .map(|line| {
-                let after_prefix = line.strip_prefix("+CUSD:").unwrap_or(line);
-                let parts: Vec<&str> = after_prefix.split(',').collect();
-                if parts.len() >= 2 {
-                    let raw = parts[1].trim().trim_matches('"');
-                    if raw.chars().all(|c| c.is_ascii_hexdigit())
-                        && raw.len() % 4 == 0
-                        && raw.len() >= 4
-                    {
-                        ucs2_hex_to_string(raw)
-                    } else {
-                        raw.to_string()
-                    }
-                } else {
-                    String::new()
-                }
-            })
-            .unwrap_or_default();
+            .find_map(|line| line.trim().strip_prefix("+QCFG: \"nwscanmode\","))
+            .and_then(|value| value.trim().parse().ok())
+            .ok_or_else(|| io::Error::other("Module did not report nwscanmode"))
+    }
 
-        Ok(ussd_response)
+    async fn set_nwscanmode(&self, mode: u8) -> io::Result<()> {
+        self.send_command_with_ok(&format!("AT+QCFG=\"nwscanmode\",{},1\r\n", mode)).await?;
+        Ok(())
+    }
+
+    async fn wait_registered(&self, eps: bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let command = if eps { "AT+CEREG?\r\n" } else { "AT+CREG?\r\n" };
+            if let Ok(response) = self.send_command(command).await {
+                let status = if eps {
+                    NetworkRegistrationStatus::from_cereg_response(&response)
+                } else {
+                    NetworkRegistrationStatus::from_response(&response)
+                };
+                if status.is_some_and(|status| matches!(status.status_code().trim(), "1" | "5")) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        false
+    }
+
+    /// USSD only works on 2G/3G: switch to GSM (then WCDMA), send the code, then restore LTE.
+    pub async fn send_ussd_on_legacy_network(&self, code: &str) -> Result<String, String> {
+        let original = self.nwscanmode().await.map_err(|e| format!("读取网络模式失败: {}", e))?;
+        let mut result = Err("无法注册到 2G/3G 网络".to_string());
+        for (mode, label) in [(1u8, "2G"), (2u8, "3G")] {
+            if let Err(e) = self.set_nwscanmode(mode).await {
+                result = Err(format!("切换到 {} 失败: {}", label, e));
+                continue;
+            }
+            if !self.wait_registered(false, Duration::from_secs(45)).await {
+                info!("[USSD {}] not registered on {} within 45s", self.com_port, label);
+                continue;
+            }
+            info!("[USSD {}] registered on {}, sending {}", self.com_port, label, code);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            result = self.send_ussd(code).await.map_err(|e| format!("{} USSD 失败: {}", label, e));
+            break;
+        }
+        // A port that was already 2G/3G-only still goes back to automatic (4G) selection.
+        let restore = if matches!(original, 1 | 2) { 0 } else { original };
+        let restored = match self.set_nwscanmode(restore).await {
+            Ok(()) => self.wait_registered(true, Duration::from_secs(60)).await,
+            Err(e) => {
+                warn!("[USSD {}] failed to restore nwscanmode {}: {}", self.com_port, restore, e);
+                false
+            }
+        };
+        if !restored {
+            warn!("[USSD {}] not yet registered on 4G after restoring nwscanmode {}", self.com_port, restore);
+        }
+        result.map(|text| if restored { text } else { format!("{} (已恢复网络模式，4G 尚未注册)", text) })
+    }
+
+    /// Service provider name from the SIM (AT+CSPN?), e.g. "giffgaff".
+    pub async fn read_spn(&self) -> Option<String> {
+        let response = self.send_command_with_ok("AT+CSPN?\r\n").await.ok()?;
+        let line = response.lines().find(|line| line.trim_start().starts_with("+CSPN:"))?;
+        let start = line.find('"')? + 1;
+        let end = start + line[start..].find('"')?;
+        let raw = line[start..end].trim();
+        let name = if raw.len() >= 4 && raw.len() % 4 == 0 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            ucs2_hex_to_string(raw)
+        } else {
+            raw.to_string()
+        };
+        (!name.trim().is_empty()).then(|| name.trim().to_string())
     }
 
     /// Query CLCC and extract the caller's phone number from an incoming call.
@@ -3997,6 +4090,15 @@ mod tests {
     use super::Modem;
 
     #[test]
+    fn cusd_reply_decodes_ucs2_and_keeps_commas() {
+        let hex = super::string_to_ucs2_pub("Your number is 07848998171, thanks").unwrap();
+        assert_eq!(super::parse_cusd(&format!("+CUSD: 0,\"{}\",72", hex)).unwrap(), "Your number is 07848998171, thanks");
+        assert_eq!(super::parse_cusd("+CUSD: 0,\"Balance: 5, number 07848998171\",15").unwrap(), "Balance: 5, number 07848998171");
+        assert!(super::parse_cusd("+CUSD: 4").is_err());
+        assert!(super::parse_cusd("+CUSD: 2").is_err());
+    }
+
+    #[test]
     fn recoverable_sim_error_matches_supported_codes_and_formats() {
         for response in ["+CME ERROR: 13", "+CME ERROR:50", "+CME: ERROR 50", "+cme error 13", "Command failed: \\r\\n+CME ERROR: 50\\r\\n"] {
             assert!(Modem::is_recoverable_sim_error(&std::io::Error::other(response)), "{}", response);
@@ -4057,6 +4159,25 @@ mod tests {
 }
 
 /// Decode a UCS2 hex string (e.g. "00410042" → "AB").
+/// Parse `+CUSD: <m>[,"<str>"[,<dcs>]]`; the text may contain commas.
+fn parse_cusd(line: &str) -> io::Result<String> {
+    let body = line.trim().strip_prefix("+CUSD:").unwrap_or(line).trim();
+    let status = body.split(',').next().unwrap_or("").trim();
+    let text = match (body.find('"'), body.rfind('"')) {
+        (Some(start), Some(end)) if end > start => &body[start + 1..end],
+        _ => "",
+    };
+    if text.is_empty() {
+        return Err(io::Error::other(match status {
+            "2" => "USSD session terminated by network".to_string(),
+            "4" => "USSD operation not supported".to_string(),
+            other => format!("Empty USSD reply (status {})", other),
+        }));
+    }
+    let looks_ucs2 = text.len() >= 4 && text.len() % 4 == 0 && text.chars().all(|c| c.is_ascii_hexdigit());
+    Ok(if looks_ucs2 { ucs2_hex_to_string(text) } else { text.to_string() })
+}
+
 fn ucs2_hex_to_string(hex: &str) -> String {
     (0..hex.len())
         .step_by(4)

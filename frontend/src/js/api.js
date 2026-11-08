@@ -333,6 +333,10 @@ class ApiClient {
         return FetchApi.post('/api/phone-numbers/ussd', { code });
     }
 
+    async startFreeSmsNumber() {
+        return FetchApi.post('/api/phone-numbers/free-sms', {});
+    }
+
     async getPhoneNumberStatus() {
         return FetchApi.get('/api/phone-numbers/status');
     }

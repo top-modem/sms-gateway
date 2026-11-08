@@ -376,7 +376,9 @@
         <Icon icon="carbon:phone" class="w-4 h-4" />
         {$t('call_log')}
       </button>
+      <!-- 注册 / 再次注册 hidden on request; handlers kept for API compatibility. -->
       <button
+        hidden
         onclick={forceRegister}
         disabled={getSelectedSimIds().length === 0 || forceRegBusy || reRegisterBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
@@ -389,6 +391,7 @@
         {forceRegBusy ? $t('force_register_running') : $t('btn_force_register')}
       </button>
       <button
+        hidden
         onclick={reRegister}
         disabled={getSelectedSimIds().length === 0 || reRegisterBusy || forceRegBusy}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium

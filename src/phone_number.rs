@@ -353,102 +353,159 @@ pub async fn sms_exchange(mm: Arc<ModemManager>, task: TaskHandle) {
     .await;
 }
 
-/// Send USSD code to every SIM that does not yet have a phone number and try to extract it.
-pub async fn ussd_batch(mm: Arc<ModemManager>, task: TaskHandle, code: String) {
-    let sims = list_sims(&mm).await;
-    let targets: Vec<_> = sims
-        .into_iter()
-        .filter(|s| s.phone_number.is_none())
-        .collect();
+/// Ports switch radio mode independently, so several can run at once.
+const NUMBER_LOOKUP_CONCURRENCY: usize = 8;
 
+/// Run `lookup` for every SIM without a phone number, saving any number it returns.
+async fn lookup_missing_numbers<F, Fut>(mm: Arc<ModemManager>, task: TaskHandle, task_type: &str, lookup: F)
+where
+    F: Fn(Arc<ModemManager>, SimInfo) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    use futures::StreamExt;
+    let targets: Vec<_> = list_sims(&mm).await.into_iter().filter(|s| s.phone_number.is_none()).collect();
     {
         let mut t = task.write().await;
         t.running = true;
-        t.task_type = "ussd".to_string();
+        t.task_type = task_type.to_string();
         t.total = targets.len();
         t.done = 0;
-        t.current.clear();
+        t.current = format!("正在处理 {} 个无号码端口", targets.len());
         t.errors.clear();
         t.results.clear();
     }
-
-    for (idx, info) in targets.iter().enumerate() {
-        {
-            let mut t = task.write().await;
-            t.current = format!("正在对 {} 发送 USSD: {}", info.com_port, code);
+    let mut results = futures::stream::iter(targets.into_iter().map(|info| {
+        let mm = mm.clone();
+        let lookup = &lookup;
+        async move {
+            let outcome = lookup(mm.clone(), info.clone()).await;
+            let (phone_number, status, message) = match outcome {
+                Ok(Some(phone)) => match write_phone_number(&mm, &info.sim_id, &phone).await {
+                    Ok(()) => (Some(phone), PhoneResultStatus::Success, "已获取并保存号码".to_string()),
+                    Err(e) => (Some(phone), PhoneResultStatus::Failed, format!("获取到号码但保存失败: {}", e)),
+                },
+                Ok(None) => (None, PhoneResultStatus::Skipped, "未检测到号码".to_string()),
+                Err(message) => (None, PhoneResultStatus::Failed, message),
+            };
+            PhoneResult { com_port: info.com_port, sim_id: info.sim_id, phone_number, status, message }
         }
-
-        let result = match mm.send_ussd(&info.sim_id, &code).await {
-            Ok(response) => {
-                let detected = extract_phone_from_ussd(&response);
-                let message = if detected.is_some() {
-                    "USSD 响应中检测到号码".to_string()
-                } else {
-                    format!("未检测到号码: {}", response)
-                };
-
-                if let Some(ref phone) = detected {
-                    if let Err(e) = write_phone_number(&mm, &info.sim_id, phone).await {
-                        PhoneResult {
-                            com_port: info.com_port.clone(),
-                            sim_id: info.sim_id.clone(),
-                            phone_number: detected.clone(),
-                            status: PhoneResultStatus::Failed,
-                            message: format!("检测到号码但写入失败: {}", e),
-                        }
-                    } else {
-                        PhoneResult {
-                            com_port: info.com_port.clone(),
-                            sim_id: info.sim_id.clone(),
-                            phone_number: detected.clone(),
-                            status: PhoneResultStatus::Success,
-                            message,
-                        }
-                    }
-                } else {
-                    PhoneResult {
-                        com_port: info.com_port.clone(),
-                        sim_id: info.sim_id.clone(),
-                        phone_number: None,
-                        status: PhoneResultStatus::Skipped,
-                        message,
-                    }
-                }
-            }
-            Err(e) => PhoneResult {
-                com_port: info.com_port.clone(),
-                sim_id: info.sim_id.clone(),
-                phone_number: None,
-                status: PhoneResultStatus::Failed,
-                message: format!("USSD 失败: {}", e),
-            },
-        };
-
-        {
-            let mut t = task.write().await;
-            if result.status == PhoneResultStatus::Failed {
-                t.errors
-                    .push(format!("{}: {}", info.com_port, result.message));
-            }
-            t.results.push(result);
-            t.done = idx + 1;
-        }
-    }
-
-    {
+    }))
+    .buffer_unordered(NUMBER_LOOKUP_CONCURRENCY);
+    while let Some(result) = results.next().await {
         let mut t = task.write().await;
-        t.running = false;
-        t.current = "USSD 批量操作完成".to_string();
+        if result.status == PhoneResultStatus::Failed {
+            t.errors.push(format!("{}: {}", result.com_port, result.message));
+        }
+        t.current = format!("{} 完成", result.com_port);
+        t.results.push(result);
+        t.done += 1;
+    }
+    let mut t = task.write().await;
+    t.running = false;
+    t.current = "取号完成".to_string();
+}
+
+/// Send a USSD code on 2G/3G to every SIM without a phone number, then return it to 4G.
+pub async fn ussd_batch(mm: Arc<ModemManager>, task: TaskHandle, code: String) {
+    lookup_missing_numbers(mm, task, "ussd", |mm, info| {
+        let code = code.clone();
+        async move {
+            let response = mm.send_ussd_on_legacy_network(&info.sim_id, &code).await?;
+            match extract_phone_from_ussd(&response) {
+                Some(phone) => Ok(Some(phone)),
+                None => Err(format!("USSD 回复中未找到号码: {}", response)),
+            }
+        }
+    })
+    .await;
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct FreeSmsRoute {
+    pub operator: &'static str,
+    pub to: &'static str,
+    pub body: &'static str,
+}
+
+/// Free "what is my number" SMS for UK operators, chosen by SIM SPN, then IMSI network.
+pub(crate) fn free_sms_route(spn: Option<&str>, imsi: Option<&str>) -> Option<FreeSmsRoute> {
+    const EE: FreeSmsRoute = FreeSmsRoute { operator: "EE", to: "150", body: "NUMBER" };
+    const O2: FreeSmsRoute = FreeSmsRoute { operator: "O2", to: "2020", body: "NUMBER" };
+    const GIFFGAFF: FreeSmsRoute = FreeSmsRoute { operator: "giffgaff", to: "43430", body: "NUMBER" };
+    const ASDA: FreeSmsRoute = FreeSmsRoute { operator: "Asda Mobile", to: "2732", body: "MY NUMBER" };
+    let spn = spn.unwrap_or("").trim().to_lowercase();
+    if spn.contains("giffgaff") { return Some(GIFFGAFF); }
+    if spn.contains("asda") { return Some(ASDA); }
+    if spn == "o2" || spn.starts_with("o2 ") || spn.starts_with("o2-") { return Some(O2); }
+    if spn == "ee" { return Some(EE); }
+    // giffgaff shares O2's 234-10 network code, so its SPN check must come first.
+    match imsi.map(str::trim).filter(|imsi| imsi.len() >= 5).map(|imsi| &imsi[..5]) {
+        Some("23410") => Some(O2),
+        Some("23430" | "23431" | "23432" | "23433" | "23434") => Some(EE),
+        _ => None,
     }
 }
 
+/// Text the operator's free number-lookup short code and read the number from its reply.
+pub async fn free_sms_batch(mm: Arc<ModemManager>, task: TaskHandle) {
+    lookup_missing_numbers(mm, task, "free_sms", |mm, info| async move {
+        let spn = mm.read_spn(&info.sim_id).await;
+        let imsi = mm.get_sim_card_cached(&info.sim_id).await.and_then(|card| card.imsi);
+        let route = free_sms_route(spn.as_deref(), imsi.as_deref())
+            .ok_or_else(|| format!("不支持的运营商 (SPN: {}, IMSI: {})", spn.as_deref().unwrap_or("-"),
+                imsi.as_deref().map(|i| i.chars().take(5).collect::<String>()).unwrap_or_else(|| "-".into())))?;
+        let before = Sms::max_id().await.map_err(|e| format!("读取短信记录失败: {}", e))?;
+        let contact = Contact { id: route.to.to_string(), name: route.to.to_string() };
+        mm.send_sms(&info.sim_id, &contact, route.body)
+            .await
+            .map_err(|e| format!("{}: 发送 {} 到 {} 失败: {}", route.operator, route.body, route.to, e))?;
+        for _ in 0..30 {
+            sleep(Duration::from_secs(4)).await;
+            let _ = mm.read_sms_sync_insert(&info.sim_id, SmsType::RecUnread).await;
+            let replies = Sms::incoming_after_id(&info.sim_id, before).await.unwrap_or_default();
+            if let Some(phone) = replies.iter().find_map(|(_, message)| extract_phone_from_ussd(message)) {
+                return Ok(Some(phone));
+            }
+        }
+        Err(format!("{}: 已发送 {} 到 {}，2 分钟内未收到含号码的回复", route.operator, route.body, route.to))
+    })
+    .await;
+}
+
+/// Find one UK mobile number (07…, 447…, +447…, 00447…) and return it as national `7XXXXXXXXX`.
 pub(crate) fn extract_phone_from_ussd(response: &str) -> Option<String> {
-    // Try common UK mobile pattern first.
-    let re = Regex::new(r"(?:(?:\+|00)44|0)7\d{9}").ok()?;
-    re.find(response)
-        .ok()
-        .flatten()
-        .map(|m| m.as_str().to_string())
+    static UK_MOBILE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?<![\d+])(?:(?:\+|00)?44\s?|0)7(?:[ -]?\d){9}(?!\d)").expect("valid UK mobile pattern")
+    });
+    let matched = UK_MOBILE.find(response).ok()??;
+    let digits: String = matched.as_str().chars().filter(char::is_ascii_digit).collect();
+    let national = digits.trim_start_matches("00").strip_prefix("44").unwrap_or(&digits).trim_start_matches('0');
+    (national.len() == 10).then(|| national.to_string())
+}
+
+#[cfg(test)]
+mod number_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn uk_number_is_extracted_in_national_form() {
+        for text in ["Your number is 07848998171.", "Your mobile number is +447848998171", "447848998171", "MSISDN: 0044 7848998171", "Number: 07848 998171"] {
+            assert_eq!(extract_phone_from_ussd(text).as_deref(), Some("7848998171"), "{text}");
+        }
+        for text in ["Balance £5.00", "Call 0800123456", "078489981712", "Ref 1078489981"] {
+            assert_eq!(extract_phone_from_ussd(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn free_sms_route_uses_spn_before_imsi() {
+        assert_eq!(free_sms_route(Some("giffgaff"), Some("234100000000000")).unwrap().to, "43430");
+        assert_eq!(free_sms_route(Some("ASDA Mobile"), None).unwrap().body, "MY NUMBER");
+        assert_eq!(free_sms_route(None, Some("234100000000000")).unwrap().to, "2020");
+        assert_eq!(free_sms_route(Some("EE"), None).unwrap().to, "150");
+        assert_eq!(free_sms_route(Some(""), Some("234330000000000")).unwrap().to, "150");
+        assert_eq!(free_sms_route(Some("Lyca"), Some("234260000000000")), None);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

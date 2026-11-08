@@ -33,8 +33,9 @@
   // Exchange tabs
   let exchangeRunning = $state(false);
   // USSD tab
-  let ussdCode = $state('*100#');
+  let ussdCode = $state('*#100#');
   let ussdRunning = $state(false);
+  let freeSmsRunning = $state(false);
 
   // Status polling
   let statusTask = $state(null);
@@ -98,7 +99,10 @@
       if (activeTab === 'import') importRunning = running && taskStatus.task_type === 'import';
       if (activeTab === 'call') exchangeRunning = running && taskStatus.task_type === 'call';
       if (activeTab === 'sms') exchangeRunning = running && taskStatus.task_type === 'sms';
-      if (activeTab === 'ussd') ussdRunning = running && taskStatus.task_type === 'ussd';
+      if (activeTab === 'ussd') {
+        ussdRunning = running && taskStatus.task_type === 'ussd';
+        freeSmsRunning = running && taskStatus.task_type === 'free_sms';
+      }
 
       if (running) {
         statusTask = setTimeout(pollStatus, 1500);
@@ -327,6 +331,18 @@
     } catch (e) {
       error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
       ussdRunning = false;
+    }
+  }
+
+  async function startFreeSms() {
+    freeSmsRunning = true;
+    error = '';
+    try {
+      await apiClient.startFreeSmsNumber();
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+      freeSmsRunning = false;
     }
   }
 
@@ -725,7 +741,7 @@
         <!-- USSD -->
         {:else if activeTab === 'ussd'}
           <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+            <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 items-end">
               <div class="sm:col-span-2">
                 <label for="ussdCode" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{$t('ussd_code_label')}</label>
                 <input
@@ -748,7 +764,28 @@
                 {/if}
                 {$t('btn_send_ussd')}
               </button>
+              <button
+                onclick={startFreeSms}
+                disabled={ussdRunning || freeSmsRunning}
+                title={$t('free_sms_hint')}
+                class="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                {#if freeSmsRunning}
+                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                {:else}
+                  <Icon icon="carbon:chat" class="w-4 h-4" />
+                {/if}
+                {$t('btn_free_sms_number')}
+              </button>
             </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400">{$t('ussd_network_hint')}</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">{$t('free_sms_hint')}</p>
+
+            {#if taskStatus.running && taskStatus.task_type === 'free_sms'}
+              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
+                {$t('ussd_progress', { done: taskStatus.done, total: taskStatus.total })}
+              </div>
+            {/if}
 
             {#if taskStatus.running && taskStatus.task_type === 'ussd'}
               <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">

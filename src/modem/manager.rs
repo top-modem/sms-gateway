@@ -3329,6 +3329,18 @@ impl ModemManager {
         modem.send_ussd(code).await.map_err(Into::into)
     }
 
+    pub async fn send_ussd_on_legacy_network(&self, sim_id: &str, code: &str) -> Result<String, String> {
+        let modem = self
+            .get_modem(sim_id)
+            .await
+            .ok_or_else(|| format!("Modem not found for SIM ID: {}", sim_id))?;
+        modem.send_ussd_on_legacy_network(code).await
+    }
+
+    pub async fn read_spn(&self, sim_id: &str) -> Option<String> {
+        self.get_modem(sim_id).await?.read_spn().await
+    }
+
     pub async fn read_clcc_caller_number(&self, sim_id: &str) -> anyhow::Result<Option<String>> {
         let modem = self
             .get_modem(sim_id)
@@ -3797,6 +3809,13 @@ impl ModemManager {
             if let Some(ended_call) = line.strip_prefix("VOICE_OTP_END:") {
                 if active_call_id.as_deref() != Some(ended_call) { continue; }
                 line = "NO CARRIER".into();
+            }
+
+            if line.starts_with("+CUSD:") {
+                if !modem.deliver_ussd_reply(&line).await {
+                    info!("[URC {}] unsolicited USSD: {}", sim_id, line);
+                }
+                continue;
             }
 
             if line.starts_with("+CLIP:") {

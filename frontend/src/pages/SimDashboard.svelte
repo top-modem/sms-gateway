@@ -376,33 +376,6 @@
         <Icon icon="carbon:phone" class="w-4 h-4" />
         {$t('call_log')}
       </button>
-      <!-- 注册 / 再次注册 hidden on request; handlers kept for API compatibility. -->
-      <button
-        hidden
-        onclick={forceRegister}
-        disabled={getSelectedSimIds().length === 0 || forceRegBusy || reRegisterBusy}
-        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
-               border border-gray-200 dark:border-zinc-700
-               text-gray-600 dark:text-gray-300
-               hover:bg-gray-50 dark:hover:bg-zinc-800 transition
-               disabled:opacity-60 disabled:cursor-not-allowed"
-      >
-        <Icon icon="carbon:network-3" class="w-4 h-4" />
-        {forceRegBusy ? $t('force_register_running') : $t('btn_force_register')}
-      </button>
-      <button
-        hidden
-        onclick={reRegister}
-        disabled={getSelectedSimIds().length === 0 || reRegisterBusy || forceRegBusy}
-        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
-               border border-gray-200 dark:border-zinc-700
-               text-gray-600 dark:text-gray-300
-               hover:bg-gray-50 dark:hover:bg-zinc-800 transition
-               disabled:opacity-60 disabled:cursor-not-allowed"
-      >
-        <Icon icon="carbon:reset" class="w-4 h-4" />
-        {reRegisterBusy ? $t('register_again_running') : $t('btn_register_again')}
-      </button>
       <button
         onclick={() => { loading = true; error = ''; fetchData(); }}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium

@@ -99,10 +99,8 @@
       if (activeTab === 'import') importRunning = running && taskStatus.task_type === 'import';
       if (activeTab === 'call') exchangeRunning = running && taskStatus.task_type === 'call';
       if (activeTab === 'sms') exchangeRunning = running && taskStatus.task_type === 'sms';
-      if (activeTab === 'ussd') {
-        ussdRunning = running && taskStatus.task_type === 'ussd';
-        freeSmsRunning = running && taskStatus.task_type === 'free_sms';
-      }
+      if (activeTab === 'ussd') ussdRunning = running && taskStatus.task_type === 'ussd';
+      if (activeTab === 'free_sms') freeSmsRunning = running && taskStatus.task_type === 'free_sms';
 
       if (running) {
         statusTask = setTimeout(pollStatus, 1500);
@@ -462,6 +460,7 @@
       </button>
       {#each [
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
+        { id: 'free_sms', label: $t('btn_free_sms_number'), icon: 'carbon:chat' },
       ] as tab}
         <button
           onclick={() => setActiveTab(tab.id)}
@@ -741,7 +740,7 @@
         <!-- USSD -->
         {:else if activeTab === 'ussd'}
           <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
-            <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 items-end">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
               <div class="sm:col-span-2">
                 <label for="ussdCode" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{$t('ussd_code_label')}</label>
                 <input
@@ -764,22 +763,23 @@
                 {/if}
                 {$t('btn_send_ussd')}
               </button>
-              <button
-                onclick={startFreeSms}
-                disabled={ussdRunning || freeSmsRunning}
-                title={$t('free_sms_hint')}
-                class="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
-              >
-                {#if freeSmsRunning}
-                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
-                {:else}
-                  <Icon icon="carbon:chat" class="w-4 h-4" />
-                {/if}
-                {$t('btn_free_sms_number')}
-              </button>
             </div>
             <p class="text-xs text-gray-500 dark:text-gray-400">{$t('ussd_network_hint')}</p>
-            <p class="text-xs text-gray-500 dark:text-gray-400">{$t('free_sms_hint')}</p>
+
+            {#if taskStatus.running && taskStatus.task_type === 'ussd'}
+              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
+                {$t('ussd_progress', { done: taskStatus.done, total: taskStatus.total })}
+              </div>
+            {/if}
+          </div>
+
+        <!-- Free SMS number lookup -->
+        {:else if activeTab === 'free_sms'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            <div class="p-3 rounded-lg bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 text-sm flex items-start gap-2">
+              <Icon icon="carbon:information" class="w-5 h-5 flex-shrink-0" />
+              <span>{$t('free_sms_hint')}</span>
+            </div>
 
             {#if taskStatus.running && taskStatus.task_type === 'free_sms'}
               <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
@@ -787,11 +787,20 @@
               </div>
             {/if}
 
-            {#if taskStatus.running && taskStatus.task_type === 'ussd'}
-              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
-                {$t('ussd_progress', { done: taskStatus.done, total: taskStatus.total })}
-              </div>
-            {/if}
+            <div class="flex justify-end">
+              <button
+                onclick={startFreeSms}
+                disabled={freeSmsRunning}
+                class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                {#if freeSmsRunning}
+                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                {:else}
+                  <Icon icon="carbon:send" class="w-4 h-4" />
+                {/if}
+                {$t('btn_free_sms_start')}
+              </button>
+            </div>
           </div>
         {/if}
 

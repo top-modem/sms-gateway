@@ -289,7 +289,7 @@ impl Call {
         Ok(row.map(|(data,)| data))
     }
 
-    /// Save the Whisper transcript for a call.
+    /// Save the speech-recognition transcript for a call.
     pub async fn save_transcript(id: &str, text: &str) -> Result<()> {
         let pool = get_pool()?;
         sqlx::query(r#"UPDATE calls SET transcript = ? WHERE id = ?"#)

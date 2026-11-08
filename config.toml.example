@@ -13,12 +13,8 @@ password = "your_secure_password" # Web interface password
 # SMS reading frequency in seconds
 read_sms_frequency = 30          # How often to check for new SMS messages
 
-# Speech-to-text via whisper.cpp (optional). Remove these lines to disable transcription.
-# Download multilingual model: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+# ffmpeg converts call recordings for Aliyun speech recognition (bundled tools/ffmpeg/ffmpeg.exe is found automatically).
 # ffmpeg_exe       = "/path/to/ffmpeg"
-# whisper_exe      = "/path/to/whisper-cli"
-# whisper_model    = "/path/to/ggml-base.bin"
-# whisper_language = "auto"   # "auto" = detect language, or "en", "zh", "ja", "ko", etc.
 # auto_answer_enabled = true                # Whether to auto-answer incoming calls (default true)
 # auto_answer_delay_secs = 2               # Delay before auto-answering (0=immediate, 2=default)
 # force_uk_mcc_to_46001 = true             # If MCC is 234/235, send AT+COPS=1,2,"46001" during SIM init

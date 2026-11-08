@@ -1829,9 +1829,14 @@ async fn get_call_transcript(Path(id): Path<String>) -> Response {
     }
 }
 
+async fn voice_ready(manager: &ModemManagerRef) -> bool {
+    manager.audio_tools_ready().await
+        && crate::aliyun_asr::AliyunAsrSettings::load().await.is_ok_and(|aliyun| aliyun.ready())
+}
+
 async fn get_voice_otp_settings(State(manager): State<ModemManagerRef>) -> Response {
     match crate::transcribe::VoiceOtpSettings::load().await {
-        Ok(settings) => Json(json!({ "settings": settings, "local_ready": manager.local_transcription_ready().await })).into_response(),
+        Ok(settings) => Json(json!({ "settings": settings, "ready": voice_ready(&manager).await })).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
     }
 }
@@ -1843,12 +1848,10 @@ async fn set_voice_otp_settings(
     if let Err(error) = settings.validate() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response();
     }
-    if settings.enabled && !manager.local_transcription_ready().await {
-        return (StatusCode::CONFLICT, Json(json!({ "error": "Local ffmpeg/Whisper tools are unavailable" }))).into_response();
+    if settings.enabled && !manager.audio_tools_ready().await {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "ffmpeg is unavailable for converting call audio" }))).into_response();
     }
-    if settings.enabled && settings.provider == "aliyun"
-        && !crate::aliyun_asr::AliyunAsrSettings::load().await.is_ok_and(|aliyun| aliyun.ready())
-    {
+    if settings.enabled && !crate::aliyun_asr::AliyunAsrSettings::load().await.is_ok_and(|aliyun| aliyun.ready()) {
         return (StatusCode::CONFLICT, Json(json!({ "error": "Configure the Aliyun AppKey and token or AccessKey first" }))).into_response();
     }
     let value = match serde_json::to_string(&settings) {
@@ -1856,7 +1859,7 @@ async fn set_voice_otp_settings(
         Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response(),
     };
     match AppSetting::set("voice_otp_local_settings", Some(&value)).await {
-        Ok(()) => Json(json!({ "settings": settings, "local_ready": manager.local_transcription_ready().await })).into_response(),
+        Ok(()) => Json(json!({ "settings": settings, "ready": voice_ready(&manager).await })).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() }))).into_response(),
     }
 }

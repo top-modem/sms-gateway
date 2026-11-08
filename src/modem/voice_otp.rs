@@ -67,8 +67,6 @@ struct LocalCall {
     call_id: String,
     sim_id: String,
     config: Arc<TranscribeConfig>,
-    language: String,
-    provider: String,
     sse: Arc<SseManager>,
 }
 
@@ -111,19 +109,8 @@ impl CallIo for LocalCall {
 
     async fn transcribe(&self, audio: &[u8]) -> Result<String> {
         let started = std::time::Instant::now();
-        if self.provider == "aliyun" {
-            match crate::aliyun_asr::transcribe(audio, &self.config.ffmpeg_exe).await {
-                Ok(text) => {
-                    log::info!("[Voice {}] Aliyun recognition took {} ms", self.modem.com_port, started.elapsed().as_millis());
-                    return Ok(text);
-                }
-                Err(error) => log::warn!("[Voice {}] Aliyun recognition failed after {} ms, using local Whisper: {:#}",
-                    self.modem.com_port, started.elapsed().as_millis(), error),
-            }
-        }
-        let text = crate::transcribe::transcribe(audio, &self.config.ffmpeg_exe, &self.config.whisper_exe,
-            &self.config.whisper_model, &self.language).await?;
-        log::info!("[Voice {}] local recognition finished after {} ms", self.modem.com_port, started.elapsed().as_millis());
+        let text = crate::aliyun_asr::transcribe(audio, &self.config.ffmpeg_exe).await?;
+        log::info!("[Voice {}] Aliyun recognition took {} ms", self.modem.com_port, started.elapsed().as_millis());
         Ok(text)
     }
 
@@ -281,7 +268,10 @@ pub(super) async fn maybe_start(
     if !settings.handles(&modem.com_port) {
         return Ok(false);
     }
-    let config = config.context("Local ffmpeg/Whisper tools are unavailable")?;
+    let config = config.context("ffmpeg is unavailable for converting call audio")?;
+    if !crate::aliyun_asr::AliyunAsrSettings::load().await?.ready() {
+        bail!("Aliyun speech recognition is not configured");
+    }
     static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VoiceOtpSettings::MAX_PORTS);
     let permit = ADMISSION.try_acquire().context("Too many voice-flow calls are already running")?;
     let mut owned_call = modem.voice_otp_call_id.lock().await;
@@ -295,14 +285,13 @@ pub(super) async fn maybe_start(
     *modem.voice_otp_cancel_tx.lock().await = Some(user_cancel_tx);
     let mut cancellation = VoiceCancellation { remote: Some(cancel_rx), user: user_cancel_rx };
     drop(owned_call);
-    let io = LocalCall { modem: modem.clone(), call_id: call_id.clone(), sim_id,
-        config, language: settings.language.clone(), provider: settings.provider.clone(), sse };
+    let io = LocalCall { modem: modem.clone(), call_id: call_id.clone(), sim_id, config, sse };
     let token: String = call_id.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
     let prompt_file = format!("vp{}.amr", token);
     let code_file = format!("vc{}.amr", token);
     tokio::spawn(async move {
         let _permit = permit;
-        let mut progress = VoiceOtpProgress { provider: io.provider.clone(), ..Default::default() };
+        let mut progress = VoiceOtpProgress { provider: "aliyun".into(), ..Default::default() };
         if let Err(error) = run(&io, &settings, &mut progress, &mut cancellation, &prompt_file, &code_file).await {
             progress.state = if error.is::<VoiceCancelled>() || error.is::<RemoteCallEnded>()
                 || (!modem.voice_otp_finishing.load(Ordering::SeqCst) && io.active().await.is_err())

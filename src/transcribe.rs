@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use log::{debug, error};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
@@ -16,17 +15,16 @@ fn hidden_command(exe: &str) -> Command {
     cmd
 }
 
+/// Recognition is Aliyun-only; obsolete saved keys (language, provider) are ignored.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct VoiceOtpSettings {
     pub enabled: bool,
     pub com_port: String,
     pub prompt_seconds: u64,
     pub code_seconds: u64,
     pub otp_length: usize,
-    pub language: String,
     pub deadline_seconds: u64,
-    pub provider: String,
 }
 
 impl Default for VoiceOtpSettings {
@@ -37,9 +35,7 @@ impl Default for VoiceOtpSettings {
             prompt_seconds: 10,
             code_seconds: 10,
             otp_length: 6,
-            language: "auto".into(),
             deadline_seconds: 120,
-            provider: "local".into(),
         }
     }
 }
@@ -80,12 +76,6 @@ impl VoiceOtpSettings {
         }
         if !(4..=8).contains(&self.otp_length) {
             bail!("OTP length must be between 4 and 8 digits");
-        }
-        if !matches!(self.language.as_str(), "auto" | "en" | "zh") {
-            bail!("Voice language must be auto, en or zh");
-        }
-        if !matches!(self.provider.as_str(), "local" | "aliyun") {
-            bail!("Voice provider must be local or aliyun");
         }
         if !(30..=240).contains(&self.deadline_seconds)
             || self.deadline_seconds < self.prompt_seconds + self.code_seconds + 10
@@ -266,146 +256,6 @@ pub(crate) fn extract_voice_otp(text: &str, expected_length: usize) -> Result<St
     Ok(candidates.into_iter().next().unwrap())
 }
 
-/// Convert an AMR audio blob to text using a local whisper.cpp installation.
-///
-/// Steps:
-/// 1. Write `amr_bytes` to `<tmpdir>/<id>.amr`
-/// 2. Run ffmpeg to convert to 16 kHz mono WAV: `<tmpdir>/<id>.wav`
-/// 3. Run whisper-cli with `--output-txt` (language auto-detected or forced)
-/// 4. Read the generated `<tmpdir>/<id>.wav.txt` transcript
-/// 5. Delete all temp files
-///
-/// `language`: language code ("en", "zh", "ja", etc.) or "auto" for auto-detect.
-/// Returns the trimmed transcript string on success.
-pub async fn transcribe(
-    amr_bytes: &[u8],
-    ffmpeg_exe: &str,
-    whisper_exe: &str,
-    whisper_model: &str,
-    language: &str,
-) -> Result<String> {
-    static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let _worker = WORKERS.acquire().await.context("Local transcription worker unavailable")?;
-    if amr_bytes.is_empty() || amr_bytes.len() > 5 * 1024 * 1024 {
-        bail!("Recording must contain between 1 byte and 5 MB of audio");
-    }
-    let tmp = std::env::temp_dir();
-    let id = Uuid::new_v4().to_string();
-
-    let amr_path: PathBuf = tmp.join(format!("{}.amr", id));
-    let wav_path: PathBuf = tmp.join(format!("{}.wav", id));
-    // whisper --output-txt writes to <-of value>.txt
-    let txt_path: PathBuf = tmp.join(format!("{}.txt", id));
-    let _temp_files = TempAudioFiles(vec![amr_path.clone(), wav_path.clone(), txt_path.clone()]);
-
-    // ── Step 1: Write AMR bytes ───────────────────────────────────────────────
-    tokio::fs::write(&amr_path, amr_bytes)
-        .await
-        .context("failed to write temp AMR file")?;
-
-    // ── Step 2: ffmpeg AMR → 16 kHz mono WAV ─────────────────────────────────
-    let ffmpeg_child = hidden_command(ffmpeg_exe)
-        .args([
-            "-y", // overwrite output without asking
-            "-i",
-            amr_path.to_str().unwrap(),
-            "-ar",
-            "16000", // 16 kHz sample rate (required by Whisper)
-            "-ac",
-            "1", // mono
-            wav_path.to_str().unwrap(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to launch ffmpeg (is it installed and on PATH?)")?;
-
-    let ffmpeg_out = match tokio::time::timeout(
-        Duration::from_secs(60),
-        ffmpeg_child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-            bail!("ffmpeg error: {}", e);
-        }
-        Err(_) => {
-            cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-            bail!("ffmpeg timed out after 60s");
-        }
-    };
-
-    if !ffmpeg_out.status.success() {
-        let stderr = String::from_utf8_lossy(&ffmpeg_out.stderr);
-        cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-        bail!("ffmpeg failed: {}", stderr.trim());
-    }
-
-    debug!("transcribe: ffmpeg ok, wav={}", wav_path.display());
-
-    // ── Step 3: whisper-cli transcription ─────────────────────────────────────
-    let output_prefix = txt_path.with_extension("");
-    let output_prefix_str = output_prefix.to_str().unwrap();
-    let wav_str = wav_path.to_str().unwrap();
-    let mut whisper_args: Vec<&str> = vec![
-        "-m",
-        whisper_model,
-        "-f",
-        wav_str,
-        "--output-txt", // write transcript to <-of>.txt
-        "-nt",          // no timestamps in output
-        "-of",
-        output_prefix_str,
-    ];
-    whisper_args.push("-l");
-    whisper_args.push(language);
-    let whisper_child = hidden_command(whisper_exe)
-        .args(&whisper_args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to launch whisper-cli (is it installed?)")?;
-
-    let whisper_out = match tokio::time::timeout(
-        Duration::from_secs(120),
-        whisper_child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-            bail!("whisper-cli error: {}", e);
-        }
-        Err(_) => {
-            cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-            bail!("whisper-cli timed out after 120s");
-        }
-    };
-
-    if !whisper_out.status.success() {
-        let stderr = String::from_utf8_lossy(&whisper_out.stderr);
-        cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-        bail!("whisper-cli failed: {}", stderr.trim());
-    }
-
-    debug!("transcribe: whisper ok, reading {}", txt_path.display());
-
-    // ── Step 4: Read transcript ───────────────────────────────────────────────
-    let transcript = tokio::fs::read_to_string(&txt_path)
-        .await
-        .context("failed to read whisper transcript file")?;
-
-    // ── Step 5: Cleanup ───────────────────────────────────────────────────────
-    cleanup(&[&amr_path, &wav_path, &txt_path]).await;
-
-    Ok(transcript.trim().to_string())
-}
-
 /// Convert an AMR recording to mono 16-bit WAV at `sample_rate` for cloud recognition.
 pub(crate) async fn convert_to_wav(amr_bytes: &[u8], ffmpeg_exe: &str, sample_rate: u32) -> Result<Vec<u8>> {
     if amr_bytes.is_empty() || amr_bytes.len() > 5 * 1024 * 1024 {
@@ -432,19 +282,6 @@ pub(crate) async fn convert_to_wav(amr_bytes: &[u8], ffmpeg_exe: &str, sample_ra
         bail!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     tokio::fs::read(&wav_path).await.context("failed to read converted WAV")
-}
-
-async fn cleanup(paths: &[&PathBuf]) {
-    for p in paths {
-        if let Err(e) = tokio::fs::remove_file(p).await {
-            // Non-fatal — just log at debug level
-            error!(
-                "transcribe: failed to delete temp file {}: {}",
-                p.display(),
-                e
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -556,19 +393,5 @@ mod voice_otp_tests {
         for transcript in ["Your code is 123. Another number is 456.", "Codes 123456 and 654321.", "Your code is 1234567.", "Silence."] {
             assert!(extract_voice_otp(transcript, 6).is_err(), "unexpected code: {transcript}");
         }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires bundled local tools and generated VOICE_OTP_SMOKE_PROMPT/CODE WAV files"]
-    async fn voice_otp_local_whisper_pipeline() {
-        let ffmpeg = resolve_local_file(None, &["tools/ffmpeg/ffmpeg.exe"]).unwrap();
-        let whisper = resolve_local_file(None, &["tools/whisper/whisper-cli.exe"]).unwrap();
-        let model = resolve_local_file(None, &["tools/whisper/ggml-base.bin"]).unwrap();
-        let prompt_audio = tokio::fs::read(std::env::var("VOICE_OTP_SMOKE_PROMPT").unwrap()).await.unwrap();
-        let code_audio = tokio::fs::read(std::env::var("VOICE_OTP_SMOKE_CODE").unwrap()).await.unwrap();
-        let prompt = transcribe(&prompt_audio, &ffmpeg, &whisper, &model, "en").await.unwrap();
-        assert_eq!(parse_voice_prompt(&prompt, 6).unwrap(), VoicePrompt::PressDigit('5'), "prompt: {prompt}");
-        let code = transcribe(&code_audio, &ffmpeg, &whisper, &model, "en").await.unwrap();
-        assert_eq!(extract_voice_otp(&code, 6).unwrap(), "005861", "transcript: {code}");
     }
 }

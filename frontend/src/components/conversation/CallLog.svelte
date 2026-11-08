@@ -13,7 +13,7 @@
   let makeCallSimId = $state('');
   let making = $state(false);
   let makeError = $state('');
-  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, language: 'auto', deadline_seconds: 120, provider: 'local' });
+  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, deadline_seconds: 120 });
   let aliyun = $state({ app_key: '', region: 'cn-shanghai', sample_rate: 16000, access_key_id: '', has_token: false, has_access_key_secret: false, ready: false });
   let aliyunToken = $state('');
   let aliyunSecret = $state('');
@@ -72,7 +72,7 @@
     try {
       const response = await apiClient.getVoiceOtpSettings();
       voiceSettings = response.data.settings;
-      voiceReady = response.data.local_ready === true;
+      voiceReady = response.data.ready === true;
       aliyun = (await apiClient.getAliyunAsrSettings()).data;
     } catch (error) {
       voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
@@ -90,6 +90,7 @@
       if (aliyunToken.trim()) payload.token = aliyunToken.trim();
       if (aliyunSecret.trim()) payload.access_key_secret = aliyunSecret.trim();
       aliyun = (await apiClient.setAliyunAsrSettings(payload)).data;
+      voiceReady = aliyun.ready === true;
       aliyunToken = '';
       aliyunSecret = '';
       aliyunMessage = $t('voice_saved');
@@ -121,7 +122,7 @@
     try {
       const response = await apiClient.setVoiceOtpSettings({ ...voiceSettings });
       voiceSettings = response.data.settings;
-      voiceReady = response.data.local_ready === true;
+      voiceReady = response.data.ready === true;
       voiceSaved = true;
     } catch (error) {
       voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
@@ -232,14 +233,7 @@
         <Icon icon={voiceBusy ? 'carbon:renew' : 'carbon:save'} class="w-4 h-4" />
       </button>
     </div>
-    <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-7 gap-3 min-w-0">
-      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
-        {$t('voice_provider')}
-        <select bind:value={voiceSettings.provider} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
-          <option value="local">{$t('voice_provider_local')}</option>
-          <option value="aliyun">{$t('voice_provider_aliyun')}</option>
-        </select>
-      </label>
+    <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3 min-w-0">
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0" title={$t('voice_port_hint')}>
         {$t('voice_port')}
         <input type="text" required pattern={'\\s*COM[1-9][0-9]{0,2}(\\s*,\\s*COM[1-9][0-9]{0,2}){0,31}\\s*'} placeholder="COM2,COM5" bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
@@ -257,14 +251,6 @@
         <input type="number" min="4" max="8" step="1" required bind:value={voiceSettings.otp_length} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
       </label>
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
-        {$t('voice_language')}
-        <select bind:value={voiceSettings.language} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5">
-          <option value="auto">{$t('voice_language_auto')}</option>
-          <option value="en">English</option>
-          <option value="zh">中文</option>
-        </select>
-      </label>
-      <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
         {$t('voice_deadline')}
         <input type="number" min="30" max="240" step="1" required bind:value={voiceSettings.deadline_seconds} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
       </label>
@@ -273,8 +259,7 @@
     {#if voiceError}<p class="text-xs text-red-600 dark:text-red-400 mt-2 break-words" role="alert">{voiceError}</p>{/if}
   </form>
 
-  {#if voiceSettings.provider === 'aliyun'}
-    <form
+  <form
       aria-label={$t('aliyun_title')}
       class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0"
       onsubmit={(event) => { event.preventDefault(); saveAliyun(); }}
@@ -333,7 +318,6 @@
       {#if aliyunMessage}<p class="text-xs text-green-600 dark:text-green-400 mt-2" role="status">{aliyunMessage}</p>{/if}
       {#if aliyunError}<p class="text-xs text-red-600 dark:text-red-400 mt-2 break-words" role="alert">{aliyunError}</p>{/if}
     </form>
-  {/if}
 
   <!-- Make a call -->
   <div class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0">

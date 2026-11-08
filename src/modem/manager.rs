@@ -18,15 +18,10 @@ use crate::webhook;
 use super::core::Modem;
 use super::types::*;
 
-/// Configuration for local whisper.cpp speech-to-text transcription.
-/// All three fields must be `Some` for transcription to be enabled.
+/// Call-audio settings: ffmpeg converts modem AMR recordings for Aliyun recognition.
 #[derive(Debug, Clone)]
 pub struct TranscribeConfig {
     pub ffmpeg_exe: String,
-    pub whisper_exe: String,
-    pub whisper_model: String,
-    /// Language code: "en", "zh", "ja", etc., or "auto" for auto-detect.
-    pub whisper_language: String,
     /// Delay before auto-answering incoming calls (seconds).
     pub auto_answer_delay_secs: u64,
     /// Whether to enable auto-answer for incoming calls.
@@ -37,9 +32,6 @@ impl TranscribeConfig {
     pub fn from_settings(s: &Settings) -> Option<Arc<Self>> {
         Some(Arc::new(Self {
                 ffmpeg_exe: crate::transcribe::resolve_local_file(s.ffmpeg_exe.as_deref(), &["tools/ffmpeg/ffmpeg.exe", "ffmpeg.exe"] )?,
-                whisper_exe: crate::transcribe::resolve_local_file(s.whisper_exe.as_deref(), &["tools/whisper/whisper-cli.exe"] )?,
-                whisper_model: crate::transcribe::resolve_local_file(s.whisper_model.as_deref(), &["tools/whisper/ggml-base.bin"] )?,
-                whisper_language: s.whisper_language.clone().unwrap_or_else(|| "auto".to_string()),
                 auto_answer_delay_secs: s.auto_answer_delay_secs.unwrap_or(2),
                 auto_answer_enabled: s.auto_answer_enabled.unwrap_or(true),
         }))
@@ -150,12 +142,9 @@ mod recovery_capacity_tests {
         let mut config: crate::config::AppConfig = toml::from_str(
             "[settings]\nserver_host='127.0.0.1'\nserver_port=0\nread_sms_frequency=10",
         ).unwrap();
-        let filename = path.to_string_lossy().to_string();
-        config.settings.ffmpeg_exe = Some(filename.clone());
-        config.settings.whisper_exe = Some(filename.clone());
-        config.settings.whisper_model = Some(filename);
+        config.settings.ffmpeg_exe = Some(path.to_string_lossy().to_string());
         let manager = ModemManager::new(&config);
-        assert!(manager.local_transcription_ready().await);
+        assert!(manager.audio_tools_ready().await);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3601,7 +3590,7 @@ impl ModemManager {
             Ok(false) => {}
             Err(error) => {
                 let progress = crate::transcribe::VoiceOtpProgress {
-                    state: "failed".into(), provider: "local".into(), error: Some(error.to_string()),
+                    state: "failed".into(), provider: "aliyun".into(), error: Some(error.to_string()),
                     ..Default::default()
                 };
                 let _ = Call::save_voice_otp(&call_id, &progress).await;
@@ -3645,11 +3634,9 @@ impl ModemManager {
         Ok(false)
     }
 
-    pub(crate) async fn local_transcription_ready(&self) -> bool {
-        self.transcribe_config.read().await.as_ref().is_some_and(|config| {
-            [&config.ffmpeg_exe, &config.whisper_exe, &config.whisper_model]
-                .iter().all(|path| std::path::Path::new(path).is_file())
-        })
+    pub(crate) async fn audio_tools_ready(&self) -> bool {
+        self.transcribe_config.read().await.as_ref()
+            .is_some_and(|config| std::path::Path::new(&config.ffmpeg_exe).is_file())
     }
 
     /// Answer the current inbound call. Mirrors the URC handler's auto-answer
@@ -3985,8 +3972,10 @@ impl ModemManager {
                                     error!("[URC {}] failed to save recording to DB: {}", sim_id, e);
                                 } else {
                                     info!("[URC {}] recording saved to DB", sim_id);
-                                    // ── Spawn transcription (fire-and-forget) ──────────
-                                    if let Some(cfg) = transcribe_cfg.as_ref() {
+                                    // ── Spawn Aliyun transcription when configured (fire-and-forget) ──
+                                    let aliyun_ready = crate::aliyun_asr::AliyunAsrSettings::load().await
+                                        .is_ok_and(|settings| settings.ready());
+                                    if let Some(cfg) = transcribe_cfg.as_ref().filter(|_| aliyun_ready) {
                                         let data_c = data.clone();
                                         let call_id_c = call_id.clone();
                                         let sim_id_c = sim_id.clone();
@@ -3994,13 +3983,7 @@ impl ModemManager {
                                         tokio::spawn(async move {
                                             info!("[URC {}] transcribing recording for call {}", sim_id_c, call_id_c);
                                             let t = std::time::Instant::now();
-                                            match crate::transcribe::transcribe(
-                                                &data_c,
-                                                &cfg_c.ffmpeg_exe,
-                                                &cfg_c.whisper_exe,
-                                                &cfg_c.whisper_model,
-                                                &cfg_c.whisper_language,
-                                            ).await {
+                                            match crate::aliyun_asr::transcribe(&data_c, &cfg_c.ffmpeg_exe).await {
                                                 Ok(text) => {
                                                     info!("[URC {}] transcript ({:.1}s): {}", sim_id_c, t.elapsed().as_secs_f64(), text);
                                                     if let Err(e) = Call::save_transcript(&call_id_c, &text).await {

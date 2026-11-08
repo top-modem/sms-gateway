@@ -82,15 +82,8 @@ pub struct Settings {
     pub webhooks_max_concurrent: Option<usize>,
     pub webhooks: Option<Vec<WebhookConfig>>,
     pub sms_storage: Option<SmsStorage>,
-    /// Path to ffmpeg executable (used to convert AMR → WAV before transcription).
+    /// Path to ffmpeg executable (converts call AMR audio to WAV for Aliyun recognition).
     pub ffmpeg_exe: Option<String>,
-    /// Path to whisper-cli executable (whisper.cpp CLI binary).
-    pub whisper_exe: Option<String>,
-    /// Path to the whisper.cpp model file, e.g. ggml-base.bin
-    pub whisper_model: Option<String>,
-    /// Language code for Whisper transcription: "en", "zh", "ja", etc.
-    /// Set to "auto" (default) to auto-detect the language.
-    pub whisper_language: Option<String>,
     /// Delay in seconds before auto-answering incoming calls (0 = immediate, default 2 = let it ring briefly).
     pub auto_answer_delay_secs: Option<u64>,
     /// Enable or disable auto-answering of incoming calls (default true = enabled).

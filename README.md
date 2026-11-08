@@ -80,47 +80,39 @@ $env:ESIM_OCR_TEST_IMAGE = (Resolve-Path .\doc\779347821.png).Path
 cargo test --release esim::activation::tests -- --include-ignored
 ```
 
-### Local Voice-Code Trial
+### WhatsApp Voice-Code Flow (Aliyun)
 
-The Calls view includes an opt-in, local-only two-stage voice-code flow. It uses
-whisper.cpp, not an OpenAI API or a local ChatGPT server. The default test port is
-COM2, with independent 10-second prompt/code recordings, a six-digit code,
-automatic language detection, and a 120-second deadline. Save the settings before
-calling; only the selected enabled port uses the interactive flow.
+The Calls view includes an opt-in two-stage voice-code flow. Speech recognition
+uses only the Aliyun 智能语音交互 short-sentence (一句话识别) RESTful API; there is
+no local speech model. The default port is COM2, with independent 10-second
+prompt/code recordings, a six-digit code, and a 120-second deadline. Save the
+settings before calling; only the enabled ports use the interactive flow.
 
-Local tool locations are:
+`tools/ffmpeg/ffmpeg.exe` converts modem AMR recordings to WAV before upload (a
+configured `ffmpeg_exe` takes precedence); `tools/lpac/lpac.exe` is used by the
+separate eSIM operations.
 
-- `tools/whisper/whisper-cli.exe` and `tools/whisper/ggml-base.bin`
-- `tools/ffmpeg/ffmpeg.exe` for AMR conversion
-- `tools/lpac/lpac.exe` for the separate eSIM operations
-
-Valid configured speech-tool paths take precedence; otherwise the application
-looks for the bundled files relative to the working directory and executable.
-Keep the Whisper DLLs beside its executable. Local Whisper transcription runs
-one recording at a time, so it is only practical for a few simultaneous calls.
-
-#### Ports and Aliyun online recognition
+#### Ports and Aliyun configuration
 
 The port setting accepts a comma-separated list of up to 32 ports (for example
 `COM2,COM5`); each listed port runs its own independent voice flow.
 
-Set "Recognition" to Aliyun online to use the Aliyun 智能语音交互 short-sentence
-(一句话识别) RESTful API, which handles many calls in parallel. In the Aliyun panel
-enter the project AppKey and either a console token (expires, for testing) or a
-RAM AccessKey ID/Secret, from which the gateway creates and renews tokens
-automatically. Choose the project region and the model sample rate (16 kHz for
-general models, 8 kHz for telephone models); the language comes from the
-project's model, not the language setting. Use "Test connection" to verify.
+In the Aliyun panel enter the project AppKey and either a console token
+(expires, for testing) or a RAM AccessKey ID/Secret, from which the gateway
+creates and renews tokens automatically. Choose the project region and the
+model sample rate (16 kHz for general models, 8 kHz for telephone models); the
+language comes from the project's model. Use "Test connection" to verify.
 Credentials stay on the gateway (`GET/PUT /api/settings/aliyun-asr`,
 `POST /api/settings/aliyun-asr/test`) and secrets are never returned to the
-browser. If an Aliyun request fails, that recording falls back to local Whisper.
-When Aliyun is selected, recordings are sent to Aliyun for recognition.
+browser. The flow cannot be enabled until Aliyun is configured. Recordings are
+sent to Aliyun for recognition; ordinary call recordings are also transcribed
+by Aliyun when it is configured.
 
 The enabled voice-flow port answers without the ordinary auto-answer delay;
 other calls retain their configured delay. After answering, the flow
 records/downloads/transcribes the prompt while the call remains connected.
 Record enough of the repeated prompt to capture both complete instructions.
-The full recording is transcribed in one local pass, and each recognized
+The full recording is transcribed in one pass, and each recognized
 press instruction is compared. At least two clear readings of the same digit
 are required before DTMF. Quoted digits are accepted, but conflicting choices
 and multi-digit instructions are rejected. Each reading and the comparison
@@ -148,26 +140,24 @@ call test. Ordinary calls do not receive these audio changes.
 
 The call log shows stages, both transcripts, the sent digit, the resulting code,
 recording downloads, and cancellation. Codes retain leading zeroes. A restart
-marks unfinished jobs interrupted and never replays DTMF. Apart from the optional
-Aliyun recognition above, no audio or code is sent to OpenAI, WorldCode, or
+marks unfinished jobs interrupted and never replays DTMF. Apart from Aliyun
+recognition, no audio or code is sent to other services, WorldCode, or
 webhooks by this flow. Other incoming calls keep
 the existing ordinary recording behavior.
 
-The prompt window and local recognition must finish before the remote IVR
+The prompt window and Aliyun recognition must finish before the remote IVR
 hangs up; increasing the application's deadline cannot extend a call ended by
-the remote party. Use a complete first prompt and the matching language when
-tuning a short IVR. The flow never sends a delayed digit to an ended or changed
-call.
+the remote party. Use a complete first prompt and an Aliyun model matching the
+prompt language when tuning a short IVR. The flow never sends a delayed digit to
+an ended or changed call.
 
 The control API is authenticated: `GET/PUT /api/settings/voice-otp`,
 `POST /api/calls/{id}/voice-cancel`, and
 `GET /api/calls/{id}/recording?stage=prompt|code`.
 
 Run `cargo test voice_otp` for hardware-free parsing, persistence, ordering,
-cancellation, and restart checks. The opt-in `voice_otp_local_whisper_pipeline`
-test uses `VOICE_OTP_SMOKE_PROMPT` and `VOICE_OTP_SMOKE_CODE` WAV paths to exercise
-the actual local tools. Real in-call AMR download, recording restart, DTMF
-delivery, and timing still require the approved COM2 call test; the application
+cancellation, and restart checks. Real in-call AMR download, recording restart,
+DTMF delivery, and timing require a real call test; the application
 does not initiate that test call.
 
 ## 🚀 Running the Application

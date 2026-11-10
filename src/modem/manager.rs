@@ -96,6 +96,16 @@ pub struct ModemManager {
     /// repeated samples confirm the new card before teardown/reinitialization.
     identity_revalidating_ports: RwLock<HashSet<String>>,
     transcribe_config: RwLock<Option<Arc<TranscribeConfig>>>,
+    restart_statuses: RwLock<HashMap<String, RestartStatus>>,
+}
+
+/// Progress/result of an operator-requested port restart, shown on the dashboard.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RestartStatus {
+    /// resetting | initializing | checking | ok | no_network | no_sim | no_response
+    pub state: String,
+    pub message: String,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1176,6 +1186,7 @@ impl ModemManager {
             manual_restarting_ports: RwLock::new(HashSet::new()),
             msim_managed_ports: RwLock::new(HashSet::new()),
             identity_revalidating_ports: RwLock::new(HashSet::new()),
+            restart_statuses: RwLock::new(HashMap::new()),
             transcribe_config: RwLock::new(TranscribeConfig::from_settings(&config.settings)),
         }
     }
@@ -1723,7 +1734,9 @@ impl ModemManager {
                     }
 
                     if attempt < ICCID_READ_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(ICCID_RETRY_DELAY_MS)).await;
+                        // SIM busy right after power-up/restart can last several seconds.
+                        let delay = if Modem::is_sim_busy_error(&e) { 2000 } else { ICCID_RETRY_DELAY_MS };
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
                         continue;
                     }
                     log::debug!(
@@ -2317,6 +2330,7 @@ impl ModemManager {
                                 || lower.contains("wouldblock")
                                 || lower.contains("timeout")
                                 || lower.contains("timed out")
+                                || Modem::is_sim_busy_error(&std::io::Error::other(e.to_string()))
                         })
                         .unwrap_or(false);
 
@@ -2346,6 +2360,7 @@ impl ModemManager {
                                 || lower.contains("wouldblock")
                                 || lower.contains("timeout")
                                 || lower.contains("timed out")
+                                || Modem::is_sim_busy_error(&std::io::Error::other(e.to_string()))
                         })
                         .unwrap_or(false);
 
@@ -3097,6 +3112,121 @@ impl ModemManager {
 
     pub async fn get_modem_by_com_port(&self, com_port: &str) -> Option<Arc<Modem>> {
         self.modems.read().await.get(com_port).cloned()
+    }
+
+    pub async fn get_restart_statuses(&self) -> HashMap<String, RestartStatus> {
+        self.restart_statuses.read().await.clone()
+    }
+
+    async fn set_restart_status(&self, com_port: &str, state: &str, message: String) {
+        log::info!("[manual-restart {}] {}: {}", com_port, state, message);
+        self.restart_statuses.write().await.insert(com_port.to_string(), RestartStatus {
+            state: state.to_string(),
+            message,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        });
+    }
+
+    /// Why a manual restart must not run now (active call, voice OTP, eSIM session, running restart).
+    pub async fn restart_block_reason(&self, com_port: &str) -> Option<String> {
+        if self.restart_statuses.read().await.get(com_port)
+            .is_some_and(|status| matches!(status.state.as_str(), "resetting" | "initializing" | "checking"))
+        {
+            return Some("Restart already in progress".into());
+        }
+        let modem = self.get_modem_by_com_port(com_port).await?;
+        if modem.voice_otp_call_id.lock().await.is_some() {
+            return Some("Voice OTP call in progress".into());
+        }
+        if modem.inbound_call_id.lock().await.is_some() || modem.outbound_call_id.lock().await.is_some() {
+            return Some("Call in progress".into());
+        }
+        if modem.is_esim_mode().await {
+            return Some("eSIM session active".into());
+        }
+        None
+    }
+
+    /// Operator restart: reset the module (AT+CFUN=1,1), re-initialise the port and report the outcome.
+    pub async fn manual_restart_port(
+        self: Arc<Self>,
+        com_port: String,
+        sse_manager: Arc<SseManager>,
+        transcribe_cfg: Option<Arc<TranscribeConfig>>,
+    ) {
+        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+        const NETWORK_TIMEOUT: Duration = Duration::from_secs(40);
+        let Some(device) = self.devices.iter().find(|device| device.com_port.eq_ignore_ascii_case(&com_port)).cloned() else {
+            return;
+        };
+        let port = device.com_port.clone();
+        self.set_restart_status(&port, "resetting", "Sending AT+CFUN=1,1".into()).await;
+        if let Some(modem) = self.get_modem_by_com_port(&port).await {
+            let reply = modem.reset_module().await;
+            log::info!("[manual-restart {}] reset reply: {}", port, reply);
+        } else {
+            self.stop_unavailable_port_worker(&port).await;
+            let port_lock = self.port_open_lock(&port).await;
+            let _guard = port_lock.lock().await;
+            if !Modem::send_reset_on_port(&port, device.baud_rate).await {
+                log::warn!("[manual-restart {}] module did not acknowledge reset; re-initialising anyway", port);
+            }
+        }
+        if let Err(error) = self.clone().restart_port(&port, sse_manager, transcribe_cfg).await {
+            self.set_restart_status(&port, "no_response", error).await;
+            return;
+        }
+        self.set_restart_status(&port, "initializing", "Waiting for the module to come back".into()).await;
+
+        let started = Instant::now();
+        let modem = loop {
+            if let Some(modem) = self.get_modem_by_com_port(&port).await {
+                break modem;
+            }
+            if started.elapsed() > RECOVERY_TIMEOUT {
+                let snapshot = self.get_port_runtime_snapshots().await.into_iter().find(|s| s.com_port == port);
+                let module_connected = snapshot.as_ref().is_some_and(|s| s.module_connected);
+                let (state, message) = if module_connected {
+                    ("no_sim", "Module answers but no SIM is ready (check the SIM card)".to_string())
+                } else {
+                    ("no_response", format!("Module did not respond within {}s", RECOVERY_TIMEOUT.as_secs()))
+                };
+                self.set_restart_status(&port, state, message).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+
+        self.set_restart_status(&port, "checking", "Checking SIM, IMEI and network".into()).await;
+        let sim = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_status()).await
+            .map_err(|_| "timeout".to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        let imei = tokio::time::timeout(Duration::from_secs(5), modem.get_imei()).await.ok()
+            .and_then(|result| result.ok()).flatten();
+        match &sim {
+            Ok(Some(status)) if status.trim().eq_ignore_ascii_case("READY") => {}
+            other => {
+                self.set_restart_status(&port, "no_sim", format!("SIM not ready: {:?}, IMEI {:?}", other, imei)).await;
+                return;
+            }
+        }
+        let network_started = Instant::now();
+        loop {
+            let status = modem.check_network_registration().await.ok().flatten();
+            let code = status.as_ref().map(|s| s.status_code().trim().to_string());
+            if matches!(code.as_deref(), Some("1" | "5")) {
+                let roaming = code.as_deref() == Some("5");
+                self.set_restart_status(&port, "ok", format!("SIM READY, IMEI {}, network registered{}",
+                    imei.as_deref().unwrap_or("-"), if roaming { " (roaming)" } else { "" })).await;
+                return;
+            }
+            if network_started.elapsed() > NETWORK_TIMEOUT {
+                self.set_restart_status(&port, "no_network", format!("SIM READY, IMEI {}, but not registered (stat {:?})",
+                    imei.as_deref().unwrap_or("-"), code)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
     }
 
     async fn open_msim_serial_with_retry<T, F, Fut>(mut open: F) -> std::io::Result<T>

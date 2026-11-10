@@ -255,6 +255,10 @@ pub async fn run_api(
             }),
         )
         .route(
+            "/sims/restart-status",
+            get(restart_status).with_state(modem_manager.clone()),
+        )
+        .route(
             "/sims/{sim_id}/info",
             get(get_enhanced_sim_info).with_state(modem_manager.clone()),
         )
@@ -974,8 +978,10 @@ async fn get_all_sim_info(
             "memory_status": if has_sim { memory_status_data.as_ref().and_then(|s| s.as_ref()).map(|s| format_memory_status(s)) } else { None },
             "phone_number": if has_sim { phone_number } else { None }
         }));
-        let port_busy = sim_status_error.as_deref()
-            .is_some_and(|error| error.contains("timeout") || error.contains("busy"));
+        let port_busy = sim_status_error.as_deref().is_some_and(|error| {
+            error.contains("timeout") || error.contains("busy")
+                || crate::modem::core::Modem::is_sim_busy_error(&std::io::Error::other(error.to_string()))
+        });
         let mut last_good = LAST_GOOD_ROWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if has_sim && live_signal {
             last_good.insert(com_port.clone(), (std::time::Instant::now(), sim_id.clone(), details.last().unwrap().clone()));
@@ -1162,6 +1168,10 @@ struct RestartPortsRequest {
     com_ports: Vec<String>,
 }
 
+async fn restart_status(State(mm): State<ModemManagerRef>) -> Response {
+    Json(json!(mm.get_restart_statuses().await)).into_response()
+}
+
 async fn restart_ports(
     State(state): State<RestartPortsState>,
     Json(request): Json<RestartPortsRequest>,
@@ -1183,6 +1193,7 @@ async fn restart_ports(
     let mut seen = HashSet::new();
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
+    let phone_task_running = get_phone_number_task().read().await.running;
 
     for requested in request.com_ports {
         let normalized = requested.trim().to_ascii_uppercase();
@@ -1198,6 +1209,20 @@ async fn restart_ports(
             }));
             continue;
         };
+        let block = if phone_task_running {
+            Some("Phone-number task (USSD/free SMS) is running".to_string())
+        } else {
+            state.mm.restart_block_reason(&com_port).await
+        };
+        if let Some(reason) = block {
+            log::warn!("[manual-restart {}] rejected: {}", com_port, reason);
+            rejected.push(json!({
+                "com_port": com_port,
+                "success": false,
+                "message": reason,
+            }));
+            continue;
+        }
 
         accepted.push(json!({
             "com_port": com_port,
@@ -1208,14 +1233,7 @@ async fn restart_ports(
         let mm = state.mm.clone();
         let sse = state.sse.clone();
         let transcribe_cfg = state.transcribe_cfg.clone();
-        tokio::spawn(async move {
-            if let Err(error) = mm
-                .restart_port(&com_port, sse, transcribe_cfg)
-                .await
-            {
-                log::error!("[manual-restart] {} failed: {}", com_port, error);
-            }
-        });
+        tokio::spawn(mm.manual_restart_port(com_port, sse, transcribe_cfg));
     }
 
     let accepted_count = accepted.len();

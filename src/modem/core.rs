@@ -1243,6 +1243,55 @@ impl Modem {
             .await;
     }
 
+    /// Manual module reset on a live connection; returns the reply (or the error) for logging.
+    pub async fn reset_module(&self) -> String {
+        match self.send_command_outer_timeout("AT+CFUN=1,1\r\n", 8).await {
+            Ok(response) => Self::format_log(&response),
+            Err(error) => format!("no reply ({})", error),
+        }
+    }
+
+    /// Send AT+CFUN=1,1 on a port that has no live modem handle. Returns false if the
+    /// port cannot be opened or nothing answers.
+    pub async fn send_reset_on_port(com_port: &str, baud_rate: u32) -> bool {
+        let open_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking({
+                let port = com_port.to_string();
+                move || {
+                    tokio_serial::new(&port, baud_rate)
+                        .timeout(Duration::from_millis(300))
+                        .flow_control(tokio_serial::FlowControl::None)
+                        .open_native_async()
+                }
+            }),
+        )
+        .await;
+        let Ok(Ok(Ok(mut stream))) = open_result else {
+            return false;
+        };
+        if stream.write_all(b"AT+CFUN=1,1\r\n").await.is_err() || stream.flush().await.is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 256];
+        let mut response = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if response.contains("OK") || response.contains("ERROR") {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                _ => {}
+            }
+        }
+        info!("[manual-restart {}] reset reply without live handle: {:?}", com_port, response.trim());
+        response.contains("OK")
+    }
+
     /// Quick liveness probe: send AT with a short timeout and expect OK.
     pub async fn probe_alive(&self) -> bool {
         matches!(
@@ -2201,20 +2250,25 @@ impl Modem {
             .replace("\n", "\\n")
     }
 
-    pub(crate) fn is_recoverable_sim_error(err: &io::Error) -> bool {
+    fn cme_code(err: &io::Error) -> Option<String> {
         let upper = err.to_string().to_ascii_uppercase();
-        let Some((_, tail)) = upper.split_once("+CME") else {
-            return false;
-        };
-        let Some(tail) = tail.trim_start_matches(|character: char| character.is_ascii_whitespace() || character == ':').strip_prefix("ERROR") else {
-            return false;
-        };
-        let code: String = tail
+        let (_, tail) = upper.split_once("+CME")?;
+        let tail = tail.trim_start_matches(|character: char| character.is_ascii_whitespace() || character == ':').strip_prefix("ERROR")?;
+        Some(tail
             .trim_start_matches(|character: char| character.is_ascii_whitespace() || character == ':')
             .chars()
             .take_while(|character| character.is_ascii_digit())
-            .collect();
-        matches!(code.as_str(), "13" | "50")
+            .collect())
+    }
+
+    /// +CME ERROR 13 (SIM failure) / 50: recovered by a module restart.
+    pub(crate) fn is_recoverable_sim_error(err: &io::Error) -> bool {
+        matches!(Self::cme_code(err).as_deref(), Some("13" | "50"))
+    }
+
+    /// +CME ERROR 14 (SIM busy): transient while the SIM initialises; retry without restarting.
+    pub(crate) fn is_sim_busy_error(err: &io::Error) -> bool {
+        Self::cme_code(err).as_deref() == Some("14")
     }
 
     /// Whether an `AT+CFUN=1,1` SIM recovery may run now. eSIM machines recover with
@@ -2414,10 +2468,35 @@ impl Modem {
             })
             .await;
 
-        let first_err = match first_try {
+        let mut first_err = match first_try {
             Ok(status) => return Ok(status),
             Err(e) => e,
         };
+
+        const SIM_BUSY_RETRIES: u8 = 5;
+        for attempt in 1..=SIM_BUSY_RETRIES {
+            if !Self::is_sim_busy_error(&first_err) {
+                break;
+            }
+            info!("[CPIN] {} SIM busy (+CME ERROR: 14), retry {}/{} in 1s", self.com_port, attempt, SIM_BUSY_RETRIES);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            match self
+                .get_modem_info("AT+CPIN?\r\n", |response| {
+                    response
+                        .lines()
+                        .find(|line| line.starts_with("+CPIN:"))
+                        .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
+                })
+                .await
+            {
+                Ok(status) => return Ok(status),
+                Err(e) => first_err = e,
+            }
+        }
+        if Self::is_sim_busy_error(&first_err) {
+            warn!("[CPIN] {} SIM still busy after {} retries", self.com_port, SIM_BUSY_RETRIES);
+            return Err(first_err);
+        }
 
         if !Self::is_recoverable_sim_error(&first_err) || !self.sim_recovery_allowed().await {
             return Err(first_err);
@@ -4097,6 +4176,16 @@ mod tests {
     use super::Modem;
 
     #[test]
+    fn sim_busy_is_transient_not_recoverable() {
+        for response in ["+CME ERROR: 14", "Command failed: \\r\\n+CME ERROR: 14\\r\\n", "+cme error 14"] {
+            assert!(Modem::is_sim_busy_error(&std::io::Error::other(response)), "{}", response);
+        }
+        for response in ["+CME ERROR: 13", "+CME ERROR: 140", "+CMS ERROR: 14", "timeout"] {
+            assert!(!Modem::is_sim_busy_error(&std::io::Error::other(response)), "{}", response);
+        }
+    }
+
+    #[test]
     fn cusd_reply_decodes_ucs2_and_keeps_commas() {
         let hex = super::string_to_ucs2_pub("Your number is 07848998171, thanks").unwrap();
         assert_eq!(super::parse_cusd(&format!("+CUSD: 0,\"{}\",72", hex)).unwrap(), "Your number is 07848998171, thanks");
@@ -4114,7 +4203,7 @@ mod tests {
 
     #[test]
     fn recoverable_sim_error_rejects_other_codes() {
-        for response in ["+CME ERROR: 10", "+CME ERROR: 130", "+CME ERROR: 500", "+CMS ERROR: 50", "ERROR", "timeout"] {
+        for response in ["+CME ERROR: 10", "+CME ERROR: 130", "+CME ERROR: 500", "+CMS ERROR: 50", "ERROR", "timeout", "+CME ERROR: 14"] {
             assert!(!Modem::is_recoverable_sim_error(&std::io::Error::other(response)), "{}", response);
         }
     }

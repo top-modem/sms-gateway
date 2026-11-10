@@ -214,6 +214,10 @@ class ApiClient {
         return FetchApi.post('/api/sims/restart-ports', { com_ports: comPorts }, {}, 'application/json');
     }
 
+    async getRestartStatus() {
+        return FetchApi.get('/api/sims/restart-status');
+    }
+
     // ── 火狐狸 platform integration ─────────────────────────────────────────
 
     /**

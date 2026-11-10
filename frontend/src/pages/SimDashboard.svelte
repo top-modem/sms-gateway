@@ -149,6 +149,25 @@
   let restartPortsBusy = $state(false);
   let restartMessage = $state('');
   let restartMessageError = $state(false);
+  let restartStatuses = $state({});
+  let restartPorts = $state([]);
+  let restartTimer = null;
+  const RESTART_RUNNING = ['resetting', 'initializing', 'checking'];
+
+  async function pollRestartStatus() {
+    clearTimeout(restartTimer);
+    try {
+      const res = await apiClient.getRestartStatus();
+      restartStatuses = res?.data ?? res ?? {};
+    } catch (e) {
+      console.error('Restart status failed', e);
+    }
+    if (restartPorts.some((port) => RESTART_RUNNING.includes(restartStatuses[port]?.state))) {
+      restartTimer = setTimeout(pollRestartStatus, 2000);
+    } else if (restartPorts.length > 0) {
+      fetchData();
+    }
+  }
 
   function getSelectedComPorts() {
     return rows
@@ -164,7 +183,7 @@
     if (comPorts.length === 0) return;
 
     const confirmed = window.confirm(
-      `${$t('restart_ports_confirm')}\n\n${comPorts.join(', ')}`
+      `${$t('restart_ports_confirm')}\n${$t('restart_ports_confirm_reset')}\n\n${comPorts.join(', ')}`
     );
     if (!confirmed) return;
 
@@ -177,12 +196,14 @@
       const acceptedCount = Number(payload.accepted_count ?? 0);
       const rejected = Array.isArray(payload.rejected) ? payload.rejected : [];
       const rejectedCount = Number(payload.rejected_count ?? rejected.length);
-      const rejectedPorts = rejected.map((item) => item.com_port).filter(Boolean);
+      const rejectedPorts = rejected.map((item) => `${item.com_port} (${item.message})`).filter(Boolean);
       restartMessage = $t('restart_ports_accepted', { n: acceptedCount });
       if (rejectedPorts.length > 0) {
         restartMessage += ` ${$t('restart_ports_rejected', { ports: rejectedPorts.join(', ') })}`;
       }
       restartMessageError = rejectedCount > 0;
+      restartPorts = (Array.isArray(payload.accepted) ? payload.accepted : []).map((item) => item.com_port);
+      setTimeout(pollRestartStatus, 500);
       selected = new Set();
       lastClickedRowIndex = null;
       await fetchData();
@@ -232,7 +253,7 @@
     pollTimer = setInterval(fetchData, 4000);
   });
 
-  onDestroy(() => clearInterval(pollTimer));
+  onDestroy(() => { clearInterval(pollTimer); clearTimeout(restartTimer); });
 
   // ── Selection ─────────────────────────────────────────────────────────────
   function getSelectedSimIds() {
@@ -417,6 +438,25 @@
       ? 'bg-red-50 border-red-200 text-red-700 dark:bg-red-950/30 dark:border-red-900 dark:text-red-300'
       : 'bg-green-50 border-green-200 text-green-700 dark:bg-green-950/30 dark:border-green-900 dark:text-green-300'}">
       {restartMessage}
+      {#if restartPorts.length > 0}
+        <ul class="mt-1 space-y-0.5">
+          {#each restartPorts as port}
+            {@const status = restartStatuses[port]}
+            <li class="flex items-center gap-2 {status?.state === 'ok' ? 'text-green-700 dark:text-green-300' : RESTART_RUNNING.includes(status?.state) || !status ? 'text-gray-700 dark:text-gray-300' : 'text-red-700 dark:text-red-300'}">
+              {#if RESTART_RUNNING.includes(status?.state) || !status}
+                <Icon icon="carbon:renew" class="w-3.5 h-3.5 animate-spin" />
+              {:else if status.state === 'ok'}
+                <Icon icon="carbon:checkmark-filled" class="w-3.5 h-3.5" />
+              {:else}
+                <Icon icon="carbon:warning-filled" class="w-3.5 h-3.5" />
+              {/if}
+              <span class="font-mono">{port}</span>
+              <span>{$t(`restart_state_${status?.state ?? 'resetting'}`)}</span>
+              {#if status?.message}<span class="opacity-70">— {status.message}</span>{/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
     </div>
   {/if}
 

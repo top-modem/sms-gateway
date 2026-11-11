@@ -180,25 +180,37 @@ pub(crate) async fn transcribe(amr_bytes: &[u8], ffmpeg_exe: &str) -> Result<Str
         bail!("Aliyun ASR is not configured (AppKey and token or AccessKey required)");
     }
     let started = std::time::Instant::now();
-    let wav = crate::transcribe::convert_to_wav(amr_bytes, ffmpeg_exe, settings.sample_rate).await?;
+    let (audio, format) = match crate::transcribe::convert_to_opus(amr_bytes, ffmpeg_exe, settings.sample_rate).await {
+        Ok(audio) => (audio, "opus"),
+        Err(error) => {
+            log::warn!("Opus conversion failed, sending WAV instead: {:#}", error);
+            (crate::transcribe::convert_to_wav(amr_bytes, ffmpeg_exe, settings.sample_rate).await?, "wav")
+        }
+    };
     let converted_ms = started.elapsed().as_millis();
-    let text = recognize(&settings, wav).await?;
-    log::info!("Aliyun ASR timing: ffmpeg {} ms, recognition {} ms", converted_ms, started.elapsed().as_millis() - converted_ms);
+    let size = audio.len();
+    let text = recognize_format(&settings, audio, format).await?;
+    log::info!("Aliyun ASR timing: ffmpeg {} ms, upload+recognition {} ms ({} {} bytes)",
+        converted_ms, started.elapsed().as_millis() - converted_ms, format, size);
     Ok(text)
 }
 
 pub(crate) async fn recognize(settings: &AliyunAsrSettings, wav: Vec<u8>) -> Result<String> {
+    recognize_format(settings, wav, "wav").await
+}
+
+async fn recognize_format(settings: &AliyunAsrSettings, audio: Vec<u8>, format: &str) -> Result<String> {
     let token = access_token(settings).await?;
     let url = format!(
-        "https://nls-gateway-{}.aliyuncs.com/stream/v1/asr?appkey={}&format=wav&sample_rate={}&enable_punctuation_prediction=true&enable_inverse_text_normalization=true",
-        settings.region, urlencoding::encode(&settings.app_key), settings.sample_rate);
+        "https://nls-gateway-{}.aliyuncs.com/stream/v1/asr?appkey={}&format={}&sample_rate={}&enable_punctuation_prediction=true&enable_inverse_text_normalization=true",
+        settings.region, urlencoding::encode(&settings.app_key), format, settings.sample_rate);
     let mut attempt = 0;
     let response = loop {
         attempt += 1;
         let sent = client()?.post(&url)
             .header("X-NLS-Token", &token)
             .header("Content-Type", "application/octet-stream")
-            .body(wav.clone())
+            .body(audio.clone())
             .send().await.map_err(reqwest::Error::without_url);
         match sent {
             Ok(response) => break response,

@@ -208,8 +208,9 @@ async fn survives_hangup<Output>(
     }
 }
 
-/// The IVR hangs up roughly 15 s after answering when no key is pressed, and recognition
-/// takes about as long as the audio, so the prompt is checked in short slices.
+/// The IVR hangs up about 15 s after answering when no key is pressed. Its first
+/// instruction lasts about 4 s, so it is recognised on its own before later slices.
+const FIRST_PROMPT_SEGMENT: Duration = Duration::from_millis(4500);
 const PROMPT_SEGMENT: Duration = Duration::from_secs(3);
 
 fn prompt_segment_file(prompt_file: &str, index: usize) -> String {
@@ -263,7 +264,8 @@ async fn run(
     let mut remote_ended = false;
     let mut early_digit = None;
     loop {
-        let wait = (segment_started + PROMPT_SEGMENT).min(listen_until).saturating_duration_since(Instant::now());
+        let slice = if segment_index == 0 { FIRST_PROMPT_SEGMENT } else { PROMPT_SEGMENT };
+        let wait = (segment_started + slice).min(listen_until).saturating_duration_since(Instant::now());
         match cancellable(async { tokio::time::sleep(wait).await; Ok(()) }, cancel, deadline).await {
             Ok(()) => io.stop().await?,
             Err(error) if error.is::<RemoteCallEnded>() => {
@@ -302,7 +304,7 @@ async fn run(
         state(io, progress, "transcribing_prompt").await?;
         match survives_hangup(io.transcribe(&prompt_audio), cancel, deadline).await {
             Ok(text) => {
-                if let Some(digit) = crate::transcribe::early_press_digit(&text) {
+                if let Ok(VoicePrompt::PressDigit(digit)) = crate::transcribe::parse_voice_prompt(&text, settings.otp_length) {
                     record_prompt_readings(progress, &text);
                     early_digit = Some(digit);
                     break;

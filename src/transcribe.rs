@@ -208,22 +208,6 @@ pub(crate) fn parse_voice_prompt(text: &str, otp_length: usize) -> Result<VoiceP
     Ok(VoicePrompt::DirectOtp(extract_voice_otp(text, otp_length)?))
 }
 
-/// Press instruction heard in a partial prompt recording. A lone reading counts only when
-/// more speech follows it, so a digit cut off at the end of the recording is never sent.
-pub(crate) fn early_press_digit(text: &str) -> Option<char> {
-    let Ok(VoicePrompt::PressDigit(digit)) = parse_voice_prompt(text, 6) else { return None };
-    if voice_prompt_readings(text).ok()?.len() >= 2 {
-        return Some(digit);
-    }
-    let lower = text.to_lowercase();
-    let tail = lower.trim_end_matches(|character: char| character.is_whitespace() || character.is_ascii_punctuation()
-        || "，。！？、；：“”‘’「」『』".contains(character));
-    let last_word = tail.rsplit(|character: char| !character.is_alphanumeric()).next().unwrap_or("");
-    let ends_with_digit = spoken_digit(last_word).is_some()
-        || tail.chars().last().is_some_and(|character| spoken_digit(&character.to_string()).is_some());
-    (!ends_with_digit).then_some(digit)
-}
-
 pub(crate) fn extract_voice_otp(text: &str, expected_length: usize) -> Result<String> {
     if !(4..=8).contains(&expected_length) {
         bail!("OTP length must be between 4 and 8 digits");
@@ -266,17 +250,33 @@ pub(crate) fn extract_voice_otp(text: &str, expected_length: usize) -> Result<St
 
 /// Convert an AMR recording to mono 16-bit WAV at `sample_rate` for cloud recognition.
 pub(crate) async fn convert_to_wav(amr_bytes: &[u8], ffmpeg_exe: &str, sample_rate: u32) -> Result<Vec<u8>> {
+    convert_audio(amr_bytes, ffmpeg_exe, sample_rate, false).await
+}
+
+/// Convert an AMR recording to mono OGG-Opus: about 16x smaller than WAV for slow uplinks.
+pub(crate) async fn convert_to_opus(amr_bytes: &[u8], ffmpeg_exe: &str, sample_rate: u32) -> Result<Vec<u8>> {
+    convert_audio(amr_bytes, ffmpeg_exe, sample_rate, true).await
+}
+
+async fn convert_audio(amr_bytes: &[u8], ffmpeg_exe: &str, sample_rate: u32, opus: bool) -> Result<Vec<u8>> {
     if amr_bytes.is_empty() || amr_bytes.len() > 5 * 1024 * 1024 {
         bail!("Recording must contain between 1 byte and 5 MB of audio");
     }
     let id = Uuid::new_v4().to_string();
     let amr_path = std::env::temp_dir().join(format!("{}.amr", id));
-    let wav_path = std::env::temp_dir().join(format!("{}.wav", id));
-    let _temp_files = TempAudioFiles(vec![amr_path.clone(), wav_path.clone()]);
+    let out_path = std::env::temp_dir().join(format!("{}.{}", id, if opus { "ogg" } else { "wav" }));
+    let _temp_files = TempAudioFiles(vec![amr_path.clone(), out_path.clone()]);
     tokio::fs::write(&amr_path, amr_bytes).await.context("failed to write temp AMR file")?;
     let rate = sample_rate.to_string();
+    let codec: &[&str] = if opus {
+        &["-c:a", "libopus", "-b:a", "16k", "-application", "voip", "-f", "ogg"]
+    } else {
+        &["-c:a", "pcm_s16le"]
+    };
     let child = hidden_command(ffmpeg_exe)
-        .args(["-y", "-i", amr_path.to_str().unwrap(), "-ar", &rate, "-ac", "1", "-c:a", "pcm_s16le", wav_path.to_str().unwrap()])
+        .args(["-y", "-i", amr_path.to_str().unwrap(), "-ar", &rate, "-ac", "1"])
+        .args(codec)
+        .arg(out_path.to_str().unwrap())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -289,7 +289,7 @@ pub(crate) async fn convert_to_wav(amr_bytes: &[u8], ffmpeg_exe: &str, sample_ra
     if !output.status.success() {
         bail!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    tokio::fs::read(&wav_path).await.context("failed to read converted WAV")
+    tokio::fs::read(&out_path).await.context("failed to read converted audio")
 }
 
 #[cfg(test)]
@@ -372,15 +372,12 @@ mod voice_otp_tests {
     }
 
     #[test]
-    fn voice_otp_early_press_digit_waits_for_speech_after_a_lone_reading() {
-        assert_eq!(early_press_digit("好，验证码请按一主要接收wifi app"), Some('1'));
-        assert_eq!(early_press_digit("To hear your code, press five. To hear"), Some('5'));
-        assert_eq!(early_press_digit("请按九。请按9。"), Some('9'));
-        assert_eq!(early_press_digit("好，验证码请按一。"), None);
-        assert_eq!(early_press_digit("To hear your code, press five."), None);
-        assert_eq!(early_press_digit("好，验证码请按"), None);
-        assert_eq!(early_press_digit("请按9。请按6。"), None);
-        assert_eq!(early_press_digit("Your code is 005861."), None);
+    fn voice_otp_recognises_the_instructions_heard_in_the_user_prompt_clip() {
+        // Aliyun results for the first 4-5 s of a real WhatsApp prompt.
+        for text in ["接收wifi验证码按一。", "接收whaup验证码，按一主客。", "接收whaup验证码，按一点要支收。"] {
+            assert_eq!(parse_voice_prompt(text, 6).unwrap(), VoicePrompt::PressDigit('1'), "{text}");
+        }
+        assert!(parse_voice_prompt("就是wifi up验证码。", 6).is_err());
     }
 
     #[test]

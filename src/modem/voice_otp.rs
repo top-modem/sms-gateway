@@ -54,6 +54,7 @@ trait CallIo: Sync {
     fn record(&self, filename: &str) -> impl Future<Output = Result<()>> + Send;
     fn stop(&self) -> impl Future<Output = Result<()>> + Send;
     fn download(&self, filename: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
+    fn delete(&self, filename: &str) -> impl Future<Output = ()> + Send;
     fn transcribe(&self, audio: &[u8]) -> impl Future<Output = Result<String>> + Send;
     fn save_audio(&self, audio: &[u8], prompt: bool) -> impl Future<Output = Result<()>> + Send;
     fn progress(&self, progress: &VoiceOtpProgress) -> impl Future<Output = Result<()>> + Send;
@@ -106,6 +107,10 @@ impl CallIo for LocalCall {
             bail!("The modem returned an empty or invalid AMR recording");
         }
         Ok(audio)
+    }
+
+    async fn delete(&self, filename: &str) {
+        let _ = self.modem.send_command(&format!("AT+QFDEL=\"{}\"\r\n", filename)).await;
     }
 
     async fn transcribe(&self, audio: &[u8]) -> Result<String> {
@@ -203,6 +208,39 @@ async fn survives_hangup<Output>(
     }
 }
 
+/// The IVR hangs up roughly 15 s after answering when no key is pressed, and recognition
+/// takes about as long as the audio, so the prompt is checked in short slices.
+const PROMPT_SEGMENT: Duration = Duration::from_secs(3);
+
+fn prompt_segment_file(prompt_file: &str, index: usize) -> String {
+    if index == 0 { return prompt_file.to_string(); }
+    let stem = prompt_file.strip_suffix(".amr").unwrap_or(prompt_file);
+    format!("{}_{}.amr", stem, index)
+}
+
+/// Joins AMR recordings by dropping the repeated file header of later slices.
+fn append_amr(all: &mut Vec<u8>, slice: &[u8]) {
+    let header: &[u8] = if slice.starts_with(b"#!AMR-WB\n") { b"#!AMR-WB\n" } else { b"#!AMR\n" };
+    if all.is_empty() {
+        all.extend_from_slice(slice);
+    } else if all.starts_with(header) && slice.starts_with(header) {
+        all.extend_from_slice(&slice[header.len()..]);
+    } else {
+        *all = slice.to_vec();
+    }
+}
+
+fn record_prompt_readings(progress: &mut VoiceOtpProgress, text: &str) {
+    progress.prompt_transcript = Some(text.to_string());
+    progress.prompt_readings = crate::transcribe::voice_prompt_readings(text).unwrap_or_default();
+    progress.prompt_comparison = Some(match progress.prompt_readings.len() {
+        0 => "incomplete",
+        _ if progress.prompt_readings.iter().any(|digit| *digit != progress.prompt_readings[0]) => "conflicting",
+        1 => "single",
+        _ => "matched",
+    }.into());
+}
+
 async fn run(
     io: &impl CallIo,
     settings: &VoiceOtpSettings,
@@ -216,28 +254,82 @@ async fn run(
     io.active().await?;
     io.prepare_audio().await?;
     state(io, progress, "recording_prompt").await?;
-    io.record(prompt_file).await?;
+    let listen_until = Instant::now() + Duration::from_secs(settings.prompt_seconds);
+    let mut segment_index = 0;
+    let mut segment = prompt_segment_file(prompt_file, 0);
+    let mut segment_started = Instant::now();
+    io.record(&segment).await?;
+    let mut prompt_audio = Vec::new();
     let mut remote_ended = false;
-    match cancellable(async { tokio::time::sleep(Duration::from_secs(settings.prompt_seconds)).await; Ok(()) }, cancel, deadline).await {
-        Ok(()) => io.stop().await?,
-        Err(error) if error.is::<RemoteCallEnded>() => {
-            remote_ended = true;
-            io.finish_remote_recording().await?;
+    let mut early_digit = None;
+    loop {
+        let wait = (segment_started + PROMPT_SEGMENT).min(listen_until).saturating_duration_since(Instant::now());
+        match cancellable(async { tokio::time::sleep(wait).await; Ok(()) }, cancel, deadline).await {
+            Ok(()) => io.stop().await?,
+            Err(error) if error.is::<RemoteCallEnded>() => {
+                remote_ended = true;
+                io.finish_remote_recording().await?;
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
+        let finished = segment.clone();
+        let mut last = remote_ended || Instant::now() >= listen_until;
+        if !last {
+            // Keep listening while the finished slice is recognised.
+            let next = prompt_segment_file(prompt_file, segment_index + 1);
+            match io.record(&next).await {
+                Ok(()) => {
+                    segment_index += 1;
+                    segment = next;
+                    segment_started = Instant::now();
+                }
+                Err(error) => {
+                    if io.active().await.is_ok() { return Err(error); }
+                    remote_ended = true;
+                    last = true;
+                }
+            }
+        }
+        if last { state(io, progress, "downloading_prompt").await?; }
+        match io.download(&finished).await {
+            Ok(audio) => append_amr(&mut prompt_audio, &audio),
+            Err(error) if last && prompt_audio.is_empty() => return Err(error),
+            Err(error) => log::warn!("Voice prompt slice {} could not be downloaded: {:#}", finished, error),
+        }
+        if finished != prompt_file { io.delete(&finished).await; }
+        if last { break; }
+        if prompt_audio.is_empty() { continue; }
+        state(io, progress, "transcribing_prompt").await?;
+        match survives_hangup(io.transcribe(&prompt_audio), cancel, deadline).await {
+            Ok(text) => {
+                if let Some(digit) = crate::transcribe::early_press_digit(&text) {
+                    record_prompt_readings(progress, &text);
+                    early_digit = Some(digit);
+                    break;
+                }
+            }
+            Err(error) if error.is::<VoiceCancelled>() => return Err(error),
+            Err(error) => log::warn!("Partial voice prompt recognition failed: {:#}", error),
+        }
+        state(io, progress, "recording_prompt").await?;
     }
-    state(io, progress, "downloading_prompt").await?;
-    let prompt_audio = io.download(prompt_file).await?;
+    if early_digit.is_some() {
+        // Starting the code recording also stops this slice, so a failure here is harmless.
+        let _ = io.stop().await;
+        io.delete(&segment).await;
+    }
     io.save_audio(&prompt_audio, true).await?;
-    state(io, progress, "transcribing_prompt").await?;
-    let prompt_text = survives_hangup(io.transcribe(&prompt_audio), cancel, deadline).await?;
-    progress.prompt_transcript = Some(prompt_text.clone());
-    progress.prompt_readings = crate::transcribe::voice_prompt_readings(&prompt_text).unwrap_or_default();
-    progress.prompt_comparison = Some(if progress.prompt_readings.len() < 2 { "incomplete" }
-        else if progress.prompt_readings.iter().all(|digit| *digit == progress.prompt_readings[0]) { "matched" }
-        else { "conflicting" }.into());
-    state(io, progress, "checking_prompt").await?;
-    let instruction = match crate::transcribe::compare_repeated_voice_prompt(&prompt_text, settings.otp_length) {
+    let instruction = if let Some(digit) = early_digit {
+        state(io, progress, "checking_prompt").await?;
+        Ok(VoicePrompt::PressDigit(digit))
+    } else {
+        state(io, progress, "transcribing_prompt").await?;
+        let prompt_text = survives_hangup(io.transcribe(&prompt_audio), cancel, deadline).await?;
+        record_prompt_readings(progress, &prompt_text);
+        state(io, progress, "checking_prompt").await?;
+        crate::transcribe::parse_voice_prompt(&prompt_text, settings.otp_length)
+    };
+    let instruction = match instruction {
         Ok(instruction) => instruction,
         Err(error) => {
             let reason = format!("No clear press instruction: {}", error);
@@ -398,6 +490,7 @@ mod tests {
             }
             Ok(vec![1])
         }
+        async fn delete(&self, filename: &str) { self.note(format!("delete:{filename}")); }
         async fn transcribe(&self, _audio: &[u8]) -> Result<String> { self.note("transcribe".into()); self.transcripts.lock().unwrap().pop_front().context("missing fake transcript") }
         async fn save_audio(&self, _audio: &[u8], _prompt: bool) -> Result<()> { Ok(()) }
         async fn progress(&self, _progress: &VoiceOtpProgress) -> Result<()> { Ok(()) }
@@ -513,6 +606,38 @@ mod tests {
         for reply in ["ERROR\r\n", "+CMUT: 2\r\nOK\r\n", "OK\r\n"] {
             assert!(Modem::parse_voice_microphone_state(reply).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn voice_otp_sends_dtmf_after_the_first_prompt_slice_names_a_key() {
+        let io = FakeCall::new(&["好，验证码请按一主要接收", "你的验证码是256490。"]);
+        let (_sender, receiver) = oneshot::channel();
+        let (_user_sender, mut cancellation) = VoiceCancellation::for_test(receiver);
+        let mut config = settings();
+        config.prompt_seconds = 20;
+        let started = std::time::Instant::now();
+        let mut progress = VoiceOtpProgress::default();
+        run(&io, &config, &mut progress, &mut cancellation, "prompt.amr", "code.amr").await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(progress.otp.as_deref(), Some("256490"));
+        assert_eq!(progress.dtmf, Some('1'));
+        assert_eq!(progress.prompt_comparison.as_deref(), Some("single"));
+        let events = io.events.lock().unwrap();
+        let position = |name: &str| events.iter().position(|event| event == name).unwrap();
+        assert!(position("record:prompt_1.amr") < position("download:prompt.amr"));
+        assert!(position("download:prompt.amr") < position("dtmf:1"));
+        assert!(position("delete:prompt_1.amr") < position("record:code.amr"));
+        assert!(position("record:code.amr") < position("dtmf:1"));
+    }
+
+    #[test]
+    fn voice_otp_prompt_slices_join_without_repeating_the_amr_header() {
+        let mut audio = Vec::new();
+        append_amr(&mut audio, b"#!AMR\nAB");
+        append_amr(&mut audio, b"#!AMR\nCD");
+        assert_eq!(audio, b"#!AMR\nABCD");
+        assert_eq!(prompt_segment_file("vpabc.amr", 0), "vpabc.amr");
+        assert_eq!(prompt_segment_file("vpabc.amr", 2), "vpabc_2.amr");
     }
 
     #[tokio::test]

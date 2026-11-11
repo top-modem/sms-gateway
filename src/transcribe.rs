@@ -208,12 +208,20 @@ pub(crate) fn parse_voice_prompt(text: &str, otp_length: usize) -> Result<VoiceP
     Ok(VoicePrompt::DirectOtp(extract_voice_otp(text, otp_length)?))
 }
 
-pub(crate) fn compare_repeated_voice_prompt(text: &str, otp_length: usize) -> Result<VoicePrompt> {
-    let instruction = parse_voice_prompt(text, otp_length)?;
-    if matches!(instruction, VoicePrompt::PressDigit(_)) && voice_prompt_readings(text)?.len() < 2 {
-        bail!("Two clear matching prompt repetitions are required before sending DTMF");
+/// Press instruction heard in a partial prompt recording. A lone reading counts only when
+/// more speech follows it, so a digit cut off at the end of the recording is never sent.
+pub(crate) fn early_press_digit(text: &str) -> Option<char> {
+    let Ok(VoicePrompt::PressDigit(digit)) = parse_voice_prompt(text, 6) else { return None };
+    if voice_prompt_readings(text).ok()?.len() >= 2 {
+        return Some(digit);
     }
-    Ok(instruction)
+    let lower = text.to_lowercase();
+    let tail = lower.trim_end_matches(|character: char| character.is_whitespace() || character.is_ascii_punctuation()
+        || "，。！？、；：“”‘’「」『』".contains(character));
+    let last_word = tail.rsplit(|character: char| !character.is_alphanumeric()).next().unwrap_or("");
+    let ends_with_digit = spoken_digit(last_word).is_some()
+        || tail.chars().last().is_some_and(|character| spoken_digit(&character.to_string()).is_some());
+    (!ends_with_digit).then_some(digit)
 }
 
 pub(crate) fn extract_voice_otp(text: &str, expected_length: usize) -> Result<String> {
@@ -356,11 +364,23 @@ mod voice_otp_tests {
     fn voice_otp_compares_both_prompt_repetitions() {
         let prompt = "要接听WhatsApp验证码请按九。要接听WhatsApp验证码请按9。";
         assert_eq!(voice_prompt_readings(prompt).unwrap(), vec!['9', '9']);
-        assert_eq!(compare_repeated_voice_prompt(prompt, 6).unwrap(), VoicePrompt::PressDigit('9'));
-        assert!(compare_repeated_voice_prompt("请按9。请按6。", 6).is_err());
-        assert!(compare_repeated_voice_prompt("请按9。要接听WhatsApp验证码请按", 6).is_err());
-        assert!(compare_repeated_voice_prompt("噪声，没有完整按键指令", 6).is_err());
-        assert_eq!(compare_repeated_voice_prompt("Your code is 005861.", 6).unwrap(), VoicePrompt::DirectOtp("005861".into()));
+        assert_eq!(parse_voice_prompt(prompt, 6).unwrap(), VoicePrompt::PressDigit('9'));
+        assert!(parse_voice_prompt("请按9。请按6。", 6).is_err());
+        assert_eq!(parse_voice_prompt("请按9。要接听WhatsApp验证码请按", 6).unwrap(), VoicePrompt::PressDigit('9'));
+        assert!(parse_voice_prompt("噪声，没有完整按键指令", 6).is_err());
+        assert_eq!(parse_voice_prompt("Your code is 005861.", 6).unwrap(), VoicePrompt::DirectOtp("005861".into()));
+    }
+
+    #[test]
+    fn voice_otp_early_press_digit_waits_for_speech_after_a_lone_reading() {
+        assert_eq!(early_press_digit("好，验证码请按一主要接收wifi app"), Some('1'));
+        assert_eq!(early_press_digit("To hear your code, press five. To hear"), Some('5'));
+        assert_eq!(early_press_digit("请按九。请按9。"), Some('9'));
+        assert_eq!(early_press_digit("好，验证码请按一。"), None);
+        assert_eq!(early_press_digit("To hear your code, press five."), None);
+        assert_eq!(early_press_digit("好，验证码请按"), None);
+        assert_eq!(early_press_digit("请按9。请按6。"), None);
+        assert_eq!(early_press_digit("Your code is 005861."), None);
     }
 
     #[test]

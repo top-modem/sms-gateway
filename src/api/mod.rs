@@ -987,9 +987,15 @@ async fn get_all_sim_info(
             error.contains("timeout") || error.contains("busy")
                 || crate::modem::core::Modem::is_sim_busy_error(&std::io::Error::other(error.to_string()))
         });
+        let absence_suspected = match modem_manager.get_modem_by_com_port(&com_port).await {
+            Some(modem) => modem.sim_absence_suspected.load(std::sync::atomic::Ordering::SeqCst),
+            None => false,
+        };
         let mut last_good = LAST_GOOD_ROWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if has_sim && live_signal {
             last_good.insert(com_port.clone(), (std::time::Instant::now(), sim_id.clone(), details.last().unwrap().clone()));
+        } else if absence_suspected || (!has_sim && !port_busy) {
+            last_good.remove(&com_port);
         } else if port_busy {
             if let Some((saved_at, saved_sim, row)) = last_good.get(&com_port) {
                 if *saved_sim == sim_id && saved_at.elapsed() < LAST_GOOD_MAX_AGE {
@@ -1009,6 +1015,13 @@ async fn get_all_sim_info(
         }
 
         let has_historical_sim = snapshot.last_sim_id.is_some();
+        let absence_suspected = match modem_manager.get_modem_by_com_port(&snapshot.com_port).await {
+            Some(modem) => modem.sim_absence_suspected.load(std::sync::atomic::Ordering::SeqCst),
+            None => false,
+        };
+        if absence_suspected {
+            LAST_GOOD_ROWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&snapshot.com_port);
+        }
         if identity_revalidating_ports.contains(&snapshot.com_port)
             && !manual_restarting_ports.contains(&snapshot.com_port)
             && !sim_unreadable_ports.contains(&snapshot.com_port)

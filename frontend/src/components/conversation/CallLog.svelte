@@ -447,7 +447,7 @@
               </div>
               {#if voice.error}<p class="mt-1 text-xs text-red-600 dark:text-red-400 break-words">{voice.error}</p>{/if}
               {#if voice.prompt_comparison}
-                <p class="mt-2 text-xs {voice.prompt_comparison === 'matched' ? 'text-green-700 dark:text-green-400' : 'text-amber-700 dark:text-amber-400'}">
+                <p class="mt-2 text-xs {voice.prompt_comparison === 'matched' || voice.prompt_comparison === 'single' ? 'text-green-700 dark:text-green-400' : 'text-amber-700 dark:text-amber-400'}">
                   {$t('voice_prompt_comparison')}: {$t(`voice_comparison_${voice.prompt_comparison}`)}
                 </p>
                 {#each voice.prompt_readings ?? [] as reading, index}

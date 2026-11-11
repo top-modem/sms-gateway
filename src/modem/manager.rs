@@ -4020,8 +4020,10 @@ impl ModemManager {
                             error!("[URC {}] failed to update phone on call {}: {}", sim_id, id, e);
                         }
                         // Also push an updated SSE event so the frontend shows the number.
+                        // +CLIP is often handled after auto-answer; keep the banner in the answered state then.
+                        let answered = call_answered || modem.inbound_call_answered.load(Ordering::SeqCst);
                         sse.send_call_event(CallEvent {
-                            event_type: "incoming_call".into(),
+                            event_type: if answered { "call_answered" } else { "incoming_call" }.into(),
                             sim_id: sim_id.clone(),
                             call_id: id.clone(),
                             phone: Some(phone.clone()),

@@ -124,6 +124,8 @@ pub struct Modem {
     pub voice_otp_cancel_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     pub voice_otp_finishing: std::sync::atomic::AtomicBool,
     pub voice_otp_dtmf_sent: std::sync::atomic::AtomicBool,
+    /// Set by a +CME 10/13/50 CPIN reply, cleared by CPIN READY; stale SIM rows must not be shown meanwhile.
+    pub sim_absence_suspected: std::sync::atomic::AtomicBool,
     /// Receives the `+CUSD:` URC, which arrives after the AT+CUSD command's OK.
     pub ussd_reply_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
     /// Reader task handle so we can abort and release COM resources on drop.
@@ -261,6 +263,7 @@ impl Modem {
             voice_otp_cancel_tx: tokio::sync::Mutex::new(None),
             voice_otp_finishing: std::sync::atomic::AtomicBool::new(false),
             voice_otp_dtmf_sent: std::sync::atomic::AtomicBool::new(false),
+            sim_absence_suspected: std::sync::atomic::AtomicBool::new(false),
             ussd_reply_tx: tokio::sync::Mutex::new(None),
             reader_task: Mutex::new(Some(reader_task)),
             command_task: Mutex::new(Some(command_task)),
@@ -2524,6 +2527,14 @@ impl Modem {
     }
 
     pub async fn get_sim_status(&self) -> io::Result<Option<String>> {
+        let result = self.read_sim_status().await;
+        if result.as_ref().is_ok_and(|status| status.as_deref().is_some_and(|value| value.trim().eq_ignore_ascii_case("READY"))) {
+            self.sim_absence_suspected.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn read_sim_status(&self) -> io::Result<Option<String>> {
         const CPIN_RECOVERY_RETRY_ATTEMPTS: u8 = 3;
         const CPIN_RECOVERY_RETRY_DELAY_SECS: u64 = 3;
 
@@ -2564,6 +2575,10 @@ impl Modem {
         if Self::is_sim_busy_error(&first_err) {
             warn!("[CPIN] {} SIM still busy after {} retries", self.com_port, SIM_BUSY_RETRIES);
             return Err(first_err);
+        }
+        if matches!(Self::cme_code(&first_err).as_deref(), Some("10" | "13" | "50")) {
+            // Set before the slow restart recovery; callers often time out and drop this future.
+            self.sim_absence_suspected.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         if !Self::is_recoverable_sim_error(&first_err) || !self.sim_recovery_allowed().await {

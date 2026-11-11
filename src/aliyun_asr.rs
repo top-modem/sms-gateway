@@ -179,8 +179,12 @@ pub(crate) async fn transcribe(amr_bytes: &[u8], ffmpeg_exe: &str) -> Result<Str
     if !settings.ready() {
         bail!("Aliyun ASR is not configured (AppKey and token or AccessKey required)");
     }
+    let started = std::time::Instant::now();
     let wav = crate::transcribe::convert_to_wav(amr_bytes, ffmpeg_exe, settings.sample_rate).await?;
-    recognize(&settings, wav).await
+    let converted_ms = started.elapsed().as_millis();
+    let text = recognize(&settings, wav).await?;
+    log::info!("Aliyun ASR timing: ffmpeg {} ms, recognition {} ms", converted_ms, started.elapsed().as_millis() - converted_ms);
+    Ok(text)
 }
 
 pub(crate) async fn recognize(settings: &AliyunAsrSettings, wav: Vec<u8>) -> Result<String> {

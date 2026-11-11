@@ -76,9 +76,16 @@ const getAuthHeader = () => {
 
 const handleCallEvent = (/** @type {CallEvent} */ event) => {
     switch (event.event_type) {
-        case 'incoming_call':
-            incomingCall.set(event);
+        case 'incoming_call': {
+            // A late caller-ID update must not turn an answered call back into "incoming".
+            const active = get(activeCall);
+            if (active && active.call_id === event.call_id) {
+                activeCall.set({ ...active, phone: event.phone ?? active.phone });
+            } else {
+                incomingCall.set(event);
+            }
             break;
+        }
         case 'outbound_call':
         case 'outbound_call_started':
             activeCall.set(event);

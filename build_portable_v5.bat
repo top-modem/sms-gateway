@@ -112,6 +112,23 @@ if exist "%ROOT%\lpac" (
   )
 )
 
+rem tools\ffmpeg converts call recordings for Aliyun voice OTP; tools\lpac is the eSIM LPA.
+rem Both are found automatically next to the exe, so ship them in the package.
+if not exist "%ROOT%\tools\ffmpeg\ffmpeg.exe" (
+  echo Missing tools\ffmpeg\ffmpeg.exe - voice OTP needs it. Put ffmpeg.exe there and rebuild.
+  exit /b 1
+)
+xcopy /y /i /q "%ROOT%\tools\ffmpeg\ffmpeg.exe" "%NEWDIR%\tools\ffmpeg\" >nul || (
+  echo Failed to copy ffmpeg.
+  exit /b 1
+)
+if exist "%ROOT%\tools\lpac" (
+  xcopy /y /i /e /q "%ROOT%\tools\lpac" "%NEWDIR%\tools\lpac" >nul || (
+    echo Failed to copy tools\lpac folder.
+    exit /b 1
+  )
+)
+
 for %%F in (
   config.toml
   config.toml.example

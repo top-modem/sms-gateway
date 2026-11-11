@@ -35,7 +35,7 @@ impl Default for VoiceOtpSettings {
             prompt_seconds: 10,
             code_seconds: 10,
             otp_length: 6,
-            deadline_seconds: 120,
+            deadline_seconds: 60,
         }
     }
 }

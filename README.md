@@ -85,7 +85,7 @@ cargo test --release esim::activation::tests -- --include-ignored
 The Calls view includes an opt-in two-stage voice-code flow. Speech recognition
 uses only the Aliyun 智能语音交互 short-sentence (一句话识别) RESTful API; there is
 no local speech model. The default port is COM2, with independent 10-second
-prompt/code recordings, a six-digit code, and a 120-second deadline. Save the
+prompt/code recordings, a six-digit code, and a 60-second call limit. Save the
 settings before calling; only the enabled ports use the interactive flow.
 
 `tools/ffmpeg/ffmpeg.exe` converts modem AMR recordings to WAV before upload (a

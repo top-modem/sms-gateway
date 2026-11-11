@@ -13,7 +13,10 @@
   let makeCallSimId = $state('');
   let making = $state(false);
   let makeError = $state('');
-  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, deadline_seconds: 120 });
+  let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, deadline_seconds: 60 });
+  // COM port of the SIM this page was opened for; voice settings then apply to that port only.
+  let selectedPort = $state('');
+  let portEnabled = $state(false);
   let aliyun = $state({ app_key: '', region: 'cn-shanghai', sample_rate: 16000, access_key_id: '', has_token: false, has_access_key_secret: false, ready: false });
   let aliyunToken = $state('');
   let aliyunSecret = $state('');
@@ -68,10 +71,20 @@
     }
   }
 
+  function voicePorts(settings) {
+    return String(settings.com_port ?? '').split(',').map((port) => port.trim()).filter(Boolean);
+  }
+
   async function loadVoiceSettings() {
     try {
+      if (filterSimId) {
+        const info = await apiClient.getAllSimsInfo();
+        const rows = Array.isArray(info?.data) ? info.data : (Array.isArray(info) ? info : []);
+        selectedPort = rows.find((row) => row.sim_id === filterSimId)?.com_port ?? '';
+      }
       const response = await apiClient.getVoiceOtpSettings();
       voiceSettings = response.data.settings;
+      portEnabled = !!selectedPort && voiceSettings.enabled && voicePorts(voiceSettings).includes(selectedPort);
       voiceReady = response.data.ready === true;
       aliyun = (await apiClient.getAliyunAsrSettings()).data;
     } catch (error) {
@@ -120,8 +133,17 @@
     voiceError = '';
     voiceSaved = false;
     try {
-      const response = await apiClient.setVoiceOtpSettings({ ...voiceSettings });
+      const payload = { ...voiceSettings };
+      if (selectedPort) {
+        // Only add/remove this port; a disabled config has no active ports to keep.
+        const others = voiceSettings.enabled ? voicePorts(voiceSettings).filter((port) => port !== selectedPort) : [];
+        const ports = portEnabled ? [...others, selectedPort] : others;
+        payload.enabled = ports.length > 0;
+        payload.com_port = ports.length > 0 ? ports.join(',') : selectedPort;
+      }
+      const response = await apiClient.setVoiceOtpSettings(payload);
       voiceSettings = response.data.settings;
+      if (selectedPort) portEnabled = voiceSettings.enabled && voicePorts(voiceSettings).includes(selectedPort);
       voiceReady = response.data.ready === true;
       voiceSaved = true;
     } catch (error) {
@@ -224,8 +246,13 @@
           {voiceReady ? $t('voice_ready') : $t('voice_unavailable')}
         </span>
         <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
-          <input type="checkbox" bind:checked={voiceSettings.enabled} disabled={voiceBusy || (!voiceReady && !voiceSettings.enabled)} class="accent-blue-600" />
-          {$t('voice_enable')}
+          {#if selectedPort}
+            <input type="checkbox" bind:checked={portEnabled} disabled={voiceBusy || (!voiceReady && !portEnabled)} class="accent-blue-600" />
+            {$t('voice_enable')} {selectedPort}
+          {:else}
+            <input type="checkbox" bind:checked={voiceSettings.enabled} disabled={voiceBusy || (!voiceReady && !voiceSettings.enabled)} class="accent-blue-600" />
+            {$t('voice_enable')}
+          {/if}
         </label>
       </div>
       <button type="submit" disabled={voiceBusy} aria-label={$t('voice_save')} title={$t('voice_save')}
@@ -236,7 +263,11 @@
     <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3 min-w-0">
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0" title={$t('voice_port_hint')}>
         {$t('voice_port')}
-        <input type="text" required pattern={'\\s*COM[1-9][0-9]{0,2}(\\s*,\\s*COM[1-9][0-9]{0,2}){0,31}\\s*'} placeholder="COM2,COM5" bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        {#if selectedPort}
+          <input type="text" readonly value={selectedPort} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-900 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        {:else}
+          <input type="text" required pattern={'\\s*COM[1-9][0-9]{0,2}(\\s*,\\s*COM[1-9][0-9]{0,2}){0,31}\\s*'} placeholder="COM2,COM5" bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        {/if}
       </label>
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
         {$t('voice_prompt_window')}

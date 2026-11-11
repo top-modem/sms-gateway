@@ -429,14 +429,26 @@ impl Sms {
     }
     pub async fn paginate_by_contact_id(
         contact_id: &str,
+        sim_id: Option<&str>,
         page: u32,
         per_page: u32,
     ) -> Result<(Vec<Self>, i64)> {
+        let sms_list = Self::page_by_contact_in_pool(get_pool()?, contact_id, sim_id, page, per_page).await?;
+        let total = Sms::count_by_contact_id(contact_id).await?;
+        Ok((sms_list, total))
+    }
+
+    async fn page_by_contact_in_pool(
+        pool: &SqlitePool,
+        contact_id: &str,
+        sim_id: Option<&str>,
+        page: u32,
+        per_page: u32,
+    ) -> Result<Vec<Self>> {
         if page == 0 {
             return Err(anyhow::anyhow!("Page number must be greater than 0"));
         }
         let offset = (page - 1) * per_page;
-        let pool = get_pool()?;
 
         let mut tx = pool.begin().await?;
 
@@ -445,12 +457,14 @@ impl Sms {
             SELECT id, contact_id, timestamp, message, sim_id, send, status, 
                    uploaded_to_platform, platform_item_id, platform_uploaded_at, platform_response
             FROM sms 
-            WHERE contact_id = ?
+            WHERE contact_id = ? AND (? IS NULL OR sim_id = ?)
             ORDER BY timestamp DESC, id DESC
             LIMIT ? OFFSET ?
             "#,
         )
         .bind(contact_id)
+        .bind(sim_id)
+        .bind(sim_id)
         .bind(per_page as i32)
         .bind(offset as i32)
         .fetch_all(&mut *tx)
@@ -461,21 +475,20 @@ impl Sms {
                 r#"
                 UPDATE sms
                 SET status = ?
-                WHERE contact_id = ? AND status = ?
+                WHERE contact_id = ? AND status = ? AND (? IS NULL OR sim_id = ?)
                 "#,
             )
             .bind(SmsStatus::Read as i32)
             .bind(contact_id)
             .bind(SmsStatus::Unread as i32)
+            .bind(sim_id)
+            .bind(sim_id)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
-
-        let total = Sms::count_by_contact_id(contact_id).await?;
-
-        Ok((sms_list, total))
+        Ok(sms_list)
     }
 
     /// Paginated inbox (send=false) or sent (send=true) view, with contact name resolved.
@@ -3170,6 +3183,27 @@ mod hardware_type_tests {
         .await
         .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn shared_sender_conversation_is_scoped_to_the_viewed_sim() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO contacts (id, name) VALUES ('three', 'Three')").execute(&pool).await.unwrap();
+        for (sim, number) in [("COM15-SIM", "07848998171"), ("COM16-SIM", "07848960859")] {
+            sqlx::query("INSERT INTO sms (timestamp, message, contact_id, send, status, sim_id) VALUES ('2026-11-04 10:45:07', ?, 'three', 0, 0, ?)")
+                .bind(format!("Hi there, welcome to Three. Your number for this SIM is {number}."))
+                .bind(sim)
+                .execute(&pool).await.unwrap();
+        }
+        let com15 = Sms::page_by_contact_in_pool(&pool, "three", Some("COM15-SIM"), 1, 50).await.unwrap();
+        assert_eq!(com15.len(), 1);
+        assert!(com15[0].message.contains("07848998171") && com15[0].sim_id == "COM15-SIM");
+        let unread_other: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sms WHERE sim_id = 'COM16-SIM' AND status = 0")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(unread_other, 1, "viewing COM15 must not mark COM16's SMS as read");
+        assert_eq!(Sms::page_by_contact_in_pool(&pool, "three", None, 1, 50).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

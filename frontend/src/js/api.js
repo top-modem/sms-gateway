@@ -54,12 +54,13 @@ class ApiClient {
      * @param {number|null} [contactId=null] - Optional contact ID (for filtering specific contacts)
      * @param {AbortSignal} [signal=null] - Optional AbortSignal to cancel the request
      */
-    async getSmsPaginated(page = 1, perPage = 10, contactId = null, signal = null) {
+    async getSmsPaginated(page = 1, perPage = 10, contactId = null, signal = null, simId = null) {
         const params = {
             page: page,
             per_page: perPage,
             contact_id: contactId
         };
+        if (simId) params.sim_id = simId;
 
         return FetchApi.get('/api/sms', params, undefined, { signal });
     }

@@ -2,9 +2,10 @@
   import Icon from "@iconify/svelte";
   import { t } from "../../js/i18n.js";
   import { SmsStatus } from "../../stores/conversation";
+  import { simCards } from "../../stores/simcards.js";
   import { quintOut } from "svelte/easing";
 
-  let { message, isNewMessage = false } = $props();
+  let { message, isNewMessage = false, showSim = false } = $props();
 
   const urlRegex =
     /https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)/g;
@@ -160,6 +161,13 @@
         {@html formatMessage(message.message)}
       </p>
     </div>
+
+    {#if showSim && message.sim_id}
+      {@const sim = $simCards.find((card) => card.id === message.sim_id)}
+      <div class="mt-1 text-[11px] text-gray-400 {message.send ? 'text-right' : ''}">
+        SIM …{message.sim_id.slice(-6)}{sim?.phone_number ? ` · ${sim.phone_number}` : ''}
+      </div>
+    {/if}
 
     {#if getOutgoingStatusMeta(message)}
       <div class="mt-1 flex justify-end">

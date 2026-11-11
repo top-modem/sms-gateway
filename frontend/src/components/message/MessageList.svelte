@@ -20,6 +20,8 @@
   let { initialSimId = null } = $props();
 
   let messages = $state([]);
+  // Unfiltered views may mix SIMs that share a sender; label each message then.
+  let mixedSims = $derived(new Set(messages.map((msg) => msg.sim_id).filter(Boolean)).size > 1);
   let showNewMessage = $state(false);
   let concatInputText = $state("");
   let isAddingContact = $state(false);
@@ -80,7 +82,7 @@
 
     if (!contactSnapshot.new) {
       apiClient
-        .getSmsPaginated(page, pageSize, contactSnapshot.id)
+        .getSmsPaginated(page, pageSize, contactSnapshot.id, null, initialSimId)
         .then(async (res) => {
           if (thisLoadSeq !== loadSeq) return;
 
@@ -95,6 +97,7 @@
               const inboxRows = Array.isArray(inboxRes?.data?.data) ? inboxRes.data.data : [];
               rows = inboxRows.filter(
                 (row) => (row?.contact_name ?? "") === contactSnapshot.name
+                  && (!initialSimId || row?.sim_id === initialSimId)
               );
             } catch (fallbackErr) {
               console.error("Fallback inbox query failed:", fallbackErr);
@@ -249,7 +252,11 @@
 
   // Add auto-update functionality
   function handleMessageUpdate(event) {
-    const { messages: newMessages, silentUpdate } = event.detail;
+    const { messages: allNewMessages, silentUpdate } = event.detail;
+    // Live updates carry the whole contact; keep only the SIM this page shows.
+    const newMessages = (allNewMessages ?? []).filter(
+      (msg) => !initialSimId || !msg.sim_id || msg.sim_id === initialSimId
+    );
 
     if (!newMessages || newMessages.length === 0) return;
 
@@ -306,7 +313,7 @@
           style="padding-bottom: calc(8rem + env(safe-area-inset-bottom, 0px));"
         >
           {#each messages as message, index (message.id)}
-            <MessageItem {message} {isNewMessage} />
+            <MessageItem {message} {isNewMessage} showSim={mixedSims} />
             {@const timeHeader = formatTimeRange(
               message.timestamp,
               index === messages.length - 1

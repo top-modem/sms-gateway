@@ -461,6 +461,9 @@ pub struct SmsQuery {
     per_page: u32,
     #[serde(default)]
     contact_id: Option<String>,
+    /// Restrict a contact's conversation to one SIM (several SIMs often share a sender such as "Three").
+    #[serde(default)]
+    sim_id: Option<String>,
     /// "inbox" = received, "sent" = sent. Returns SmsRow with contact_name resolved.
     #[serde(default)]
     direction: Option<String>,
@@ -528,7 +531,8 @@ async fn get_sms_paginated(Query(query): Query<SmsQuery>) -> Response {
 
     let result = match &query.contact_id {
         Some(contact_id) => {
-            Sms::paginate_by_contact_id(contact_id, query.page, query.per_page).await
+            let sim_id = query.sim_id.as_deref().filter(|sim| !sim.is_empty());
+            Sms::paginate_by_contact_id(contact_id, sim_id, query.page, query.per_page).await
         }
         None => Sms::paginate(query.page, query.per_page).await,
     };

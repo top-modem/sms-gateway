@@ -166,7 +166,15 @@ pub struct Modem {
     /// backlog that never drains.
     pending_commands: Arc<AtomicUsize>,
     ftp_uploader: ftp_uploader::FtpUploader,
+    /// First time each still-incomplete multipart SMS (sender, reference, total)
+    /// was seen in storage. Its fragments are kept until all parts arrive or
+    /// `INCOMPLETE_MULTIPART_TIMEOUT` passes.
+    incomplete_multipart_seen: std::sync::Mutex<std::collections::HashMap<(String, u16, u8), Instant>>,
 }
+
+/// How long to wait for the missing parts of a multipart SMS before storing
+/// the parts received so far. Operators sometimes deliver parts minutes apart.
+const INCOMPLETE_MULTIPART_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 impl Modem {
     pub async fn new(
@@ -273,6 +281,7 @@ impl Modem {
             machine_type: RwLock::new(None),
             esim_mode: RwLock::new(false),
             pending_commands,
+            incomplete_multipart_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -1517,16 +1526,16 @@ impl Modem {
         webhook_manager: Option<webhook::WebhookManager>,
     ) -> anyhow::Result<()> {
         // Always read ALL messages so previously-read messages aren't missed
-        let (sms_list, mms_found) = self.read_sms(SmsType::All).await?;
+        let (sms_list, consumed) = self.read_sms(SmsType::All).await?;
 
-        if sms_list.is_empty() && !mms_found {
+        if consumed.is_empty() {
             return Ok(());
         }
 
-        // Delete from modem FIRST so storage doesn't fill up. This must run
-        // even when sms_list is empty but an MMS WAP-push notification was
-        // found, otherwise notifications never get cleared from SIM storage.
-        if let Err(e) = self.delete_all_sms().await {
+        // Delete handled entries from modem FIRST so storage doesn't fill up.
+        // Only the consumed indices are deleted: incomplete multipart fragments
+        // and SMS that arrived after the listing stay for the next poll.
+        if let Err(e) = self.delete_sms_indices(&consumed).await {
             log::warn!("Failed to delete SMS from modem after reading: {}", e);
         }
 
@@ -2037,15 +2046,13 @@ impl Modem {
         Ok(())
     }
 
-    /// Reads all SMS from modem storage. Returns the regular SMS list plus
-    /// whether at least one MMS WAP-push notification was also found in this
-    /// batch -- callers MUST take `mms_found` into account when deciding
-    /// whether to delete modem storage (`delete_all_sms`), since MMS
-    /// notifications are stripped out of `sms_list` here and would otherwise
-    /// never be flagged for deletion when a poll returns MMS notifications
-    /// but no regular SMS, leaving them to accumulate in SIM storage forever
-    /// and potentially causing new incoming SMS/MMS to be rejected once full.
-    pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<(Vec<ModemSMS>, bool)> {
+    /// Reads all SMS from modem storage. Returns the regular SMS list plus the
+    /// storage indices that were fully handled (SMS, completed multipart SMS,
+    /// MMS WAP-push notifications, unparseable PDUs). Callers must delete only
+    /// those indices (`delete_sms_indices`): fragments of a multipart SMS whose
+    /// other parts have not arrived yet are left in storage so the next poll can
+    /// complete them, and SMS arriving after this listing are not wiped unread.
+    pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<(Vec<ModemSMS>, Vec<u32>)> {
         let command = format!("AT+CMGL={}\r\n", sms_type.to_at_command_pdu());
         let response = self.send_command_with_ok(&command).await?;
 
@@ -2054,12 +2061,26 @@ impl Modem {
         if trimmed != "OK" && !trimmed.is_empty() {
             log::debug!("[{}] AT+CMGL raw response: {}", sim_id, trimmed);
         }
-        let (sms_list, mms_candidates) = parse_pdu_sms(&response, &sim_id);
-        let mms_found = !mms_candidates.is_empty();
+        let batch = parse_pdu_sms(&response, &sim_id);
+        let mut sms_list = batch.messages;
+        let mut consumed = batch.consumed_indices;
+        let expired = self.take_expired_incomplete(batch.incomplete, Instant::now());
+        for partial in expired {
+            log::warn!(
+                "[{}] Multipart SMS from {} (ref {}, {} parts) still incomplete after {} min; storing received parts",
+                sim_id,
+                partial.sender,
+                partial.reference,
+                partial.total,
+                INCOMPLETE_MULTIPART_TIMEOUT.as_secs() / 60
+            );
+            consumed.extend(partial.indices.iter().copied());
+            sms_list.push(partial.into_partial_sms(&sim_id));
+        }
         // Capture MMS WAP-push notifications *before* the caller deletes SMS from
         // the modem (this is our only chance -- there is no "leave undeleted for
         // retry" option like a ModemManager-based stack would have).
-        for candidate in mms_candidates {
+        for candidate in batch.mms_candidates {
             if let Err(e) = crate::mms_wap::handle_notification_candidate(&sim_id, candidate).await
             {
                 log::warn!(
@@ -2069,13 +2090,60 @@ impl Modem {
                 );
             }
         }
-        Ok((sms_list, mms_found))
+        Ok((sms_list, consumed))
     }
 
-    /// Delete all SMS messages from modem storage (AT+CMGD=1,4)
-    pub async fn delete_all_sms(&self) -> io::Result<()> {
-        self.send_command_with_ok("AT+CMGD=1,4\r\n").await?;
-        Ok(())
+    /// Track still-incomplete multipart SMS and return the ones that have
+    /// waited longer than `INCOMPLETE_MULTIPART_TIMEOUT`.
+    fn take_expired_incomplete(
+        &self,
+        incomplete: Vec<crate::decode::IncompleteMultipart>,
+        now: Instant,
+    ) -> Vec<crate::decode::IncompleteMultipart> {
+        let mut seen = self
+            .incomplete_multipart_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut still_pending = std::collections::HashMap::new();
+        let mut expired = Vec::new();
+        for item in incomplete {
+            let key = (item.sender.clone(), item.reference, item.total);
+            let first_seen = seen.get(&key).copied().unwrap_or(now);
+            if now.duration_since(first_seen) >= INCOMPLETE_MULTIPART_TIMEOUT {
+                expired.push(item);
+            } else {
+                if first_seen == now {
+                    log::info!(
+                        "Multipart SMS from {} (ref {}) has {}/{} parts; keeping fragments until the rest arrive",
+                        item.sender,
+                        item.reference,
+                        item.parts.iter().filter(|p| p.is_some()).count(),
+                        item.total
+                    );
+                }
+                still_pending.insert(key, first_seen);
+            }
+        }
+        *seen = still_pending;
+        expired
+    }
+
+    /// Delete the given storage indices (AT+CMGD=<index>).
+    pub async fn delete_sms_indices(&self, indices: &[u32]) -> io::Result<()> {
+        let mut first_error = None;
+        for index in indices {
+            if let Err(e) = self
+                .send_command_with_ok(&format!("AT+CMGD={}\r\n", index))
+                .await
+            {
+                log::warn!("[{}] Failed to delete SMS index {}: {}", self.com_port, index, e);
+                first_error.get_or_insert(e);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn get_modem_info<T>(
@@ -2415,9 +2483,9 @@ impl Modem {
     }
 
     pub async fn read_sms_sync_insert(&self, _sms_type: SmsType) -> anyhow::Result<()> {
-        let (sms_list, mms_found) = self.read_sms(SmsType::All).await?;
-        if !sms_list.is_empty() || mms_found {
-            if let Err(e) = self.delete_all_sms().await {
+        let (sms_list, consumed) = self.read_sms(SmsType::All).await?;
+        if !consumed.is_empty() {
+            if let Err(e) = self.delete_sms_indices(&consumed).await {
                 log::warn!("Failed to delete SMS from modem after reading: {}", e);
             }
         }

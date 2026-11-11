@@ -188,6 +188,21 @@ async fn state(io: &impl CallIo, progress: &mut VoiceOtpProgress, value: &str) -
     io.progress(progress).await
 }
 
+/// Like `cancellable`, but the caller hanging up does not abort it: work on audio
+/// that is already recorded must still finish after the call ends.
+async fn survives_hangup<Output>(
+    future: impl Future<Output = Result<Output>>,
+    cancel: &mut VoiceCancellation,
+    deadline: Instant,
+) -> Result<Output> {
+    if Instant::now() >= deadline { bail!("Voice-flow deadline exceeded"); }
+    tokio::select! {
+        biased;
+        _ = &mut cancel.user => Err(VoiceCancelled.into()),
+        result = tokio::time::timeout_at(deadline, future) => result.context("Voice-flow deadline exceeded")?,
+    }
+}
+
 async fn run(
     io: &impl CallIo,
     settings: &VoiceOtpSettings,
@@ -202,14 +217,20 @@ async fn run(
     io.prepare_audio().await?;
     state(io, progress, "recording_prompt").await?;
     io.record(prompt_file).await?;
-    cancellable(async { tokio::time::sleep(Duration::from_secs(settings.prompt_seconds)).await; Ok(()) }, cancel, deadline).await?;
-    io.stop().await?;
+    let mut remote_ended = false;
+    match cancellable(async { tokio::time::sleep(Duration::from_secs(settings.prompt_seconds)).await; Ok(()) }, cancel, deadline).await {
+        Ok(()) => io.stop().await?,
+        Err(error) if error.is::<RemoteCallEnded>() => {
+            remote_ended = true;
+            io.finish_remote_recording().await?;
+        }
+        Err(error) => return Err(error),
+    }
     state(io, progress, "downloading_prompt").await?;
     let prompt_audio = io.download(prompt_file).await?;
     io.save_audio(&prompt_audio, true).await?;
-    io.active().await?;
     state(io, progress, "transcribing_prompt").await?;
-    let prompt_text = cancellable(io.transcribe(&prompt_audio), cancel, deadline).await?;
+    let prompt_text = survives_hangup(io.transcribe(&prompt_audio), cancel, deadline).await?;
     progress.prompt_transcript = Some(prompt_text.clone());
     progress.prompt_readings = crate::transcribe::voice_prompt_readings(&prompt_text).unwrap_or_default();
     progress.prompt_comparison = Some(if progress.prompt_readings.len() < 2 { "incomplete" }
@@ -231,12 +252,14 @@ async fn run(
     }
     match instruction {
         VoicePrompt::DirectOtp(code) => {
-            io.active().await?;
-            io.hangup().await?;
+            if io.active().await.is_ok() {
+                io.hangup().await?;
+            }
             io.save_audio(&prompt_audio, false).await?;
             progress.otp = Some(code);
         }
         VoicePrompt::PressDigit(digit) => {
+            if remote_ended { return Err(RemoteCallEnded.into()); }
             io.active().await?;
             state(io, progress, "recording_code").await?;
             io.record(code_file).await?;
@@ -425,6 +448,29 @@ mod tests {
         run(&io, &settings(), &mut progress, &mut cancellation, "prompt.amr", "code.amr").await.unwrap();
         assert_eq!(progress.otp.as_deref(), Some("005861"));
         assert!(io.events.lock().unwrap().iter().all(|event| !event.starts_with("dtmf:") && event != "record:code.amr"));
+    }
+
+    #[tokio::test]
+    async fn voice_otp_direct_code_survives_remote_hangup_during_prompt() {
+        let io = Arc::new(FakeCall::new(&["Your WhatsApp code is 256490. Your WhatsApp code is 256490."]));
+        let (sender, receiver) = oneshot::channel();
+        let (_user_sender, mut cancellation) = VoiceCancellation::for_test(receiver);
+        let ender = io.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ender.ended.store(true, Ordering::SeqCst);
+            let _ = sender.send(());
+        });
+        let mut config = settings();
+        config.prompt_seconds = 5;
+        let mut progress = VoiceOtpProgress::default();
+        run(io.as_ref(), &config, &mut progress, &mut cancellation, "prompt.amr", "code.amr").await.unwrap();
+        assert_eq!(progress.otp.as_deref(), Some("256490"));
+        assert_eq!(progress.state, "completed");
+        let events = io.events.lock().unwrap();
+        assert!(events.iter().any(|event| event == "stop_after_remote_end"));
+        assert!(events.iter().any(|event| event == "transcribe"));
+        assert!(!events.iter().any(|event| event == "hangup"));
     }
 
     #[tokio::test]

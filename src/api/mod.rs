@@ -702,6 +702,7 @@ async fn get_all_sim_info(
     let port_snapshots = modem_manager.get_port_runtime_snapshots().await;
     let manual_restarting_ports = modem_manager.get_manual_restarting_ports().await;
     let identity_revalidating_ports = modem_manager.get_identity_revalidating_ports().await;
+    let sim_unreadable_ports = modem_manager.get_sim_unreadable_ports().await;
     log::debug!(
         "[sims/info] snapshots fetched after {}ms",
         handler_start.elapsed().as_millis()
@@ -1010,6 +1011,7 @@ async fn get_all_sim_info(
         let has_historical_sim = snapshot.last_sim_id.is_some();
         if identity_revalidating_ports.contains(&snapshot.com_port)
             && !manual_restarting_ports.contains(&snapshot.com_port)
+            && !sim_unreadable_ports.contains(&snapshot.com_port)
         {
             let known_sim = snapshot.active_sim_id.as_ref().or(snapshot.last_sim_id.as_ref());
             let reused = LAST_GOOD_ROWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

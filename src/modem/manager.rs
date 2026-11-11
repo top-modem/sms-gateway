@@ -95,6 +95,10 @@ pub struct ModemManager {
     /// Ports where CPIN is READY but ICCID changed. Hide the old identity while
     /// repeated samples confirm the new card before teardown/reinitialization.
     identity_revalidating_ports: RwLock<HashSet<String>>,
+    /// Ports whose last SIM probe could not read the card (CPIN not READY and no
+    /// IMSI), i.e. the SIM was most likely pulled. The dashboard must not keep
+    /// showing the previous card's cached row for these ports.
+    sim_unreadable_ports: RwLock<HashSet<String>>,
     transcribe_config: RwLock<Option<Arc<TranscribeConfig>>>,
     restart_statuses: RwLock<HashMap<String, RestartStatus>>,
 }
@@ -278,6 +282,27 @@ mod msim_slot_tests {
     fn msim_slot_ignores_failed_or_incomplete_replies() {
         for response in ["", "\r\nERROR\r\n", "+CME ERROR: 13", "NOT OK", "\r\nOK\r\nERROR\r\n"] {
             assert_eq!(ModemManager::confirmed_msim_slot("ath2", response), None);
+        }
+    }
+
+    #[test]
+    fn sim_absent_errors_are_classified_as_explicit_absence() {
+        for error in [
+            "Command failed: \r\n+CME ERROR: 10\r\n",
+            "Command failed: \r\n+CME ERROR: 13\r\n",
+            "+CME ERROR: SIM not inserted",
+            "+CME ERROR: SIM failure",
+        ] {
+            assert!(ModemManager::is_sim_absent_error(error), "{error:?}");
+        }
+        for error in [
+            "Command failed: \r\n+CME ERROR: 14\r\n",
+            "Command failed: \r\n+CME ERROR: 3\r\n",
+            "Command failed: \r\n+CME ERROR: 100\r\n",
+            "timeout",
+            "Command failed: \r\nERROR\r\n",
+        ] {
+            assert!(!ModemManager::is_sim_absent_error(error), "{error:?}");
         }
     }
 }
@@ -510,6 +535,31 @@ impl ModemManager {
 
     pub async fn get_identity_revalidating_ports(&self) -> HashSet<String> {
         self.identity_revalidating_ports.read().await.clone()
+    }
+
+    pub async fn get_sim_unreadable_ports(&self) -> HashSet<String> {
+        self.sim_unreadable_ports.read().await.clone()
+    }
+
+    /// `AT+CPIN?` errors that mean the card itself is gone: +CME ERROR 10
+    /// (SIM not inserted) or 13 (SIM failure, reported by many modules right
+    /// after a hot pull). Demotion still needs `SIM_PROBE_FAILURE_THRESHOLD`
+    /// consecutive samples, so a single glitch does not drop the port.
+    fn is_sim_absent_error(error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("sim not inserted") || lower.contains("sim failure") {
+            return true;
+        }
+        lower
+            .split("+cme error:")
+            .nth(1)
+            .map(|tail| {
+                tail.trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .is_some_and(|code| code == "10" || code == "13")
     }
 
     async fn set_last_known_sim_port(&self, com_port: &str, sim_id: &str) {
@@ -926,6 +976,7 @@ impl ModemManager {
 
                     self.manual_restarting_ports.write().await.remove(&com_port);
                     self.identity_revalidating_ports.write().await.remove(&com_port);
+                    self.sim_unreadable_ports.write().await.remove(&com_port);
 
                     if !self.mark_port_active(&com_port, &sim_id, generation).await {
                         log::debug!(
@@ -1186,6 +1237,7 @@ impl ModemManager {
             manual_restarting_ports: RwLock::new(HashSet::new()),
             msim_managed_ports: RwLock::new(HashSet::new()),
             identity_revalidating_ports: RwLock::new(HashSet::new()),
+            sim_unreadable_ports: RwLock::new(HashSet::new()),
             restart_statuses: RwLock::new(HashMap::new()),
             transcribe_config: RwLock::new(TranscribeConfig::from_settings(&config.settings)),
         }
@@ -2085,15 +2137,15 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        let (sms_list, mms_found) = modem.read_sms(crate::modem::SmsType::All).await?;
+        let (sms_list, consumed) = modem.read_sms(crate::modem::SmsType::All).await?;
 
-        if sms_list.is_empty() && !mms_found {
+        if consumed.is_empty() {
             return Ok(None);
         }
 
-        // Delete even if sms_list is empty but an MMS WAP-push notification
-        // was found, so notifications don't accumulate in SIM storage forever.
-        if let Err(e) = modem.delete_all_sms().await {
+        // Delete only handled entries (SMS, completed multipart, MMS
+        // notifications) so incomplete multipart fragments stay in storage.
+        if let Err(e) = modem.delete_sms_indices(&consumed).await {
             log::warn!("Failed to delete SMS from modem after reading: {}", e);
         }
 
@@ -2258,6 +2310,7 @@ impl ModemManager {
                 iccid: String,
                 com_port: String,
                 hide_identity: bool,
+                sim_unreadable: bool,
             },
         }
 
@@ -2315,7 +2368,10 @@ impl ModemManager {
                                 || upper.contains("NOT INSERTED")
                                 || upper.contains("SIM FAILURE")
                         })
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        || status_error
+                            .as_deref()
+                            .is_some_and(Self::is_sim_absent_error);
 
                     // Many modems do not emit an explicit "NOT INSERTED" after a
                     // hot pull; AT+CPIN? just returns an empty/non-READY response
@@ -2437,6 +2493,7 @@ impl ModemManager {
                                 iccid,
                                 com_port: modem.com_port.clone(),
                                 hide_identity: true,
+                                sim_unreadable: false,
                             };
                         }
                     }
@@ -2464,21 +2521,28 @@ impl ModemManager {
                             .unwrap_or(false);
                         if recently_ready {
                             log::warn!(
-                                "Suppressing non-explicit SIM-absent sample on {} (was {}): port was READY within the last 180s; keeping active.",
+                                "Suppressing non-explicit SIM-absent sample on {} (was {}, status={:?}, status_err={:?}, imsi_err={:?}): port was READY within the last 180s; keeping active.",
                                 modem.com_port,
-                                iccid
+                                iccid,
+                                status,
+                                status_error,
+                                imsi_error
                             );
                         } else {
                             log::warn!(
-                                "Ignoring non-explicit SIM-absent sample on {} (was {}): explicit SIM REMOVED evidence required for demotion.",
+                                "Ignoring non-explicit SIM-absent sample on {} (was {}, status={:?}, status_err={:?}, imsi_err={:?}): explicit SIM REMOVED evidence required for demotion.",
                                 modem.com_port,
-                                iccid
+                                iccid,
+                                status,
+                                status_error,
+                                imsi_error
                             );
                         }
                         return ProbeOutcome::TransientIssue {
                             iccid,
                             com_port: modem.com_port.clone(),
                             hide_identity: true,
+                            sim_unreadable: true,
                         };
                     }
 
@@ -2495,6 +2559,7 @@ impl ModemManager {
                         iccid,
                         com_port: modem.com_port.clone(),
                         hide_identity: true,
+                        sim_unreadable: false,
                     };
                 }
 
@@ -2521,6 +2586,7 @@ impl ModemManager {
                     .write()
                     .await
                     .insert(modem.com_port.clone(), Instant::now());
+                mgr.sim_unreadable_ports.write().await.remove(&modem.com_port);
 
                 match tokio::time::timeout(Duration::from_secs(5), modem.get_sim_iccid()).await {
                     Ok(Ok(Some(current_iccid))) if current_iccid == iccid => {
@@ -2587,6 +2653,7 @@ impl ModemManager {
                                     iccid,
                                     com_port: modem.com_port.clone(),
                                     hide_identity: true,
+                                    sim_unreadable: false,
                                 }
                             }
                         } else {
@@ -2601,6 +2668,7 @@ impl ModemManager {
                                 iccid,
                                 com_port: modem.com_port.clone(),
                                 hide_identity: true,
+                                sim_unreadable: false,
                             }
                         }
                     }
@@ -2613,6 +2681,7 @@ impl ModemManager {
                             iccid,
                             com_port: modem.com_port.clone(),
                             hide_identity: false,
+                            sim_unreadable: false,
                         }
                     }
                     Ok(Err(e)) => {
@@ -2624,6 +2693,7 @@ impl ModemManager {
                             iccid,
                             com_port: modem.com_port.clone(),
                             hide_identity: false,
+                            sim_unreadable: false,
                         }
                     }
                     Err(_) => {
@@ -2635,6 +2705,7 @@ impl ModemManager {
                             iccid,
                             com_port: modem.com_port.clone(),
                             hide_identity: false,
+                            sim_unreadable: false,
                         }
                     }
                 }
@@ -2650,6 +2721,7 @@ impl ModemManager {
                 ProbeOutcome::Healthy { iccid, modem } => {
                     let port_key = modem.com_port.clone();
                     self.identity_revalidating_ports.write().await.remove(&port_key);
+                    self.sim_unreadable_ports.write().await.remove(&port_key);
                     self.sim_probe_fail_counts.write().await.remove(&port_key);
                     self.sim_swap_confirm_streaks.write().await.remove(&port_key);
                     self.sim_probe_cooldown_until.write().await.remove(&port_key);
@@ -2748,6 +2820,7 @@ impl ModemManager {
                         .write()
                         .await
                         .insert(com_port.clone());
+                    self.sim_unreadable_ports.write().await.insert(com_port.clone());
                     self.sim_swap_confirm_streaks.write().await.remove(&com_port);
                     let in_cooldown = self
                         .sim_probe_cooldown_until
@@ -2803,12 +2876,16 @@ impl ModemManager {
                     iccid,
                     com_port,
                     hide_identity,
+                    sim_unreadable,
                 } => {
                     if hide_identity {
                         self.identity_revalidating_ports
                             .write()
                             .await
                             .insert(com_port.clone());
+                    }
+                    if sim_unreadable {
+                        self.sim_unreadable_ports.write().await.insert(com_port.clone());
                     }
                     log::debug!(
                         "Transient probe issue on {} (SIM {}, identity_hidden={}); leaving modem active.",

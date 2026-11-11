@@ -18,10 +18,51 @@ pub struct MmsNotificationCandidate {
     pub raw: Vec<u8>,
 }
 
+/// A multipart SMS whose parts are not all in modem storage yet. Its fragments
+/// must stay in storage (not be deleted) so the next poll can complete it.
+pub struct IncompleteMultipart {
+    pub sender: String,
+    pub reference: u16,
+    pub total: u8,
+    pub timestamp: NaiveDateTime,
+    pub parts: Vec<Option<String>>,
+    /// Modem storage indices of the fragments received so far.
+    pub indices: Vec<u32>,
+}
+
+impl IncompleteMultipart {
+    /// Build a best-effort message from the fragments received so far, used
+    /// once the missing parts are considered lost.
+    pub fn into_partial_sms(self, sim_id: &str) -> ModemSMS {
+        let message = self
+            .parts
+            .into_iter()
+            .map(|part| part.unwrap_or_else(|| "[...]".to_string()))
+            .collect::<String>();
+        ModemSMS {
+            contact: self.sender,
+            timestamp: self.timestamp,
+            message,
+            send: false,
+            sim_id: sim_id.to_string(),
+        }
+    }
+}
+
+/// Result of parsing one `AT+CMGL` listing.
+pub struct ParsedSmsBatch {
+    pub messages: Vec<ModemSMS>,
+    pub mms_candidates: Vec<MmsNotificationCandidate>,
+    /// Storage indices that were fully handled and may be deleted.
+    pub consumed_indices: Vec<u32>,
+    /// Multipart messages still missing parts; their indices must be kept.
+    pub incomplete: Vec<IncompleteMultipart>,
+}
+
 // --------- Multipart SMS Handler ----------
 struct MultipartHandler {
-    // (reference number, total parts) -> (timestamp, sender, message parts, original indices)
-    pending_parts: HashMap<(u16, u8), (NaiveDateTime, String, Vec<Option<String>>, Vec<u32>)>,
+    // (sender, reference number, total parts) -> (timestamp, message parts, original indices)
+    pending_parts: HashMap<(String, u16, u8), (NaiveDateTime, Vec<Option<String>>, Vec<u32>)>,
 }
 
 impl MultipartHandler {
@@ -42,30 +83,20 @@ impl MultipartHandler {
         sender: String,
         index: u32,
         sim_id: String,
-    ) -> Option<ModemSMS> {
-        // Validate parameters
-        if current == 0 || current > total {
-            return None;
-        }
-
-        let key = (reference, total);
-        let entry = self.pending_parts.entry(key).or_insert_with(|| {
-            (
-                timestamp,
-                sender.clone(),
-                vec![None; total as usize],
-                Vec::new(),
-            )
+    ) -> Option<(ModemSMS, Vec<u32>)> {
+        let key = (sender, reference, total);
+        let entry = self.pending_parts.entry(key.clone()).or_insert_with(|| {
+            (timestamp, vec![None; total as usize], Vec::new())
         });
 
         // Store current part
-        entry.2[current as usize - 1] = Some(message);
-        entry.3.push(index);
+        entry.1[current as usize - 1] = Some(message);
+        entry.2.push(index);
 
         // Check if all parts are collected
-        if entry.2.iter().all(Option::is_some) {
+        if entry.1.iter().all(Option::is_some) {
             let combined = entry
-                .2
+                .1
                 .iter()
                 .filter_map(|x| x.as_ref())
                 .fold(String::new(), |acc, s| acc + s);
@@ -77,21 +108,21 @@ impl MultipartHandler {
                 combined.len()
             );
 
-            // Create the result before removing from pending
-            let result = Some(ModemSMS {
-                contact: entry.1.clone(),
+            let sms = ModemSMS {
+                contact: key.0.clone(),
                 timestamp: entry.0,
                 message: combined,
                 send: false,
                 sim_id,
-            });
+            };
+            let indices = std::mem::take(&mut entry.2);
 
             // Remove the completed multipart message from pending
             self.pending_parts.remove(&key);
 
-            result
+            Some((sms, indices))
         } else {
-            let parts_received = entry.2.iter().filter(|x| x.is_some()).count();
+            let parts_received = entry.1.iter().filter(|x| x.is_some()).count();
             log::debug!(
                 "多段短信进度: 引用{}, 已收到{}/{}段",
                 reference,
@@ -101,17 +132,28 @@ impl MultipartHandler {
             None
         }
     }
+
+    fn into_incomplete(self) -> Vec<IncompleteMultipart> {
+        self.pending_parts
+            .into_iter()
+            .map(|((sender, reference, total), (timestamp, parts, indices))| IncompleteMultipart {
+                sender,
+                reference,
+                total,
+                timestamp,
+                parts,
+                indices,
+            })
+            .collect()
+    }
 }
 
 // ---------- Main Parser Function ----------
-/// Returns (regular text SMS, MMS WAP-push notification candidates).
-pub fn parse_pdu_sms(
-    cmgl_entries: &str,
-    sim_id: &str,
-) -> (Vec<ModemSMS>, Vec<MmsNotificationCandidate>) {
+pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> ParsedSmsBatch {
     let mut handler = MultipartHandler::new();
     let mut messages = Vec::new();
     let mut mms_candidates = Vec::new();
+    let mut consumed_indices = Vec::new();
     let entry_re = Regex::new(r#"(?i)\+(CMGL): (\d+).*?\n([0-9A-Fa-f]+)"#).unwrap();
 
     let total_entries = entry_re.captures_iter(cmgl_entries).count();
@@ -133,6 +175,7 @@ pub fn parse_pdu_sms(
             Ok(v) => v,
             Err(e) => {
                 log::warn!("跳过短信 #{}, PDU hex解码失败: {}", index, e);
+                consumed_indices.push(index);
                 continue;
             }
         };
@@ -143,6 +186,7 @@ pub fn parse_pdu_sms(
 
         if pos >= pdu.len() {
             log::warn!("跳过短信 #{}, PDU太短 (SMSC之后无数据)", index);
+            consumed_indices.push(index);
             continue;
         }
 
@@ -155,6 +199,7 @@ pub fn parse_pdu_sms(
         let mti = pdu_type & 0x03;
         if mti != 0x00 {
             log::debug!("跳过非DELIVER PDU #{} (MTI={})", index, mti);
+            consumed_indices.push(index);
             continue;
         }
         pos += 1; // Skip PDU type
@@ -164,6 +209,7 @@ pub fn parse_pdu_sms(
 
         if pos + 8 > pdu.len() {
             log::warn!("跳过短信 #{}, PDU太短 (无DCS/时间戳字段)", index);
+            consumed_indices.push(index);
             continue;
         }
 
@@ -197,7 +243,12 @@ pub fn parse_pdu_sms(
                     total,
                     content.len()
                 );
-                if let Some(sms) = handler.add_part(
+                if current == 0 || current > total {
+                    log::warn!("跳过多段短信 #{}, 分段序号无效: {}/{}", index, current, total);
+                    consumed_indices.push(index);
+                    continue;
+                }
+                if let Some((sms, indices)) = handler.add_part(
                     reference,
                     total,
                     current,
@@ -209,10 +260,12 @@ pub fn parse_pdu_sms(
                 ) {
                     log::info!("多段短信完整，添加到消息列表");
                     messages.push(sms);
+                    consumed_indices.extend(indices);
                 }
             }
             MessageContent::Single(content) => {
                 log::debug!("解析到单条短信: 索引{}, 内容长度: {}", index, content.len());
+                consumed_indices.push(index);
                 messages.push(ModemSMS {
                     contact: sender,
                     timestamp,
@@ -228,6 +281,7 @@ pub fn parse_pdu_sms(
                     sender,
                     raw.len()
                 );
+                consumed_indices.push(index);
                 mms_candidates.push(MmsNotificationCandidate {
                     sender,
                     timestamp,
@@ -244,7 +298,12 @@ pub fn parse_pdu_sms(
         messages.len(),
         mms_candidates.len()
     );
-    (messages, mms_candidates)
+    ParsedSmsBatch {
+        messages,
+        mms_candidates,
+        consumed_indices,
+        incomplete: handler.into_incomplete(),
+    }
 }
 
 // ---------- Message Content Parsing ----------
@@ -628,4 +687,56 @@ fn parse_timestamp(bytes: &[u8]) -> NaiveDateTime {
     // timestamps use the same timezone no matter which network sent the SMS.
     let gmt = naive_local - Duration::minutes(smsc_offset_minutes);
     gmt + Duration::hours(TARGET_UTC_OFFSET_HOURS)
+}
+
+#[cfg(test)]
+mod multipart_storage_tests {
+    use super::*;
+
+    /// UCS2 SMS-DELIVER from "1234" with an 8-bit concatenation UDH.
+    fn part_pdu(reference: u8, total: u8, current: u8, text: char) -> String {
+        format!(
+            "00400481214300086211111150000008050003{:02X}{:02X}{:02X}{:04X}",
+            reference, total, current, text as u32
+        )
+    }
+
+    fn listing(entries: &[(u32, String)]) -> String {
+        entries
+            .iter()
+            .map(|(index, pdu)| format!("+CMGL: {},1,,{}\r\n{}\r\n", index, pdu.len() / 2 - 1, pdu))
+            .collect::<String>()
+            + "\r\nOK\r\n"
+    }
+
+    #[test]
+    fn incomplete_multipart_fragments_are_kept_in_storage() {
+        let batch = parse_pdu_sms(&listing(&[(3, part_pdu(0x2A, 2, 1, 'A'))]), "sim");
+        assert!(batch.messages.is_empty());
+        assert!(batch.consumed_indices.is_empty());
+        assert_eq!(batch.incomplete.len(), 1);
+        assert_eq!(batch.incomplete[0].indices, vec![3]);
+
+        let partial = batch.incomplete.into_iter().next().unwrap().into_partial_sms("sim");
+        assert_eq!(partial.message, "A[...]");
+    }
+
+    #[test]
+    fn completed_multipart_consumes_all_part_indices() {
+        let batch = parse_pdu_sms(
+            &listing(&[
+                (5, part_pdu(0x2A, 2, 2, 'B')),
+                (7, part_pdu(0x2B, 2, 1, 'X')),
+                (9, part_pdu(0x2A, 2, 1, 'A')),
+            ]),
+            "sim",
+        );
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.messages[0].message, "AB");
+        let mut consumed = batch.consumed_indices.clone();
+        consumed.sort();
+        assert_eq!(consumed, vec![5, 9]);
+        assert_eq!(batch.incomplete.len(), 1);
+        assert_eq!(batch.incomplete[0].indices, vec![7]);
+    }
 }

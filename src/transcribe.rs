@@ -208,6 +208,16 @@ pub(crate) fn parse_voice_prompt(text: &str, otp_length: usize) -> Result<VoiceP
     Ok(VoicePrompt::DirectOtp(extract_voice_otp(text, otp_length)?))
 }
 
+/// Aliyun hears "WhatsApp" in phone audio as "west up", "whats的", "wifi app" and the like;
+/// a short w-word directly before 验证码 is restored to the brand name.
+pub(crate) fn normalize_voice_brand(text: &str) -> String {
+    static BRAND: std::sync::LazyLock<fancy_regex::Regex> = std::sync::LazyLock::new(|| {
+        fancy_regex::Regex::new(r"(?i)(?<![a-z'])w[a-z']{0,7}(?:\s?[a-z']{1,4})?\s*的?\s*[，,]?\s*(?=验证码)")
+            .expect("valid brand pattern")
+    });
+    BRAND.replace_all(text, "WhatsApp").into_owned()
+}
+
 pub(crate) fn extract_voice_otp(text: &str, expected_length: usize) -> Result<String> {
     if !(4..=8).contains(&expected_length) {
         bail!("OTP length must be between 4 and 8 digits");
@@ -358,6 +368,23 @@ mod voice_otp_tests {
             assert_eq!(parse_voice_prompt(prompt, 6).unwrap(), VoicePrompt::PressDigit('9'));
         }
         assert_eq!(parse_voice_prompt("Press five. Press five.", 6).unwrap(), VoicePrompt::PressDigit('5'));
+    }
+
+    #[test]
+    fn voice_otp_restores_whatsapp_before_the_code_word() {
+        for (heard, expected) in [
+            ("听说west up验证码，请按2。", "听说WhatsApp验证码，请按2。"),
+            ("听说whats up，验证码请按2。", "听说WhatsApp验证码请按2。"),
+            ("就说whats的验证码请按2。", "就说WhatsApp验证码请按2。"),
+            ("接收wh a验证码，请按2。", "接收WhatsApp验证码，请按2。"),
+            ("支收wifi up验证码，按一主要支撑wifi f验证码按一。", "支收WhatsApp验证码，按一主要支撑WhatsApp验证码按一。"),
+            ("输出word p验证码请按2。", "输出WhatsApp验证码请按2。"),
+        ] {
+            assert_eq!(normalize_voice_brand(heard), expected);
+        }
+        for unchanged in ["您的验证码为951782。", "Telegram验证码请按2", "微信验证码"] {
+            assert_eq!(normalize_voice_brand(unchanged), unchanged);
+        }
     }
 
     #[test]

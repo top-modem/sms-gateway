@@ -25,6 +25,8 @@ pub(crate) struct AliyunAsrSettings {
     pub access_key_secret: String,
     pub region: String,
     pub sample_rate: u32,
+    /// Hotword list created on the account by `ensure_vocabulary`.
+    pub vocabulary_id: String,
 }
 
 /// Secret-free view returned to the browser.
@@ -102,8 +104,10 @@ impl AliyunAsrSettings {
         settings.sample_rate = update.sample_rate;
         if let Some(token) = update.token { settings.token = field(&token)?; }
         if let Some(secret) = update.access_key_secret { settings.access_key_secret = field(&secret)?; }
+        settings.vocabulary_id.clear();
         crate::db::AppSetting::set(SETTING_KEY, Some(&serde_json::to_string(&settings)?)).await?;
         *TOKEN_CACHE.lock().await = None;
+        tokio::spawn(ensure_vocabulary());
         Ok(settings)
     }
 }
@@ -124,7 +128,11 @@ fn client() -> Result<reqwest::Client> {
 }
 
 fn pop_signature(secret: &str, canonical_query: &str) -> String {
-    let string_to_sign = format!("GET&%2F&{}", urlencoding::encode(canonical_query));
+    pop_signature_for("GET", secret, canonical_query)
+}
+
+fn pop_signature_for(method: &str, secret: &str, canonical_query: &str) -> String {
+    let string_to_sign = format!("{}&%2F&{}", method, urlencoding::encode(canonical_query));
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(format!("{}&", secret).as_bytes()).expect("HMAC accepts any key length");
     mac.update(string_to_sign.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
@@ -189,21 +197,125 @@ pub(crate) async fn transcribe(amr_bytes: &[u8], ffmpeg_exe: &str) -> Result<Str
     };
     let converted_ms = started.elapsed().as_millis();
     let size = audio.len();
-    let text = recognize_format(&settings, audio, format).await?;
+    let vocabulary = (!settings.vocabulary_id.is_empty()).then(|| settings.vocabulary_id.clone());
+    if vocabulary.is_none() {
+        tokio::spawn(ensure_vocabulary());
+    }
+    let text = match recognize_format(&settings, audio.clone(), format, vocabulary.as_deref()).await {
+        Err(error) if vocabulary.is_some() => {
+            log::warn!("Aliyun recognition with hotword list failed, retrying without it: {:#}", error);
+            forget_vocabulary().await;
+            recognize_format(&settings, audio, format, None).await?
+        }
+        result => result?,
+    };
     log::info!("Aliyun ASR timing: ffmpeg {} ms, upload+recognition {} ms ({} {} bytes)",
         converted_ms, started.elapsed().as_millis() - converted_ms, format, size);
     Ok(text)
 }
 
-pub(crate) async fn recognize(settings: &AliyunAsrSettings, wav: Vec<u8>) -> Result<String> {
-    recognize_format(settings, wav, "wav").await
+const VOCABULARY_NAME: &str = "sms-gateway-voice-otp";
+/// Phone-quality audio rarely yields the brand name without a boost.
+const VOCABULARY_WORDS: &str = r#"{"WhatsApp":5,"验证码":3}"#;
+
+/// Finds or creates the hotword list once per account; needs an AccessKey, not just a token.
+async fn ensure_vocabulary() {
+    static LAST_FAILURE: Mutex<Option<std::time::Instant>> = Mutex::const_new(None);
+    let Ok(mut last_failure) = LAST_FAILURE.try_lock() else { return };
+    if last_failure.is_some_and(|at| at.elapsed() < Duration::from_secs(600)) { return; }
+    let Ok(mut settings) = AliyunAsrSettings::load().await else { return };
+    if !settings.vocabulary_id.is_empty() || settings.access_key_id.is_empty()
+        || settings.access_key_secret.is_empty() || settings.region == "ap-southeast-1"
+    {
+        return;
+    }
+    match find_or_create_vocabulary(&settings).await {
+        Ok(id) => {
+            log::info!("Aliyun hotword list {} ready: {}", VOCABULARY_NAME, id);
+            settings.vocabulary_id = id;
+            if let Ok(value) = serde_json::to_string(&settings) {
+                if let Err(error) = crate::db::AppSetting::set(SETTING_KEY, Some(&value)).await {
+                    log::warn!("Cannot save the Aliyun hotword list id: {:#}", error);
+                }
+            }
+        }
+        Err(error) => {
+            log::warn!("Cannot prepare the Aliyun hotword list: {:#}", error);
+            *last_failure = Some(std::time::Instant::now());
+        }
+    }
 }
 
-async fn recognize_format(settings: &AliyunAsrSettings, audio: Vec<u8>, format: &str) -> Result<String> {
+async fn forget_vocabulary() {
+    if let Ok(mut settings) = AliyunAsrSettings::load().await {
+        settings.vocabulary_id.clear();
+        if let Ok(value) = serde_json::to_string(&settings) {
+            let _ = crate::db::AppSetting::set(SETTING_KEY, Some(&value)).await;
+        }
+    }
+}
+
+async fn find_or_create_vocabulary(settings: &AliyunAsrSettings) -> Result<String> {
+    let list = vocabulary_call(settings, "ListAsrVocab", &[("PageSize", "100".into())]).await?;
+    let existing = list.pointer("/Page/Content").and_then(|v| v.as_array()).and_then(|items| {
+        items.iter().find(|item| item.get("Name").and_then(|v| v.as_str()) == Some(VOCABULARY_NAME))
+            .and_then(|item| item.get("Id").and_then(|v| v.as_str()))
+    });
+    if let Some(id) = existing {
+        return Ok(id.to_string());
+    }
+    let created = vocabulary_call(settings, "CreateAsrVocab", &[
+        ("Name", VOCABULARY_NAME.into()),
+        ("Description", "sms-gateway voice OTP".into()),
+        ("WordWeights", VOCABULARY_WORDS.into()),
+    ]).await?;
+    created.get("VocabId").and_then(|v| v.as_str()).map(str::to_string)
+        .context("CreateAsrVocab returned no VocabId")
+}
+
+async fn vocabulary_call(settings: &AliyunAsrSettings, action: &str, extra: &[(&str, String)]) -> Result<serde_json::Value> {
+    let mut params: std::collections::BTreeMap<&str, String> = [
+        ("AccessKeyId", settings.access_key_id.clone()),
+        ("Action", action.into()),
+        ("Format", "JSON".into()),
+        ("RegionId", "cn-shanghai".into()),
+        ("SignatureMethod", "HMAC-SHA1".into()),
+        ("SignatureNonce", uuid::Uuid::new_v4().to_string()),
+        ("SignatureVersion", "1.0".into()),
+        ("Timestamp", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        ("Version", "2018-11-20".into()),
+    ].into_iter().collect();
+    params.extend(extra.iter().map(|(key, value)| (*key, value.clone())));
+    let query = canonical_query(&params);
+    let body = format!("{}&Signature={}", query,
+        urlencoding::encode(&pop_signature_for("POST", &settings.access_key_secret, &query)));
+    let response = client()?.post("https://nls-slp.cn-shanghai.aliyuncs.com/")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send().await.map_err(reqwest::Error::without_url)
+        .with_context(|| format!("Failed to call Aliyun {}", action))?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await.map_err(reqwest::Error::without_url)
+        .with_context(|| format!("Invalid Aliyun {} response", action))?;
+    if !status.is_success() {
+        bail!("Aliyun {} failed (HTTP {}): {}", action, status,
+            value.get("Code").and_then(|v| v.as_str()).unwrap_or("unknown error"));
+    }
+    Ok(value)
+}
+
+pub(crate) async fn recognize(settings: &AliyunAsrSettings, wav: Vec<u8>) -> Result<String> {
+    recognize_format(settings, wav, "wav", None).await
+}
+
+async fn recognize_format(settings: &AliyunAsrSettings, audio: Vec<u8>, format: &str, vocabulary: Option<&str>) -> Result<String> {
     let token = access_token(settings).await?;
-    let url = format!(
+    let mut url = format!(
         "https://nls-gateway-{}.aliyuncs.com/stream/v1/asr?appkey={}&format={}&sample_rate={}&enable_punctuation_prediction=true&enable_inverse_text_normalization=true",
         settings.region, urlencoding::encode(&settings.app_key), format, settings.sample_rate);
+    if let Some(id) = vocabulary {
+        url.push_str(&format!("&vocabulary_id={}", urlencoding::encode(id)));
+    }
     let mut attempt = 0;
     let response = loop {
         attempt += 1;

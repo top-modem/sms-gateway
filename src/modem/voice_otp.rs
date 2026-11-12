@@ -118,7 +118,7 @@ impl CallIo for LocalCall {
         let text = crate::aliyun_asr::transcribe(audio, &self.config.ffmpeg_exe).await?;
         log::info!("[Voice {}] Aliyun recognition took {} ms for {} bytes: {:?}",
             self.modem.com_port, started.elapsed().as_millis(), audio.len(), text);
-        Ok(text)
+        Ok(crate::transcribe::normalize_voice_brand(&text))
     }
 
     async fn save_audio(&self, audio: &[u8], prompt: bool) -> Result<()> {

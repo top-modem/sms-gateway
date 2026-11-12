@@ -233,6 +233,7 @@ fn append_amr(all: &mut Vec<u8>, slice: &[u8]) {
 
 fn record_prompt_readings(progress: &mut VoiceOtpProgress, text: &str) {
     progress.prompt_transcript = Some(text.to_string());
+    progress.app = crate::transcribe::detect_voice_app(text);
     progress.prompt_readings = crate::transcribe::voice_prompt_readings(text).unwrap_or_default();
     progress.prompt_comparison = Some(match progress.prompt_readings.len() {
         0 => "incomplete",
@@ -378,6 +379,9 @@ async fn run(
             state(io, progress, "transcribing_code").await?;
             let code_text = cancellable(io.transcribe(&code_audio), cancel, deadline).await?;
             progress.code_transcript = Some(code_text.clone());
+            if progress.app.is_none() {
+                progress.app = crate::transcribe::detect_voice_app(&code_text);
+            }
             progress.otp = Some(crate::transcribe::extract_voice_otp(&code_text, settings.otp_length)?);
         }
     }

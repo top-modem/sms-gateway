@@ -106,6 +106,9 @@ pub(crate) struct VoiceOtpProgress {
     pub code_transcript: Option<String>,
     pub dtmf: Option<char>,
     pub otp: Option<String>,
+    /// App named in the prompt, e.g. "WhatsApp".
+    #[serde(default)]
+    pub app: Option<String>,
     pub error: Option<String>,
 }
 
@@ -216,6 +219,17 @@ pub(crate) fn normalize_voice_brand(text: &str) -> String {
             .expect("valid brand pattern")
     });
     BRAND.replace_all(text, "WhatsApp").into_owned()
+}
+
+/// App named in a voice prompt, so the code can be labelled with it.
+pub(crate) fn detect_voice_app(text: &str) -> Option<String> {
+    const APPS: [(&str, &str); 12] = [
+        ("whatsapp", "WhatsApp"), ("telegram", "Telegram"), ("wechat", "WeChat"), ("微信", "微信"),
+        ("google", "Google"), ("microsoft", "Microsoft"), ("facebook", "Facebook"), ("instagram", "Instagram"),
+        ("tiktok", "TikTok"), ("signal", "Signal"), ("paypal", "PayPal"), ("uber", "Uber"),
+    ];
+    let lower = text.to_lowercase().replace(char::is_whitespace, "");
+    APPS.iter().find(|(needle, _)| lower.contains(needle)).map(|(_, name)| name.to_string())
 }
 
 pub(crate) fn extract_voice_otp(text: &str, expected_length: usize) -> Result<String> {
@@ -368,6 +382,13 @@ mod voice_otp_tests {
             assert_eq!(parse_voice_prompt(prompt, 6).unwrap(), VoicePrompt::PressDigit('9'));
         }
         assert_eq!(parse_voice_prompt("Press five. Press five.", 6).unwrap(), VoicePrompt::PressDigit('5'));
+    }
+
+    #[test]
+    fn voice_otp_detects_the_app_named_in_the_prompt() {
+        assert_eq!(detect_voice_app("听说WhatsApp验证码，请按2。").as_deref(), Some("WhatsApp"));
+        assert_eq!(detect_voice_app("Your Telegram code is 12345").as_deref(), Some("Telegram"));
+        assert_eq!(detect_voice_app("您的验证码为951782。"), None);
     }
 
     #[test]

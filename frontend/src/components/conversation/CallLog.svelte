@@ -428,7 +428,7 @@
               <div class="flex items-center gap-3 flex-wrap text-xs text-gray-600 dark:text-gray-300">
                 <span class={voice.error ? 'text-red-600 dark:text-red-400' : 'text-blue-600 dark:text-blue-400'}>{$t(`voice_state_${voice.state}`)}</span>
                 {#if voice.dtmf}<span>{$t('voice_dtmf')}: <span class="font-mono">{voice.dtmf}</span></span>{/if}
-                {#if voice.otp}<span class="text-sm font-semibold text-green-700 dark:text-green-400">{$t('voice_code')}: <span class="font-mono">{voice.otp}</span></span>{/if}
+                {#if voice.otp}<span class="text-sm font-semibold text-green-700 dark:text-green-400">{voice.app ? `${voice.app} ` : ''}{$t('voice_code')}: <span class="font-mono">{voice.otp}</span></span>{/if}
                 {#if voice.prompt_transcript}
                   <button type="button" onclick={() => downloadVoice(call.id, 'prompt')} aria-label={$t('voice_download_prompt')} title={$t('voice_download_prompt')} class="w-8 h-8 rounded-md border border-gray-200 dark:border-zinc-700 flex items-center justify-center">
                     <Icon icon="carbon:download" class="w-4 h-4" />

@@ -2303,7 +2303,7 @@ impl Modem {
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 2 {
                     let number = parts[1].trim().trim_matches('"').to_string();
-                    if number.is_empty() {
+                    if number.is_empty() || crate::phone_number::is_placeholder_msisdn(&number) {
                         None
                     } else {
                         Some(number)
@@ -2788,23 +2788,27 @@ impl Modem {
         Ok(())
     }
 
-    async fn wait_registered(&self, eps: bool, timeout: Duration) -> bool {
+    /// Waits until one of the domains (true = EPS/4G via CEREG, false = CS via CREG) is registered
+    /// and returns which one.
+    async fn wait_registered(&self, domains: &[bool], timeout: Duration) -> Option<bool> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            let command = if eps { "AT+CEREG?\r\n" } else { "AT+CREG?\r\n" };
-            if let Ok(response) = self.send_command(command).await {
-                let status = if eps {
-                    NetworkRegistrationStatus::from_cereg_response(&response)
-                } else {
-                    NetworkRegistrationStatus::from_response(&response)
-                };
-                if status.is_some_and(|status| matches!(status.status_code().trim(), "1" | "5")) {
-                    return true;
+            for &eps in domains {
+                let command = if eps { "AT+CEREG?\r\n" } else { "AT+CREG?\r\n" };
+                if let Ok(response) = self.send_command(command).await {
+                    let status = if eps {
+                        NetworkRegistrationStatus::from_cereg_response(&response)
+                    } else {
+                        NetworkRegistrationStatus::from_response(&response)
+                    };
+                    if status.is_some_and(|status| matches!(status.status_code().trim(), "1" | "5")) {
+                        return Some(eps);
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        false
+        None
     }
 
     /// USSD only works on 2G/3G: switch to GSM (then WCDMA), send the code, then restore LTE.
@@ -2817,7 +2821,7 @@ impl Modem {
                 result = Err(format!("切换到 {} 失败: {}", label, e));
                 continue;
             }
-            if !self.wait_registered(false, Duration::from_secs(45)).await {
+            if self.wait_registered(&[false], Duration::from_secs(45)).await.is_none() {
                 info!("[USSD {}] not registered on {} within 45s", self.com_port, label);
                 continue;
             }
@@ -2828,19 +2832,20 @@ impl Modem {
         }
         // A port that was already 2G/3G-only still goes back to automatic (4G) selection.
         let restore = if matches!(original, 1 | 2) { 0 } else { original };
+        // SIMs without a 4G plan only come back on CREG, so either registration counts.
         let restored = match self.set_nwscanmode(restore).await {
-            Ok(()) => self.wait_registered(true, Duration::from_secs(60)).await,
+            Ok(()) => self.wait_registered(&[true, false], Duration::from_secs(60)).await,
             Err(e) => {
                 warn!("[USSD {}] failed to restore nwscanmode {}: {}", self.com_port, restore, e);
-                false
+                None
             }
         };
-        if !restored {
-            warn!("[USSD {}] not yet registered on 4G after restoring nwscanmode {}", self.com_port, restore);
-        } else {
-            info!("[USSD {}] restored nwscanmode {} and registered on 4G", self.com_port, restore);
+        match restored {
+            Some(true) => info!("[USSD {}] restored nwscanmode {} and registered on 4G", self.com_port, restore),
+            Some(false) => info!("[USSD {}] restored nwscanmode {}; registered on 2G/3G (no 4G registration yet)", self.com_port, restore),
+            None => warn!("[USSD {}] not yet registered after restoring nwscanmode {}", self.com_port, restore),
         }
-        result.map(|text| if restored { text } else { format!("{} (已恢复网络模式，4G 尚未注册)", text) })
+        result.map(|text| if restored.is_some() { text } else { format!("{} (已恢复网络模式，网络尚未注册)", text) })
     }
 
     /// Service provider name from the SIM (AT+CSPN?), e.g. "giffgaff".

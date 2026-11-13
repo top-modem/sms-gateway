@@ -61,6 +61,19 @@ pub fn normalize_msisdn(raw: &str) -> String {
     digits.trim_start_matches('0').to_string()
 }
 
+/// Some SIMs carry a dummy own-number such as "440000000000" instead of their MSISDN.
+pub(crate) fn is_placeholder_msisdn(raw: &str) -> bool {
+    let digits = normalize_msisdn(raw);
+    let trailing_zeros = digits.len() - digits.trim_end_matches('0').len();
+    digits.len() < 6 || trailing_zeros >= 6 || digits.chars().all(|digit| Some(digit) == digits.chars().next())
+}
+
+/// Three UK has no 2G and switched off 3G, so USSD over the legacy network cannot work.
+fn ussd_unavailable_reason(imsi: Option<&str>) -> Option<&'static str> {
+    imsi.filter(|imsi| imsi.starts_with("23420"))
+        .map(|_| "Three UK 没有 2G/3G 网络，无法使用 USSD；请用欢迎短信或短信取号")
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct WelcomeSmsIdentity {
     pub operator: &'static str,
@@ -411,6 +424,9 @@ pub async fn ussd_batch(mm: Arc<ModemManager>, task: TaskHandle, code: String) {
     lookup_missing_numbers(mm, task, "ussd", |mm, info| {
         let code = code.clone();
         async move {
+            if let Some(reason) = ussd_unavailable_reason(info.imsi.as_deref()) {
+                return Err(reason.to_string());
+            }
             let response = mm.send_ussd_on_legacy_network(&info.sim_id, &code).await?;
             match extract_phone_from_ussd(&response) {
                 Some(phone) => Ok(Some(phone)),
@@ -504,6 +520,18 @@ mod number_lookup_tests {
     }
 
     #[test]
+    fn placeholder_sim_numbers_are_not_real_numbers() {
+        for dummy in ["440000000000", "+440000000000", "0000000000", "1111111111", "12345"] {
+            assert!(is_placeholder_msisdn(dummy), "{dummy}");
+        }
+        for real in ["7848960848", "+447557537442", "07345830360", "7700900100"] {
+            assert!(!is_placeholder_msisdn(real), "{real}");
+        }
+        assert!(ussd_unavailable_reason(Some("234201234567890")).is_some());
+        assert!(ussd_unavailable_reason(Some("234151234567890")).is_none());
+    }
+
+    #[test]
     fn free_sms_route_uses_spn_before_imsi() {
         assert_eq!(free_sms_route(Some("giffgaff"), Some("234100000000000")).unwrap().to, "43430");
         assert_eq!(free_sms_route(Some("ASDA Mobile"), None).unwrap().body, "MY NUMBER");
@@ -523,6 +551,7 @@ struct SimInfo {
     com_port: String,
     sim_id: String,
     phone_number: Option<String>,
+    imsi: Option<String>,
 }
 
 async fn list_sims(mm: &Arc<ModemManager>) -> Vec<SimInfo> {
@@ -541,7 +570,9 @@ async fn list_sims(mm: &Arc<ModemManager>) -> Vec<SimInfo> {
             result.push(SimInfo {
                 com_port,
                 sim_id,
-                phone_number: card.phone_number.clone(),
+                phone_number: card.phone_number.clone()
+                    .filter(|phone| !phone.trim().is_empty() && !is_placeholder_msisdn(phone)),
+                imsi: card.imsi.clone(),
             });
         }
     }

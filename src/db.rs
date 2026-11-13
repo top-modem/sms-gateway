@@ -1208,6 +1208,19 @@ impl SimCard {
         Ok(updated.rows_affected() == 1)
     }
 
+    /// Drops dummy own-numbers (e.g. "440000000000") read from SIMs so number lookup treats them as missing.
+    async fn clear_placeholder_numbers_in_pool(pool: &SqlitePool) -> Result<()> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, phone_number FROM sim_cards WHERE phone_number_source = 'sim_read' AND phone_number IS NOT NULL",
+        ).fetch_all(pool).await?;
+        for (id, phone) in rows.into_iter().filter(|(_, phone)| crate::phone_number::is_placeholder_msisdn(phone)) {
+            sqlx::query("UPDATE sim_cards SET phone_number = NULL, phone_number_source = NULL WHERE id = ? AND phone_number = ?")
+                .bind(&id).bind(&phone).execute(pool).await?;
+            log::info!("Cleared placeholder SIM number {} on {}", phone, id);
+        }
+        Ok(())
+    }
+
     async fn backfill_identity_in_pool(pool: &SqlitePool, id: &str, imsi: Option<&str>, phone: Option<&str>) -> Result<()> {
         sqlx::query(
             "UPDATE sim_cards SET imsi = COALESCE(?1, imsi),
@@ -3529,6 +3542,7 @@ pub async fn db_init() -> Result<()> {
 
     migrate!("./migrations").run(&pool).await?;
     Call::interrupt_voice_otp_in_pool(&pool).await?;
+    SimCard::clear_placeholder_numbers_in_pool(&pool).await?;
 
     POOL.set(pool)
         .map_err(|_| anyhow::anyhow!("Failed to initialize database connection pool"))?;

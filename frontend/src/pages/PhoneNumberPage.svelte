@@ -37,6 +37,15 @@
   let ussdRunning = $state(false);
   let freeSmsRunning = $state(false);
 
+  // Export tab
+  let exportSelected = $state([]);
+  let exportDialogOpen = $state(false);
+  let exportFileName = $state('');
+  let exportFileInput = $state(null);
+  let numberedSims = $derived(sims.filter(s => String(s.phone_number ?? '').trim()));
+  let allExportSelected = $derived(numberedSims.length > 0 && numberedSims.every(s => exportSelected.includes(s.sim_id)));
+  let exportCount = $derived(numberedSims.filter(s => exportSelected.includes(s.sim_id)).length);
+
   // Status polling
   let statusTask = $state(null);
   let taskStatus = $state({ running: false, task_type: '', total: 0, done: 0, current: '', errors: [], results: [] });
@@ -344,6 +353,46 @@
     }
   }
 
+  // ── Export tab ───────────────────────────────────────────────────────────────────────
+  function toggleExportAll(checked) {
+    exportSelected = checked ? numberedSims.map(s => s.sim_id) : [];
+  }
+
+  function toggleExportSim(simId, checked) {
+    exportSelected = checked
+      ? [...exportSelected.filter(id => id !== simId), simId]
+      : exportSelected.filter(id => id !== simId);
+  }
+
+  async function openExportDialog() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    exportFileName = `phone_numbers_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+    exportDialogOpen = true;
+    await tick();
+    exportFileInput?.focus();
+    exportFileInput?.select();
+  }
+
+  function exportNumbers() {
+    const numbers = numberedSims
+      .filter(s => exportSelected.includes(s.sim_id))
+      .map(s => String(s.phone_number).trim());
+    if (numbers.length === 0) return;
+    let name = exportFileName.trim().replace(/[\\/:*?"<>|]/g, '_') || 'phone_numbers';
+    if (!/\.txt$/i.test(name)) name += '.txt';
+    const blob = new Blob([numbers.join('\r\n') + '\r\n'], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    exportDialogOpen = false;
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────────────
   function formatPhone(p) {
     if (!p) return $t('phone_result_empty');
@@ -461,6 +510,7 @@
       {#each [
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
         { id: 'free_sms', label: $t('btn_free_sms_number'), icon: 'carbon:chat' },
+        { id: 'export', label: $t('btn_export_numbers'), icon: 'carbon:document-export' },
       ] as tab}
         <button
           onclick={() => setActiveTab(tab.id)}
@@ -800,6 +850,86 @@
                 {/if}
                 {$t('btn_free_sms_start')}
               </button>
+            </div>
+          </div>
+
+        <!-- Export numbers -->
+        {:else if activeTab === 'export'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            {#if numberedSims.length === 0}
+              <p class="text-gray-500 dark:text-gray-400">{$t('export_no_numbers')}</p>
+            {:else}
+              <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800 max-h-[60vh] overflow-y-auto">
+                <table class="min-w-full text-sm">
+                  <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 sticky top-0">
+                    <tr>
+                      <th class="px-3 py-2 text-left font-medium w-10">
+                        <input type="checkbox" class="accent-blue-600" aria-label={$t('export_select_all')}
+                          checked={allExportSelected} onchange={(event) => toggleExportAll(event.currentTarget.checked)} />
+                      </th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_com')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_iccid')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_current_phone')}</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                    {#each numberedSims as sim (sim.sim_id)}
+                      <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                        <td class="px-3 py-2">
+                          <input type="checkbox" class="accent-blue-600" aria-label={sim.com_port}
+                            checked={exportSelected.includes(sim.sim_id)}
+                            onchange={(event) => toggleExportSim(sim.sim_id, event.currentTarget.checked)} />
+                        </td>
+                        <td class="px-3 py-2 font-medium">{sim.com_port}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{sim.sim_id}</td>
+                        <td class="px-3 py-2 font-mono">{sim.phone_number}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {/if}
+
+            <div class="flex items-center justify-between">
+              <span class="text-sm text-gray-500 dark:text-gray-400">{$t('export_selected_count', { n: exportCount })}</span>
+              <button
+                onclick={openExportDialog}
+                disabled={exportCount === 0}
+                class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                <Icon icon="carbon:document-export" class="w-4 h-4" />
+                {$t('btn_export_numbers')}
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        {#if exportDialogOpen}
+          <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="presentation"
+            onclick={(event) => { if (event.target === event.currentTarget) exportDialogOpen = false; }}>
+            <div class="w-full max-w-md rounded-xl bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 shadow-xl p-5 space-y-4"
+              role="dialog" aria-modal="true" aria-labelledby="exportDialogTitle">
+              <h2 id="exportDialogTitle" class="text-base font-semibold text-gray-800 dark:text-gray-100">{$t('export_file_title')}</h2>
+              <div>
+                <label for="exportFileName" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{$t('export_file_name')}</label>
+                <div class="flex items-center gap-2">
+                  <input id="exportFileName" type="text" bind:this={exportFileInput} bind:value={exportFileName}
+                    onkeydown={(event) => { if (event.key === 'Enter') exportNumbers(); if (event.key === 'Escape') exportDialogOpen = false; }}
+                    class="flex-1 rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none" />
+                  <span class="text-gray-500 dark:text-gray-400">.txt</span>
+                </div>
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{$t('export_file_hint')}</p>
+              </div>
+              <div class="flex justify-end gap-2">
+                <button onclick={() => (exportDialogOpen = false)}
+                  class="px-4 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-zinc-800 hover:bg-gray-200 dark:hover:bg-zinc-700 transition">
+                  {$t('btn_cancel_export')}
+                </button>
+                <button onclick={exportNumbers}
+                  class="px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 transition">
+                  {$t('btn_confirm_export')}
+                </button>
+              </div>
             </div>
           </div>
         {/if}

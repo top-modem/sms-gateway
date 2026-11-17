@@ -35,6 +35,10 @@
   // USSD tab
   let ussdCode = $state('*#100#');
   let ussdRunning = $state(false);
+  let ussdSelected = $state([]);
+  let stopping = $state(false);
+  let emptySims = $derived(sims.filter(s => !String(s.phone_number ?? '').trim()));
+  let ussdTargets = $derived(emptySims.filter(s => ussdSelected.includes(s.com_port)).map(s => s.com_port));
   let freeSmsRunning = $state(false);
 
   // Export tab
@@ -114,6 +118,7 @@
       if (running) {
         statusTask = setTimeout(pollStatus, 1500);
       } else {
+        stopping = false;
         // Refresh SIM list when task finishes
         fetchData();
       }
@@ -331,14 +336,30 @@
       error = $t('err_no_ussd_code');
       return;
     }
+    if (ussdTargets.length === 0) return;
     ussdRunning = true;
     try {
-      await apiClient.sendUssdBatch(ussdCode.trim());
+      await apiClient.sendUssdBatch(ussdCode.trim(), ussdTargets);
       startPolling();
     } catch (e) {
       error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
       ussdRunning = false;
+      startPolling();
     }
+  }
+
+  async function stopTask() {
+    stopping = true;
+    try {
+      await apiClient.cancelPhoneNumberTask();
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+    }
+  }
+
+  function toggleUssdPort(port, checked) {
+    ussdSelected = checked ? [...ussdSelected.filter(p => p !== port), port] : ussdSelected.filter(p => p !== port);
   }
 
   async function startFreeSms() {
@@ -435,6 +456,8 @@
 
   onMount(async () => {
     await Promise.all([fetchData(), loadWelcomeSmsSync()]);
+    // A task started earlier (or from another browser) keeps running on the server.
+    startPolling();
     if (activeTab === 'barcode') {
       await fetchBarcodeScans();
       await focusBarcodeIccidInput();
@@ -803,7 +826,7 @@
               </div>
               <button
                 onclick={sendUssdBatch}
-                disabled={ussdRunning}
+                disabled={ussdRunning || taskStatus.running || ussdTargets.length === 0}
                 class="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
                 {#if ussdRunning}
@@ -816,9 +839,48 @@
             </div>
             <p class="text-xs text-gray-500 dark:text-gray-400">{$t('ussd_network_hint')}</p>
 
-            {#if taskStatus.running && taskStatus.task_type === 'ussd'}
-              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300">
-                {$t('ussd_progress', { done: taskStatus.done, total: taskStatus.total })}
+            {#if emptySims.length === 0}
+              <p class="text-sm text-gray-500 dark:text-gray-400">{$t('ussd_no_empty_ports')}</p>
+            {:else}
+              <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800 max-h-[45vh] overflow-y-auto">
+                <table class="min-w-full text-sm">
+                  <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 sticky top-0">
+                    <tr>
+                      <th class="px-3 py-2 text-left font-medium w-10">
+                        <input type="checkbox" class="accent-blue-600" aria-label={$t('export_select_all')}
+                          checked={ussdTargets.length === emptySims.length}
+                          onchange={(event) => (ussdSelected = event.currentTarget.checked ? emptySims.map(s => s.com_port) : [])} />
+                      </th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_com')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_iccid')}</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                    {#each emptySims as sim (sim.sim_id)}
+                      <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                        <td class="px-3 py-2">
+                          <input type="checkbox" class="accent-blue-600" aria-label={sim.com_port}
+                            checked={ussdSelected.includes(sim.com_port)}
+                            onchange={(event) => toggleUssdPort(sim.com_port, event.currentTarget.checked)} />
+                        </td>
+                        <td class="px-3 py-2 font-medium">{sim.com_port}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{sim.sim_id}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+              <span class="text-sm text-gray-500 dark:text-gray-400">{$t('export_selected_count', { n: ussdTargets.length })}</span>
+            {/if}
+
+            {#if taskStatus.running}
+              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300 flex items-center justify-between gap-3">
+                <span>{$t('phone_task_running', { type: taskStatus.task_type, done: taskStatus.done, total: taskStatus.total })} · {taskStatus.current}</span>
+                <button onclick={stopTask} disabled={stopping}
+                  class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 transition">
+                  <Icon icon="carbon:stop-filled" class="w-4 h-4" />
+                  {$t('btn_stop_task')}
+                </button>
               </div>
             {/if}
           </div>

@@ -339,6 +339,7 @@ pub async fn run_api(
             post(phone_numbers_free_sms).with_state(modem_manager.clone()),
         )
         .route("/phone-numbers/status", get(phone_numbers_status))
+        .route("/phone-numbers/cancel", post(phone_numbers_cancel))
         // ── 火狐狸 platform integration routes ─────────────────────────────
         .route("/settings/firefox-api-key", get(get_firefox_api_key))
         .route("/settings/firefox-api-key", put(set_firefox_api_key))
@@ -1402,6 +1403,9 @@ struct PhoneNumberImportRequest {
 #[derive(Deserialize)]
 struct PhoneNumberUssdRequest {
     code: String,
+    /// Empty means every port without a number.
+    #[serde(default)]
+    com_ports: Vec<String>,
 }
 
 fn get_phone_number_task() -> &'static TaskHandle {
@@ -1773,8 +1777,17 @@ async fn phone_numbers_ussd(
     if !claim_phone_number_task(&task, "ussd").await {
         return (StatusCode::CONFLICT, Json(json!({"error": "Another phone-number task is running"}))).into_response();
     }
-    tokio::spawn(ussd_batch(mm, task, code));
+    tokio::spawn(ussd_batch(mm, task, code, payload.com_ports));
     (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_cancel() -> Response {
+    let mut task = get_phone_number_task().write().await;
+    if task.running {
+        task.cancel_requested = true;
+        task.current = "正在停止：等待进行中的端口完成并恢复网络".to_string();
+    }
+    (StatusCode::OK, Json(json!({"status": "stopping"}))).into_response()
 }
 
 async fn phone_numbers_free_sms(State(mm): State<ModemManagerRef>) -> Response {
@@ -1792,6 +1805,7 @@ async fn claim_phone_number_task(task: &TaskHandle, task_type: &str) -> bool {
         return false;
     }
     t.running = true;
+    t.cancel_requested = false;
     t.task_type = task_type.to_string();
     t.done = 0;
     t.total = 0;
@@ -1809,6 +1823,7 @@ async fn phone_numbers_status() -> Response {
         current: task.current.clone(),
         errors: task.errors.clone(),
         results: task.results.clone(),
+        cancel_requested: task.cancel_requested,
     };
     Json(task_clone).into_response()
 }

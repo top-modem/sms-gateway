@@ -20,6 +20,9 @@ pub struct PhoneNumberTask {
     pub current: String,
     pub errors: Vec<String>,
     pub results: Vec<PhoneResult>,
+    /// Set by the stop button; ports not yet started are skipped.
+    #[serde(skip)]
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -369,14 +372,17 @@ pub async fn sms_exchange(mm: Arc<ModemManager>, task: TaskHandle) {
 /// Ports switch radio mode independently, so several can run at once.
 const NUMBER_LOOKUP_CONCURRENCY: usize = 8;
 
-/// Run `lookup` for every SIM without a phone number, saving any number it returns.
-async fn lookup_missing_numbers<F, Fut>(mm: Arc<ModemManager>, task: TaskHandle, task_type: &str, lookup: F)
+/// Run `lookup` for every SIM without a phone number (only `com_ports` when given), saving any number it returns.
+async fn lookup_missing_numbers<F, Fut>(mm: Arc<ModemManager>, task: TaskHandle, task_type: &str, com_ports: Vec<String>, lookup: F)
 where
     F: Fn(Arc<ModemManager>, SimInfo) -> Fut,
     Fut: std::future::Future<Output = Result<Option<String>, String>>,
 {
     use futures::StreamExt;
-    let targets: Vec<_> = list_sims(&mm).await.into_iter().filter(|s| s.phone_number.is_none()).collect();
+    let targets: Vec<_> = list_sims(&mm).await.into_iter()
+        .filter(|s| s.phone_number.is_none())
+        .filter(|s| com_ports.is_empty() || com_ports.iter().any(|port| port.eq_ignore_ascii_case(&s.com_port)))
+        .collect();
     {
         let mut t = task.write().await;
         t.running = true;
@@ -390,7 +396,12 @@ where
     let mut results = futures::stream::iter(targets.into_iter().map(|info| {
         let mm = mm.clone();
         let lookup = &lookup;
+        let task = task.clone();
         async move {
+            if task.read().await.cancel_requested {
+                return PhoneResult { com_port: info.com_port, sim_id: info.sim_id, phone_number: None,
+                    status: PhoneResultStatus::Skipped, message: "已停止".to_string() };
+            }
             let outcome = lookup(mm.clone(), info.clone()).await;
             let (phone_number, status, message) = match outcome {
                 Ok(Some(phone)) => match write_phone_number(&mm, &info.sim_id, &phone).await {
@@ -416,12 +427,13 @@ where
     }
     let mut t = task.write().await;
     t.running = false;
+    t.cancel_requested = false;
     t.current = "取号完成".to_string();
 }
 
-/// Send a USSD code on 2G/3G to every SIM without a phone number, then return it to 4G.
-pub async fn ussd_batch(mm: Arc<ModemManager>, task: TaskHandle, code: String) {
-    lookup_missing_numbers(mm, task, "ussd", |mm, info| {
+/// Send a USSD code on 2G/3G to SIMs without a phone number, then return them to 4G.
+pub async fn ussd_batch(mm: Arc<ModemManager>, task: TaskHandle, code: String, com_ports: Vec<String>) {
+    lookup_missing_numbers(mm, task, "ussd", com_ports, |mm, info| {
         let code = code.clone();
         async move {
             if let Some(reason) = ussd_unavailable_reason(info.imsi.as_deref()) {
@@ -465,7 +477,7 @@ pub(crate) fn free_sms_route(spn: Option<&str>, imsi: Option<&str>) -> Option<Fr
 
 /// Text the operator's free number-lookup short code and read the number from its reply.
 pub async fn free_sms_batch(mm: Arc<ModemManager>, task: TaskHandle) {
-    lookup_missing_numbers(mm, task, "free_sms", |mm, info| async move {
+    lookup_missing_numbers(mm, task, "free_sms", Vec::new(), |mm, info| async move {
         let spn = mm.read_spn(&info.sim_id).await;
         let imsi = mm.get_sim_card_cached(&info.sim_id).await.and_then(|card| card.imsi);
         let route = free_sms_route(spn.as_deref(), imsi.as_deref())

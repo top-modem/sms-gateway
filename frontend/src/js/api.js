@@ -334,8 +334,12 @@ class ApiClient {
         return FetchApi.post('/api/phone-numbers/sms-exchange');
     }
 
-    async sendUssdBatch(code) {
-        return FetchApi.post('/api/phone-numbers/ussd', { code });
+    async sendUssdBatch(code, comPorts = []) {
+        return FetchApi.post('/api/phone-numbers/ussd', { code, com_ports: comPorts });
+    }
+
+    async cancelPhoneNumberTask() {
+        return FetchApi.post('/api/phone-numbers/cancel', {});
     }
 
     async startFreeSmsNumber() {

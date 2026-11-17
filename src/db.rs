@@ -747,24 +747,6 @@ impl Sms {
         Ok(())
     }
 
-    /// Mark SMS records as successfully uploaded to platform.
-    pub async fn mark_uploaded_by_phone_message(
-        phone_num: &str,
-        sim_id: &str,
-        messages: &[String],
-        platform_response: Option<String>,
-    ) -> Result<()> {
-        Self::mark_platform_attempt_by_phone_message(
-            phone_num,
-            sim_id,
-            messages,
-            None,
-            true,
-            platform_response,
-        )
-        .await
-    }
-
     /// Find SMS records that were recently inserted for a SIM card
     pub async fn find_recent_received_sms(sim_id: &str, limit: i32) -> Result<Vec<Self>> {
         let pool = get_pool()?;
@@ -1533,6 +1515,38 @@ impl FirefoxPlatformItem {
     }
 }
 
+/// Whether an SMS names the item, e.g. "Telegram code: 72850" for "Telegram/TG（飞机）".
+fn message_names_item(message: &str, item_name: &str) -> bool {
+    let words: Vec<String> = message
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    item_name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 2)
+        .any(|keyword| words.iter().any(|word| word.eq_ignore_ascii_case(keyword)))
+}
+
+/// A phone can wait for several items at once; upload under the one the SMS names, else the first.
+pub async fn pick_upload_item_for_message(item_ids: &[String], message: &str) -> Result<Option<String>> {
+    if item_ids.len() <= 1 {
+        return Ok(item_ids.first().cloned());
+    }
+    let pool = get_pool()?;
+    for item_id in item_ids {
+        let item_name: Option<String> =
+            sqlx::query_scalar("SELECT item_name FROM firefox_item_names WHERE item_id = ?")
+                .bind(item_id)
+                .fetch_optional(pool)
+                .await?;
+        if item_name.is_some_and(|name| message_names_item(message, &name)) {
+            return Ok(Some(item_id.clone()));
+        }
+    }
+    Ok(item_ids.first().cloned())
+}
+
 /// Build the SMS content to upload to the platform.
 /// If the raw message does not already contain the item name keyword,
 /// prefix it with `[Item_Name] ` so the platform accepts it.
@@ -1745,11 +1759,20 @@ impl FirefoxMoneyStat {
                     ),
                     0.0
                 ) AS money_earning,
-                GROUP_CONCAT(
-                    DISTINCT CASE
-                        WHEN s.send = 0 AND s.platform_item_id IS NOT NULL AND s.uploaded_to_platform = 1
-                            THEN COALESCE(fin.item_name, s.platform_item_id)
-                    END
+                (
+                    SELECT GROUP_CONCAT(per_item.name || char(30) || per_item.money, char(31))
+                    FROM (
+                        SELECT
+                            COALESCE(MAX(fin2.item_name), s2.platform_item_id) AS name,
+                            SUM(COALESCE(fin2.seller_item_price, 0.0)) AS money
+                        FROM sms s2
+                        LEFT JOIN firefox_item_names fin2
+                            ON fin2.item_id = s2.platform_item_id
+                        WHERE s2.sim_id = s.sim_id
+                            AND s2.send = 0 AND s2.platform_item_id IS NOT NULL AND s2.uploaded_to_platform = 1
+                        GROUP BY s2.platform_item_id
+                        ORDER BY money DESC
+                    ) AS per_item
                 ) AS earning_item_names
             FROM sms s
             LEFT JOIN sim_cards sc
@@ -3008,6 +3031,14 @@ async fn upsert_port_machine_type_in_pool(
 #[cfg(test)]
 mod hardware_type_tests {
     use super::*;
+
+    #[test]
+    fn sms_is_matched_to_the_item_it_names() {
+        assert!(message_names_item("Telegram code: 72850", "Telegram/TG（飞机）"));
+        assert!(!message_names_item("Telegram code: 72850", "Facebook（脸书）"));
+        assert!(message_names_item("<#> 08360 is your Facebook code\nLaz+nxCarLW", "Facebook（脸书）"));
+        assert!(!message_names_item("Your code is 12345", "Viber"));
+    }
 
     #[tokio::test]
     async fn voice_otp_progress_migration_preserves_existing_call_audio() {

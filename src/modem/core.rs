@@ -1641,13 +1641,13 @@ impl Modem {
                                                 .trim_start_matches('0')
                                                 .to_string();
 
-                                            let wait_list_item_id = match crate::firefox_api::get_wait_phone_list(&client, &api_key).await {
+                                            let wait_list_item_ids: Vec<String> = match crate::firefox_api::get_wait_phone_list(&client, &api_key).await {
                                                 Ok(wait_resp) => {
                                                     wait_resp
                                                         .data
                                                         .and_then(|d| d.as_array().cloned())
-                                                        .and_then(|items| {
-                                                            items.into_iter().find_map(|item| {
+                                                        .map(|items| {
+                                                            items.into_iter().filter_map(|item| {
                                                                 let phone_match = item
                                                                     .get("Phone_Num")
                                                                     .and_then(|v| v.as_str())
@@ -1682,8 +1682,9 @@ impl Modem {
                                                                         None
                                                                     }
                                                                 })
-                                                            })
+                                                            }).collect()
                                                         })
+                                                        .unwrap_or_default()
                                                 }
                                                 Err(e) => {
                                                     log::warn!(
@@ -1692,7 +1693,7 @@ impl Modem {
                                                         phone_num,
                                                         e
                                                     );
-                                                    None
+                                                    Vec::new()
                                                 }
                                             };
 
@@ -1709,14 +1710,14 @@ impl Modem {
                                                 }
                                             };
 
-                                            let preferred_item_id = if wait_list_item_id.is_some() {
+                                            let use_wait_list = !wait_list_item_ids.is_empty();
+                                            if use_wait_list {
                                                 log::info!(
                                                     "[{}] Upload item source=wait-list for phone {}: {:?}",
                                                     sim_id,
                                                     phone_num,
-                                                    wait_list_item_id
+                                                    wait_list_item_ids
                                                 );
-                                                wait_list_item_id
                                             } else {
                                                 log::info!(
                                                     "[{}] Upload item source=db-latest for phone {}: {:?}",
@@ -1724,12 +1725,27 @@ impl Modem {
                                                     phone_num,
                                                     latest_item_id
                                                 );
-                                                latest_item_id
-                                            };
+                                            }
 
                                             for sms in &sms_list {
                                                 if sms.send {
                                                     continue;
+                                                }
+
+                                                let preferred_item_id = if use_wait_list {
+                                                    match crate::db::pick_upload_item_for_message(&wait_list_item_ids, &sms.message).await {
+                                                        Ok(item_id) => item_id,
+                                                        Err(e) => {
+                                                            log::warn!("[{}] Failed to match SMS to a wait-list item: {}", sim_id, e);
+                                                            wait_list_item_ids.first().cloned()
+                                                        }
+                                                    }
+                                                } else {
+                                                    latest_item_id.clone()
+                                                };
+                                                if wait_list_item_ids.len() > 1 {
+                                                    log::info!("[{}] Phone {} waits for {:?}; SMS matched item {:?}",
+                                                        sim_id, phone_num, wait_list_item_ids, preferred_item_id);
                                                 }
 
                                                 let upload_content = if let Some(item_id) = preferred_item_id.as_deref() {
@@ -1768,10 +1784,12 @@ impl Modem {
 
                                                         let response_json =
                                                             serde_json::to_string(&resp).ok();
-                                                        if let Err(e) = crate::db::Sms::mark_uploaded_by_phone_message(
+                                                        if let Err(e) = crate::db::Sms::mark_platform_attempt_by_phone_message(
                                                             &phone_num,
                                                             &sim_id,
                                                             &[sms.message.clone()],
+                                                            preferred_item_id.as_deref(),
+                                                            true,
                                                             response_json,
                                                         )
                                                         .await
@@ -1799,7 +1817,7 @@ impl Modem {
                                                             &phone_num,
                                                             &sim_id,
                                                             &[sms.message.clone()],
-                                                            None,
+                                                            preferred_item_id.as_deref(),
                                                             false,
                                                             response_json,
                                                         )

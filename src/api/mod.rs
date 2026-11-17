@@ -157,6 +157,13 @@ mod tests {
     use super::resolve_sim_status;
 
     #[test]
+    fn earning_items_show_each_items_money() {
+        let raw = "Telegram/TG（飞机）\u{1E}30.0\u{1F}Facebook, Inc\u{1E}0.0\u{1F}X\u{1E}1.5";
+        assert_eq!(super::format_earning_items(raw), "Telegram/TG（飞机）:30 | Facebook, Inc:0 | X:1.5");
+        assert_eq!(super::format_earning_items(""), "");
+    }
+
+    #[test]
     fn resolves_removed_state_for_unavailable_ports() {
         assert_eq!(
             resolve_sim_status(None, false, false, true),
@@ -3424,14 +3431,9 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
 
         let waiting_sms_count = waiting_by_sim.max(waiting_by_phone);
 
-        let earning_item_names = agg
-            .and_then(|a| a.earning_item_names.clone())
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ");
+        let earning_item_names = format_earning_items(
+            agg.and_then(|a| a.earning_item_names.as_deref()).unwrap_or_default(),
+        );
 
         result.push(FirefoxMoneyStatsRow {
             com_port,
@@ -3452,6 +3454,25 @@ async fn firefox_money_stats(State(modem_manager): State<ModemManagerRef>) -> Re
     }
 
     (StatusCode::OK, Json(json!(result))).into_response()
+}
+
+/// Turns `name\x1Emoney\x1F...` from the stats query into `Telegram/TG（飞机）:3 | Facebook（脸书）:0.5`.
+fn format_earning_items(raw: &str) -> String {
+    raw.split('\u{1F}')
+        .filter_map(|entry| {
+            let (name, money) = entry.split_once('\u{1E}')?;
+            let name = name.trim();
+            if name.is_empty() { return None; }
+            let money = (money.trim().parse::<f64>().unwrap_or(0.0) * 100.0).round() / 100.0;
+            let money = if money.fract() == 0.0 {
+                format!("{}", money as i64)
+            } else {
+                format!("{:.2}", money).trim_end_matches('0').to_string()
+            };
+            Some(format!("{}:{}", name, money))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 async fn firefox_platform_rejection_reasons() -> Response {

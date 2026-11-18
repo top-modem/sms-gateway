@@ -42,7 +42,8 @@ impl FirefoxUploadRetryItem {
             country_id,
             message,
             retry_count: 0,
-            max_retries: 5,
+            // ~17 min of attempts: WorldCode outages (HTTP 5xx / unreachable) often last several minutes.
+            max_retries: 10,
             next_retry_at,
             last_error: Some(error),
             last_response_code: response_code,

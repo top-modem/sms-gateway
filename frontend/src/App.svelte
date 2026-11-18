@@ -19,6 +19,7 @@
   /** @type {'sim' | 'messages' | 'calllog' | 'simcards' | 'setphone' | 'platform' | 'phonenumber' | 'platform-stats' | 'money' | 'mms' | 'esim' | 'msim'} */
   let currentPage = $state('sim');
   let filterSimId = $state(null);
+  let callSimIds = $state([]);
 
   function goToSim() {
     filterSimId = null;
@@ -30,8 +31,8 @@
     currentPage = 'messages';
   }
 
-  function goToCallLog(simId) {
-    filterSimId = simId;
+  function goToCallLog(simIds) {
+    callSimIds = Array.isArray(simIds) ? simIds : (simIds ? [simIds] : []);
     currentPage = 'calllog';
   }
 
@@ -127,7 +128,7 @@
 
     {:else if currentPage === 'calllog'}
       <div in:fly={{ x: 40, duration: 350, easing: quartOut }} out:fly={{ x: 40, duration: 250, easing: quartOut }}>
-        <CallLogPage onBack={goToSim} filterSimId={filterSimId} />
+        <CallLogPage onBack={goToSim} filterSimIds={callSimIds} />
       </div>
 
     {:else if currentPage === 'simcards'}

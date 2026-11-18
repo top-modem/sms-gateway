@@ -7,15 +7,16 @@
   import { apiClient, buildBasicAuthHeader } from '../../js/api.js';
   import { t } from '../../js/i18n.js';
 
-  let { filterSimId = null } = $props();
+  let { filterSimId = null, filterSimIds = [] } = $props();
 
   let makeCallPhone = $state('');
   let makeCallSimId = $state('');
   let making = $state(false);
   let makeError = $state('');
   let voiceSettings = $state({ enabled: false, com_port: 'COM2', prompt_seconds: 10, code_seconds: 10, otp_length: 6, deadline_seconds: 60 });
-  // COM port of the SIM this page was opened for; voice settings then apply to that port only.
-  let selectedPort = $state('');
+  // COM ports of the SIMs this page was opened for; voice settings then apply to those ports only.
+  let selectedPorts = $state([]);
+  let allPorts = $state([]);
   let portEnabled = $state(false);
   let aliyun = $state({ app_key: '', region: 'cn-shanghai', sample_rate: 16000, access_key_id: '', has_token: false, has_access_key_secret: false, ready: false });
   let aliyunToken = $state('');
@@ -29,32 +30,21 @@
   let voiceSaved = $state(false);
 
   let sims = $derived($simCards);
+  let scopeSimIds = $derived(filterSimIds?.length ? filterSimIds : (filterSimId ? [filterSimId] : []));
+  let callSims = $derived(scopeSimIds.length ? sims.filter((sim) => scopeSimIds.includes(sim.id)) : sims);
   let log = $derived($callLog);
-  let filteredLog = $derived(filterSimId ? log.filter(call => call.sim_id === filterSimId) : log);
+  let filteredLog = $derived(scopeSimIds.length ? log.filter(call => scopeSimIds.includes(call.sim_id)) : log);
   let incoming = $derived($incomingCall);
   let active = $derived($activeCall);
 
   onMount(() => {
     callActions.refreshLog();
     loadVoiceSettings();
-    if (filterSimId) {
-      makeCallSimId = filterSimId;
-      return;
-    }
-    if (sims.length > 0 && !makeCallSimId) {
-      makeCallSimId = sims[0].id;
-    }
   });
 
   $effect(() => {
-    if (filterSimId) {
-      makeCallSimId = filterSimId;
-    }
-  });
-
-  $effect(() => {
-    if (sims.length > 0 && !makeCallSimId) {
-      makeCallSimId = sims[0].id;
+    if (callSims.length > 0 && !callSims.some((sim) => sim.id === makeCallSimId)) {
+      makeCallSimId = callSims[0].id;
     }
   });
 
@@ -75,16 +65,28 @@
     return String(settings.com_port ?? '').split(',').map((port) => port.trim()).filter(Boolean);
   }
 
+  function comIndex(port) {
+    const number = parseInt(String(port).replace(/^COM/i, ''), 10);
+    return Number.isNaN(number) ? Infinity : number;
+  }
+
+  function portsEnabled(settings, ports) {
+    return ports.length > 0 && settings.enabled && ports.every((port) => voicePorts(settings).includes(port));
+  }
+
   async function loadVoiceSettings() {
     try {
-      if (filterSimId) {
-        const info = await apiClient.getAllSimsInfo();
-        const rows = Array.isArray(info?.data) ? info.data : (Array.isArray(info) ? info : []);
-        selectedPort = rows.find((row) => row.sim_id === filterSimId)?.com_port ?? '';
-      }
+      const info = await apiClient.getAllSimsInfo();
+      const rows = Array.isArray(info?.data) ? info.data : (Array.isArray(info) ? info : []);
+      allPorts = [...new Set(rows.filter((row) => row.sim_id && row.com_port).map((row) => row.com_port))]
+        .sort((a, b) => comIndex(a) - comIndex(b));
+      selectedPorts = scopeSimIds.length
+        ? [...new Set(rows.filter((row) => scopeSimIds.includes(row.sim_id)).map((row) => row.com_port).filter(Boolean))]
+          .sort((a, b) => comIndex(a) - comIndex(b))
+        : [];
       const response = await apiClient.getVoiceOtpSettings();
       voiceSettings = response.data.settings;
-      portEnabled = !!selectedPort && voiceSettings.enabled && voicePorts(voiceSettings).includes(selectedPort);
+      portEnabled = portsEnabled(voiceSettings, selectedPorts);
       voiceReady = response.data.ready === true;
       aliyun = (await apiClient.getAliyunAsrSettings()).data;
     } catch (error) {
@@ -128,29 +130,45 @@
     }
   }
 
-  async function saveVoiceSettings() {
+  async function submitVoiceSettings(payload) {
     voiceBusy = true;
     voiceError = '';
     voiceSaved = false;
     try {
-      const payload = { ...voiceSettings };
-      if (selectedPort) {
-        // Only add/remove this port; a disabled config has no active ports to keep.
-        const others = voiceSettings.enabled ? voicePorts(voiceSettings).filter((port) => port !== selectedPort) : [];
-        const ports = portEnabled ? [...others, selectedPort] : others;
-        payload.enabled = ports.length > 0;
-        payload.com_port = ports.length > 0 ? ports.join(',') : selectedPort;
-      }
       const response = await apiClient.setVoiceOtpSettings(payload);
       voiceSettings = response.data.settings;
-      if (selectedPort) portEnabled = voiceSettings.enabled && voicePorts(voiceSettings).includes(selectedPort);
+      portEnabled = portsEnabled(voiceSettings, selectedPorts);
       voiceReady = response.data.ready === true;
       voiceSaved = true;
     } catch (error) {
       voiceError = error?.data?.error ?? error?.message ?? $t('voice_error');
+      portEnabled = portsEnabled(voiceSettings, selectedPorts);
     } finally {
       voiceBusy = false;
     }
+  }
+
+  function saveVoiceSettings() {
+    const payload = { ...voiceSettings };
+    if (selectedPorts.length > 0) {
+      // Only add/remove the selected ports; a disabled config has no active ports to keep.
+      const others = voiceSettings.enabled ? voicePorts(voiceSettings).filter((port) => !selectedPorts.includes(port)) : [];
+      const ports = portEnabled ? [...others, ...selectedPorts] : others;
+      payload.enabled = ports.length > 0;
+      payload.com_port = ports.length > 0 ? ports.join(',') : selectedPorts[0];
+    }
+    return submitVoiceSettings(payload);
+  }
+
+  function onEnableChange(checked) {
+    if (selectedPorts.length > 0) portEnabled = checked;
+    else voiceSettings.enabled = checked;
+    saveVoiceSettings();
+  }
+
+  function applyToAllPorts() {
+    if (allPorts.length === 0) return;
+    submitVoiceSettings({ ...voiceSettings, enabled: true, com_port: allPorts.join(',') });
   }
 
   function voiceProgress(value) {
@@ -224,8 +242,10 @@
   <!-- Header -->
   <div class="px-4 py-3 border-b border-gray-200/70 dark:border-zinc-800 shrink-0">
     <h2 class="text-base font-semibold text-gray-900 dark:text-white">{$t('call_log_title')}</h2>
-    {#if filterSimId}
-      <p class="text-xs text-blue-600 dark:text-blue-400 mt-0.5">SIM: {filterSimId.slice(0, 12)}…</p>
+    {#if scopeSimIds.length === 1}
+      <p class="text-xs text-blue-600 dark:text-blue-400 mt-0.5">SIM: {scopeSimIds[0].slice(0, 12)}…</p>
+    {:else if scopeSimIds.length > 1}
+      <p class="text-xs text-blue-600 dark:text-blue-400 mt-0.5">{selectedPorts.join(', ') || `${scopeSimIds.length} SIM`}</p>
     {/if}
     <p class="text-xs text-gray-500 dark:text-zinc-500 mt-0.5">
       SSE: <span class={$callSseConnected ? 'text-green-500' : 'text-red-400'}>
@@ -246,14 +266,21 @@
           {voiceReady ? $t('voice_ready') : $t('voice_unavailable')}
         </span>
         <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
-          {#if selectedPort}
-            <input type="checkbox" bind:checked={portEnabled} disabled={voiceBusy || (!voiceReady && !portEnabled)} class="accent-blue-600" />
-            {$t('voice_enable')} {selectedPort}
+          {#if selectedPorts.length > 0}
+            <input type="checkbox" checked={portEnabled} onchange={(event) => onEnableChange(event.currentTarget.checked)}
+              disabled={voiceBusy || (!voiceReady && !portEnabled)} class="accent-blue-600" />
+            {$t('voice_enable')} {selectedPorts.length <= 3 ? selectedPorts.join(', ') : `${selectedPorts.length} ${$t('voice_ports_unit')}`}
           {:else}
-            <input type="checkbox" bind:checked={voiceSettings.enabled} disabled={voiceBusy || (!voiceReady && !voiceSettings.enabled)} class="accent-blue-600" />
+            <input type="checkbox" checked={voiceSettings.enabled} onchange={(event) => onEnableChange(event.currentTarget.checked)}
+              disabled={voiceBusy || (!voiceReady && !voiceSettings.enabled)} class="accent-blue-600" />
             {$t('voice_enable')}
           {/if}
         </label>
+        <button type="button" onclick={applyToAllPorts} disabled={voiceBusy || !voiceReady || allPorts.length === 0}
+          title={allPorts.join(', ')}
+          class="px-2.5 py-1 rounded-md text-xs font-medium border border-blue-600 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-40">
+          {$t('voice_apply_all_ports')}
+        </button>
       </div>
       <button type="submit" disabled={voiceBusy} aria-label={$t('voice_save')} title={$t('voice_save')}
         class="w-9 h-9 shrink-0 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 flex items-center justify-center">
@@ -263,10 +290,10 @@
     <fieldset disabled={voiceBusy} class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3 min-w-0">
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0" title={$t('voice_port_hint')}>
         {$t('voice_port')}
-        {#if selectedPort}
-          <input type="text" readonly value={selectedPort} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-900 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+        {#if selectedPorts.length > 0}
+          <input type="text" readonly value={selectedPorts.join(',')} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-900 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
         {:else}
-          <input type="text" required pattern={'\\s*COM[1-9][0-9]{0,2}(\\s*,\\s*COM[1-9][0-9]{0,2}){0,31}\\s*'} placeholder="COM2,COM5" bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
+          <input type="text" required pattern={'\\s*COM[1-9][0-9]{0,2}(\\s*,\\s*COM[1-9][0-9]{0,2}){0,127}\\s*'} placeholder="COM2,COM5" bind:value={voiceSettings.com_port} class="w-full min-w-0 text-sm rounded-md border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5" />
         {/if}
       </label>
       <label class="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-400 min-w-0">
@@ -357,10 +384,10 @@
     <div class="flex gap-2 items-center flex-wrap">
       <select
         bind:value={makeCallSimId}
-        disabled={!!filterSimId}
+        disabled={callSims.length <= 1 && scopeSimIds.length > 0}
         class="text-sm rounded-lg border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-gray-800 dark:text-gray-100 px-2 py-1.5 min-w-0 max-w-[180px] shrink-0"
       >
-        {#each sims as sim}
+        {#each callSims as sim}
           <option value={sim.id}>{sim.alias ?? sim.phone_number ?? sim.id.slice(0, 8)}</option>
         {/each}
       </select>

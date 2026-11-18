@@ -960,7 +960,7 @@ async fn get_all_sim_info(
         );
 
         if STATUS_TRACE_PORTS.contains(&com_port.as_str()) {
-            log::warn!(
+            log::debug!(
                 "[sims/info][trace][active] port={} sim_id={} cpin_raw={:?} cpin_ready={} has_sim={} available={} imei_present={} resolved_status={:?}",
                 com_port,
                 sim_id,
@@ -1072,7 +1072,7 @@ async fn get_all_sim_info(
         };
 
         if STATUS_TRACE_PORTS.contains(&snapshot.com_port.as_str()) {
-            log::warn!(
+            log::debug!(
                 "[sims/info][trace][fallback] port={} lifecycle={:?} has_active_sim={} has_last_sim={} module_connected={} imei_present={} available={} resolved_status={:?}",
                 snapshot.com_port,
                 snapshot.lifecycle,

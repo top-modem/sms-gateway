@@ -41,7 +41,7 @@ impl Default for VoiceOtpSettings {
 }
 
 impl VoiceOtpSettings {
-    pub(crate) const MAX_PORTS: usize = 32;
+    pub(crate) const MAX_PORTS: usize = 128;
 
     /// `com_port` holds a comma-separated list such as `COM2,COM5`.
     pub(crate) fn ports(&self) -> impl Iterator<Item = &str> {
@@ -347,14 +347,14 @@ mod voice_otp_tests {
     }
 
     #[test]
-    fn voice_otp_accepts_up_to_32_distinct_ports() {
+    fn voice_otp_accepts_every_port_from_com1_to_com128() {
         let mut settings = VoiceOtpSettings { enabled: true, com_port: "COM2, COM5".into(), ..Default::default() };
         assert!(settings.validate().is_ok());
         assert!(settings.handles("COM5") && settings.handles("COM2") && !settings.handles("COM3"));
         assert_eq!(settings.answer_delay_for("COM5", 2), 0);
-        settings.com_port = (1..=32).map(|n| format!("COM{n}")).collect::<Vec<_>>().join(",");
+        settings.com_port = (1..=128).map(|n| format!("COM{n}")).collect::<Vec<_>>().join(",");
         assert!(settings.validate().is_ok());
-        settings.com_port.push_str(",COM33");
+        settings.com_port.push_str(",COM129");
         assert!(settings.validate().is_err());
         for invalid in ["COM2,COM2", "", "COM2,,ATH", "COM02"] {
             settings.com_port = invalid.into();

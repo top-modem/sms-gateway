@@ -6,7 +6,7 @@
   import { simCardActions } from '../stores/simcards.js';
   import { t } from '../js/i18n.js';
 
-  let { onBack = () => {}, filterSimId = null } = $props();
+  let { onBack = () => {}, filterSimIds = [] } = $props();
 
   onMount(async () => {
     await simCardActions.loadAll();
@@ -35,6 +35,6 @@
 
   <!-- Content -->
   <div class="flex-1 overflow-hidden">
-    <CallLog {filterSimId} />
+    <CallLog {filterSimIds} />
   </div>
 </div>

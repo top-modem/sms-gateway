@@ -2512,6 +2512,38 @@ impl Modem {
         Ok(())
     }
 
+    /// Re-applies a stored welcome SMS when the first sync was skipped or failed
+    /// (e.g. command timeouts while 128 new SIMs register at once).
+    pub(crate) async fn retry_welcome_sms_identity(&self) {
+        const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+        static LAST_TRY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+            std::sync::LazyLock::new(Default::default);
+        let Some(sim_id) = self.sim_id.read().await.clone() else { return };
+        {
+            let mut last_try = LAST_TRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last_try.get(&sim_id).is_some_and(|at| at.elapsed() < RETRY_INTERVAL) {
+                return;
+            }
+            last_try.insert(sim_id.clone(), Instant::now());
+        }
+        let has_number = SimCard::find_by_conditions(Some(&sim_id), None, None, None).await
+            .ok()
+            .and_then(|cards| cards.into_iter().next())
+            .is_some_and(|card| card.phone_number.is_some_and(|phone| !phone.trim().is_empty()));
+        if has_number {
+            return;
+        }
+        match crate::db::Sms::find_welcome_sms(&sim_id).await {
+            Ok(stored) if !stored.is_empty() => {
+                if let Err(error) = self.sync_welcome_sms_identity(&stored).await {
+                    log::warn!("[{}] Welcome SMS SIM sync retry failed: {}", self.com_port, error);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("[{}] Cannot read stored welcome SMS: {}", self.com_port, error),
+        }
+    }
+
     async fn send_command_exclusive(
         &self,
         command: &str,

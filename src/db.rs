@@ -757,6 +757,22 @@ impl Sms {
     }
 
     /// Find SMS records that were recently inserted for a SIM card
+    /// Stored welcome SMS for a SIM, newest first, so a missed number sync can be retried.
+    pub async fn find_welcome_sms(sim_id: &str) -> Result<Vec<ModemSMS>> {
+        let pool = get_pool()?;
+        let rows: Vec<(String, NaiveDateTime, String)> = sqlx::query_as(
+            "SELECT contact_id, timestamp, message FROM sms
+             WHERE sim_id = ? AND send = 0 AND LOWER(message) LIKE '%welcome to three%'
+             ORDER BY timestamp DESC LIMIT 3",
+        )
+        .bind(sim_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|(contact, timestamp, message)| ModemSMS {
+            contact, timestamp, message, send: false, sim_id: sim_id.to_string(),
+        }).collect())
+    }
+
     pub async fn find_recent_received_sms(sim_id: &str, limit: i32) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let sms_records = sqlx::query_as(

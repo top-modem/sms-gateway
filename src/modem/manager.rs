@@ -128,6 +128,8 @@ pub struct PortRuntimeState {
     pub last_sim_id: Option<String>,
     pub module_connected: bool,
     pub last_imei: Option<String>,
+    /// When `lifecycle` last changed.
+    pub lifecycle_since: std::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +142,7 @@ pub struct PortRuntimeSnapshot {
     pub last_sim_id: Option<String>,
     pub module_connected: bool,
     pub last_imei: Option<String>,
+    pub lifecycle_since: std::time::Instant,
 }
 
 const SIM_PROBE_FAILURE_THRESHOLD: u8 = 3;
@@ -148,6 +151,18 @@ const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 #[cfg(test)]
 mod recovery_capacity_tests {
     use super::*;
+
+    #[test]
+    fn a_port_left_without_its_sim_does_not_stop_sms_reads_forever() {
+        let snapshot = |lifecycle, age_secs| PortRuntimeSnapshot {
+            com_port: "COM7".into(), baud_rate: 115200, generation: 1, lifecycle,
+            active_sim_id: None, last_sim_id: Some("8944".into()), module_connected: true, last_imei: None,
+            lifecycle_since: std::time::Instant::now() - std::time::Duration::from_secs(age_secs),
+        };
+        assert!(ModemManager::should_defer_sms_reads_from_snapshots(&[snapshot(PortLifecycle::Probing, 10)]));
+        assert!(!ModemManager::should_defer_sms_reads_from_snapshots(&[snapshot(PortLifecycle::Unavailable, 600)]));
+        assert!(!ModemManager::should_defer_sms_reads_from_snapshots(&[snapshot(PortLifecycle::Active, 10)]));
+    }
 
     #[tokio::test]
     async fn voice_otp_tools_are_ready_before_modem_discovery() {
@@ -350,11 +365,16 @@ impl ModemManager {
         }
     }
 
+    /// Pause SMS work briefly while a previously used port is recovering. A port whose SIM was
+    /// removed never becomes Active again, so it must not block SMS reads on every other port.
     fn should_defer_sms_reads_from_snapshots(snapshots: &[PortRuntimeSnapshot]) -> bool {
+        const RECOVERY_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
         snapshots
             .iter()
             .any(|snapshot| {
-                snapshot.last_sim_id.is_some() && snapshot.lifecycle != PortLifecycle::Active
+                snapshot.last_sim_id.is_some()
+                    && snapshot.lifecycle != PortLifecycle::Active
+                    && snapshot.lifecycle_since.elapsed() < RECOVERY_GRACE
             })
     }
 
@@ -380,8 +400,12 @@ impl ModemManager {
             last_sim_id: None,
             module_connected: false,
             last_imei: None,
+            lifecycle_since: std::time::Instant::now(),
         });
         entry.generation = generation;
+        if entry.lifecycle != PortLifecycle::Probing {
+            entry.lifecycle_since = std::time::Instant::now();
+        }
         entry.lifecycle = PortLifecycle::Probing;
         entry.active_sim_id = None;
         generation
@@ -396,11 +420,15 @@ impl ModemManager {
             last_sim_id: None,
             module_connected: false,
             last_imei: None,
+            lifecycle_since: std::time::Instant::now(),
         });
         if entry.generation > generation {
             return false;
         }
         entry.generation = generation;
+        if entry.lifecycle != PortLifecycle::Active {
+            entry.lifecycle_since = std::time::Instant::now();
+        }
         entry.lifecycle = PortLifecycle::Active;
         entry.active_sim_id = Some(sim_id.to_string());
         entry.last_sim_id = Some(sim_id.to_string());
@@ -417,7 +445,11 @@ impl ModemManager {
             last_sim_id: None,
             module_connected: false,
             last_imei: None,
+            lifecycle_since: std::time::Instant::now(),
         });
+        if entry.lifecycle != PortLifecycle::Unavailable {
+            entry.lifecycle_since = std::time::Instant::now();
+        }
         entry.lifecycle = PortLifecycle::Unavailable;
         entry.active_sim_id = None;
         if let Some(sim_id) = sim_id {
@@ -442,10 +474,14 @@ impl ModemManager {
             last_sim_id: None,
             module_connected: false,
             last_imei: None,
+            lifecycle_since: std::time::Instant::now(),
         });
         let was_stale = entry.lifecycle != PortLifecycle::Active
             || entry.active_sim_id.as_deref() != Some(sim_id);
         entry.generation = generation;
+        if entry.lifecycle != PortLifecycle::Active {
+            entry.lifecycle_since = std::time::Instant::now();
+        }
         entry.lifecycle = PortLifecycle::Active;
         entry.active_sim_id = Some(sim_id.to_string());
         entry.last_sim_id = Some(sim_id.to_string());
@@ -462,6 +498,7 @@ impl ModemManager {
             last_sim_id: None,
             module_connected: connected,
             last_imei: None,
+            lifecycle_since: std::time::Instant::now(),
         });
         entry.module_connected = connected;
         if !connected {
@@ -478,6 +515,7 @@ impl ModemManager {
             last_sim_id: None,
             module_connected: false,
             last_imei: None,
+            lifecycle_since: std::time::Instant::now(),
         });
         entry.last_imei = imei;
     }
@@ -514,6 +552,7 @@ impl ModemManager {
                     last_sim_id: None,
                     module_connected: false,
                     last_imei: None,
+                    lifecycle_since: std::time::Instant::now(),
                 });
                 PortRuntimeSnapshot {
                     com_port: device.com_port.clone(),
@@ -524,6 +563,7 @@ impl ModemManager {
                     last_sim_id: state.last_sim_id,
                     module_connected: state.module_connected,
                     last_imei: state.last_imei,
+                    lifecycle_since: state.lifecycle_since,
                 }
             })
             .collect()
@@ -784,6 +824,7 @@ impl ModemManager {
                 last_sim_id: None,
                 module_connected: false,
                 last_imei: None,
+                lifecycle_since: std::time::Instant::now(),
             },
         );
 
@@ -1206,6 +1247,7 @@ impl ModemManager {
                     last_sim_id: None,
                     module_connected: false,
                     last_imei: None,
+                    lifecycle_since: std::time::Instant::now(),
                 },
             );
         }
@@ -2253,6 +2295,7 @@ impl ModemManager {
                 {
                     error!("Failed to read SMS for {}: {}", sim_id, e);
                 }
+                modem.retry_welcome_sms_identity().await;
             });
         }
 

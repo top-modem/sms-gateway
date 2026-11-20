@@ -3492,7 +3492,10 @@ impl ModemManager {
         }
 
         log::info!("[SIM:{}] Writing phone number {} to SIM own-number phonebook", sim_id, phone_number);
-        modem.write_phone_number(phone_number).await.map_err(anyhow::Error::from)?;
+        if let Err(error) = modem.write_phone_number(phone_number).await {
+            // The number is still valid; keep it locally so the dashboard and platform can use it.
+            log::warn!("[SIM:{}] SIM own-number write failed, saving {} to the local DB only: {}", sim_id, phone_number, error);
+        }
 
         // Update DB and in-memory cache so the dashboard shows the new number immediately.
         match SimCard::find_by_conditions(Some(sim_id), None, None, None).await {

@@ -2307,10 +2307,24 @@ impl Modem {
     /// Write the user's own phone number into the SIM "Own Number" phonebook.
     /// Sequence: AT+CPBS="ON" then AT+CPBW=1,"<phone_number>",145
     pub async fn write_phone_number(&self, phone_number: &str) -> io::Result<()> {
-        self.send_command_with_ok("AT+CPBS=\"ON\"\r\n").await?;
-        self.send_command_with_ok(&format!("AT+CPBW=1,\"{}\",145\r\n", phone_number))
-            .await?;
-        Ok(())
+        let mut last_error = None;
+        // Right after a network-mode switch the SIM phonebook often answers ERROR for a few seconds.
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            let _ = self.send_command_with_ok("AT$QCPBMPREF=1\r\n").await;
+            let written = async {
+                self.send_command_with_ok("AT+CPBS=\"ON\"\r\n").await?;
+                self.send_command_with_ok(&format!("AT+CPBW=1,\"{}\",145\r\n", phone_number)).await
+            }
+            .await;
+            match written {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("SIM phonebook write failed")))
     }
 
     fn parse_phone_number(response: &str) -> Option<String> {
@@ -2797,7 +2811,7 @@ impl Modem {
         response
             .lines()
             .find_map(|line| line.trim().strip_prefix("+QCFG: \"nwscanmode\","))
-            .and_then(|value| value.trim().parse().ok())
+            .and_then(|value| value.split(',').next()?.trim().parse().ok())
             .ok_or_else(|| io::Error::other("Module did not report nwscanmode"))
     }
 
@@ -2850,20 +2864,50 @@ impl Modem {
         }
         // A port that was already 2G/3G-only still goes back to automatic (4G) selection.
         let restore = if matches!(original, 1 | 2) { 0 } else { original };
-        // SIMs without a 4G plan only come back on CREG, so either registration counts.
-        let restored = match self.set_nwscanmode(restore).await {
-            Ok(()) => self.wait_registered(&[true, false], Duration::from_secs(60)).await,
-            Err(e) => {
-                warn!("[USSD {}] failed to restore nwscanmode {}: {}", self.com_port, restore, e);
-                None
+        // An open USSD dialogue can keep the module on 2G; close it before switching back.
+        let _ = self.send_command("AT+CUSD=2\r\n").await;
+        let mode_restored = self.restore_nwscanmode(restore).await;
+        // Prefer 4G; SIMs without a 4G plan only come back on CREG.
+        let restored = if mode_restored {
+            match self.wait_registered(&[true], Duration::from_secs(45)).await {
+                Some(eps) => Some(eps),
+                None => self.wait_registered(&[false], Duration::from_secs(15)).await,
             }
+        } else {
+            None
         };
         match restored {
             Some(true) => info!("[USSD {}] restored nwscanmode {} and registered on 4G", self.com_port, restore),
-            Some(false) => info!("[USSD {}] restored nwscanmode {}; registered on 2G/3G (no 4G registration yet)", self.com_port, restore),
-            None => warn!("[USSD {}] not yet registered after restoring nwscanmode {}", self.com_port, restore),
+            Some(false) => info!("[USSD {}] restored nwscanmode {}; registered on 2G/3G only (no 4G registration)", self.com_port, restore),
+            None if mode_restored => warn!("[USSD {}] restored nwscanmode {} but the network is not registered yet", self.com_port, restore),
+            None => {}
+        }
+        if !mode_restored {
+            let message = format!("网络模式未能恢复为 {}，请重启该端口", restore);
+            return match result {
+                Ok(text) => Ok(format!("{} ({})", text, message)),
+                Err(error) => Err(format!("{}；{}", error, message)),
+            };
         }
         result.map(|text| if restored.is_some() { text } else { format!("{} (已恢复网络模式，网络尚未注册)", text) })
+    }
+
+    /// Sets nwscanmode and reads it back: the module can answer OK yet keep the old mode.
+    async fn restore_nwscanmode(&self, mode: u8) -> bool {
+        for attempt in 1..=3 {
+            if let Err(e) = self.set_nwscanmode(mode).await {
+                warn!("[USSD {}] restore nwscanmode {} attempt {}/3 failed: {}", self.com_port, mode, attempt, e);
+            } else {
+                match self.nwscanmode().await {
+                    Ok(current) if current == mode => return true,
+                    Ok(current) => warn!("[USSD {}] nwscanmode is still {} after setting {} (attempt {}/3)", self.com_port, current, mode, attempt),
+                    Err(e) => warn!("[USSD {}] cannot read nwscanmode after restore (attempt {}/3): {}", self.com_port, attempt, e),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        error!("[USSD {}] nwscanmode could not be restored to {}; the port stays on 2G/3G", self.com_port, mode);
+        false
     }
 
     /// Service provider name from the SIM (AT+CSPN?), e.g. "giffgaff".

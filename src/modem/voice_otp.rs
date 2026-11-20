@@ -420,7 +420,12 @@ pub(super) async fn maybe_start(
     tokio::spawn(async move {
         let _permit = permit;
         let mut progress = VoiceOtpProgress { provider: "aliyun".into(), ..Default::default() };
-        if let Err(error) = run(&io, &settings, &mut progress, &mut cancellation, &prompt_file, &code_file).await {
+        let outcome = run(&io, &settings, &mut progress, &mut cancellation, &prompt_file, &code_file).await;
+        if let (Ok(()), Some(otp)) = (&outcome, progress.otp.clone()) {
+            tokio::spawn(deliver_as_sms(modem.clone(), io.sim_id.clone(), call_id.clone(),
+                progress.app.clone(), otp, io.sse.clone()));
+        }
+        if let Err(error) = outcome {
             progress.state = if error.is::<VoiceCancelled>() || error.is::<RemoteCallEnded>()
                 || (!modem.voice_otp_finishing.load(Ordering::SeqCst) && io.active().await.is_err())
                 { "cancelled" } else { "failed" }.into();
@@ -455,9 +460,47 @@ pub(super) async fn maybe_start(
     Ok(true)
 }
 
+fn voice_otp_message(app: Option<&str>, otp: &str) -> String {
+    format!("Your {} code: {}", app.unwrap_or("verification"), otp)
+}
+
+/// Stores a recognised voice code as an incoming SMS so it is shown, counted and uploaded
+/// to the platform exactly like a received SMS.
+async fn deliver_as_sms(modem: Arc<Modem>, sim_id: String, call_id: String, app: Option<String>, otp: String, sse: Arc<SseManager>) {
+    let caller = Call::phone_of(&call_id).await.ok().flatten()
+        .filter(|phone| !phone.trim().is_empty())
+        .unwrap_or_else(|| "Voice OTP".to_string());
+    let sms = crate::db::ModemSMS {
+        contact: caller,
+        timestamp: chrono::Local::now().naive_local(),
+        message: voice_otp_message(app.as_deref(), &otp),
+        send: false,
+        sim_id,
+    };
+    match crate::db::ModemSMS::bulk_insert(std::slice::from_ref(&sms)).await {
+        Ok(contact_ids) => {
+            if let Ok(conversations) = crate::db::Conversation::query_by_contact_ids(&contact_ids).await {
+                sse.send(conversations);
+            }
+        }
+        Err(error) => {
+            log::error!("[Voice {}] call={} cannot store the voice code as SMS: {}", modem.com_port, call_id, error);
+            return;
+        }
+    }
+    log::info!("[Voice {}] call={} voice code stored as SMS {:?}; uploading to the platform", modem.com_port, call_id, sms.message);
+    modem.upload_incoming_sms(std::slice::from_ref(&sms)).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_otp_is_uploaded_as_an_sms_naming_the_app() {
+        assert_eq!(voice_otp_message(Some("WhatsApp"), "734606"), "Your WhatsApp code: 734606");
+        assert_eq!(voice_otp_message(None, "844889"), "Your verification code: 844889");
+    }
     use std::collections::VecDeque;
     use std::sync::Mutex;
 

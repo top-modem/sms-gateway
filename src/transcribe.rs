@@ -215,7 +215,7 @@ pub(crate) fn parse_voice_prompt(text: &str, otp_length: usize) -> Result<VoiceP
 /// a short w-word directly before 验证码 is restored to the brand name.
 pub(crate) fn normalize_voice_brand(text: &str) -> String {
     static BRAND: std::sync::LazyLock<fancy_regex::Regex> = std::sync::LazyLock::new(|| {
-        fancy_regex::Regex::new(r"(?i)(?<![a-z'])w[a-z']{0,7}(?:\s?[a-z']{1,4})?\s*的?\s*[，,]?\s*(?=验证码)")
+        fancy_regex::Regex::new(r"(?i)(?<![a-z'])w[a-z']{0,7}(?:\s?[a-z']{1,4})?\s*的?\s*[，,。.]?\s*(?=验证码)")
             .expect("valid brand pattern")
     });
     BRAND.replace_all(text, "WhatsApp").into_owned()
@@ -229,6 +229,9 @@ pub(crate) fn detect_voice_app(text: &str) -> Option<String> {
         ("tiktok", "TikTok"), ("signal", "Signal"), ("paypal", "PayPal"), ("uber", "Uber"),
     ];
     let lower = text.to_lowercase().replace(char::is_whitespace, "");
+    if lower.contains("whats") || lower.contains("what's") {
+        return Some("WhatsApp".to_string());
+    }
     APPS.iter().find(|(needle, _)| lower.contains(needle)).map(|(_, name)| name.to_string())
 }
 
@@ -387,6 +390,7 @@ mod voice_otp_tests {
     #[test]
     fn voice_otp_detects_the_app_named_in_the_prompt() {
         assert_eq!(detect_voice_app("听说WhatsApp验证码，请按2。").as_deref(), Some("WhatsApp"));
+        assert_eq!(detect_voice_app("验证码请按9，除了接收whats up。验证码请按9。").as_deref(), Some("WhatsApp"));
         assert_eq!(detect_voice_app("Your Telegram code is 12345").as_deref(), Some("Telegram"));
         assert_eq!(detect_voice_app("您的验证码为951782。"), None);
     }

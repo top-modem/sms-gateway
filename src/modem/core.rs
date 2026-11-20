@@ -1580,6 +1580,13 @@ impl Modem {
             }
         }
 
+        self.upload_incoming_sms(&sms_list).await;
+        Ok(())
+    }
+
+    /// Uploads received messages (already stored in the `sms` table) to the WorldCode platform.
+    pub(crate) async fn upload_incoming_sms(&self, sms_list: &[ModemSMS]) {
+        let sms_list = sms_list.to_vec();
         // ── Upload received SMS to 火狐狸 platform ────────────────
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
         if sim_id.is_empty() {
@@ -2063,8 +2070,6 @@ impl Modem {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Reads all SMS from modem storage. Returns the regular SMS list plus the

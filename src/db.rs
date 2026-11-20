@@ -185,6 +185,15 @@ impl Call {
         Ok(())
     }
 
+    pub async fn phone_of(id: &str) -> Result<Option<String>> {
+        let pool = get_pool()?;
+        let phone: Option<Option<String>> = sqlx::query_scalar("SELECT phone FROM calls WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+        Ok(phone.flatten())
+    }
+
     pub async fn query_by_sim(sim_id: &str, limit: i64) -> Result<Vec<Self>> {
         let pool = get_pool()?;
         let calls = sqlx::query_as(
@@ -3038,6 +3047,7 @@ mod hardware_type_tests {
         assert!(!message_names_item("Telegram code: 72850", "Facebook（脸书）"));
         assert!(message_names_item("<#> 08360 is your Facebook code\nLaz+nxCarLW", "Facebook（脸书）"));
         assert!(!message_names_item("Your code is 12345", "Viber"));
+        assert!(message_names_item("Your WhatsApp code: 734606", "whatsapp（WS/WA）"));
     }
 
     #[tokio::test]

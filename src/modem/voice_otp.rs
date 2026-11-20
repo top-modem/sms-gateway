@@ -380,7 +380,8 @@ async fn run(
             let code_text = cancellable(io.transcribe(&code_audio), cancel, deadline).await?;
             progress.code_transcript = Some(code_text.clone());
             if progress.app.is_none() {
-                progress.app = crate::transcribe::detect_voice_app(&code_text);
+                // Only WhatsApp uses the two-step "press a key, then hear the code" call.
+                progress.app = crate::transcribe::detect_voice_app(&code_text).or_else(|| Some("WhatsApp".to_string()));
             }
             progress.otp = Some(crate::transcribe::extract_voice_otp(&code_text, settings.otp_length)?);
         }
@@ -461,7 +462,7 @@ pub(super) async fn maybe_start(
 }
 
 fn voice_otp_message(app: Option<&str>, otp: &str) -> String {
-    format!("Your {} code: {}", app.unwrap_or("verification"), otp)
+    format!("Your {} Voice otp code: {}", app.unwrap_or("verification"), otp)
 }
 
 /// Stores a recognised voice code as an incoming SMS so it is shown, counted and uploaded
@@ -498,8 +499,8 @@ mod tests {
 
     #[test]
     fn voice_otp_is_uploaded_as_an_sms_naming_the_app() {
-        assert_eq!(voice_otp_message(Some("WhatsApp"), "734606"), "Your WhatsApp code: 734606");
-        assert_eq!(voice_otp_message(None, "844889"), "Your verification code: 844889");
+        assert_eq!(voice_otp_message(Some("WhatsApp"), "734606"), "Your WhatsApp Voice otp code: 734606");
+        assert_eq!(voice_otp_message(None, "844889"), "Your verification Voice otp code: 844889");
     }
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -571,6 +572,7 @@ mod tests {
         run(&io, &settings(), &mut progress, &mut cancellation, "prompt.amr", "code.amr").await.unwrap();
         assert_eq!(progress.otp.as_deref(), Some("005861"));
         assert_eq!(progress.state, "completed");
+        assert_eq!(progress.app.as_deref(), Some("WhatsApp"));
         assert_eq!(progress.prompt_readings, vec!['5', '5']);
         assert_eq!(progress.prompt_comparison.as_deref(), Some("matched"));
         let events = io.events.lock().unwrap();
@@ -589,6 +591,7 @@ mod tests {
         let mut progress = VoiceOtpProgress::default();
         run(&io, &settings(), &mut progress, &mut cancellation, "prompt.amr", "code.amr").await.unwrap();
         assert_eq!(progress.otp.as_deref(), Some("005861"));
+        assert_eq!(progress.app, None);
         assert!(io.events.lock().unwrap().iter().all(|event| !event.starts_with("dtmf:") && event != "record:code.amr"));
     }
 

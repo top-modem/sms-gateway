@@ -3047,7 +3047,7 @@ mod hardware_type_tests {
         assert!(!message_names_item("Telegram code: 72850", "Facebook（脸书）"));
         assert!(message_names_item("<#> 08360 is your Facebook code\nLaz+nxCarLW", "Facebook（脸书）"));
         assert!(!message_names_item("Your code is 12345", "Viber"));
-        assert!(message_names_item("Your WhatsApp code: 734606", "whatsapp（WS/WA）"));
+        assert!(message_names_item("Your WhatsApp Voice otp code: 734606", "whatsapp（WS/WA）"));
     }
 
     #[tokio::test]

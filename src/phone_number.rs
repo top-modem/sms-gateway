@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
-use crate::db::{AppSetting, Contact, SimCard, Sms};
+use crate::db::{Contact, SimCard, Sms};
 use crate::modem::manager::ModemManager;
 use crate::modem::types::SmsType;
 use log;
@@ -429,119 +429,6 @@ where
     t.running = false;
     t.cancel_requested = false;
     t.current = "取号完成".to_string();
-}
-
-/// Read the Three UK welcome SMS on LTE. The number text is kept on the SIM.
-pub async fn welcome_sms_batch(mm: Arc<ModemManager>, task: TaskHandle, com_ports: Vec<String>) {
-    use futures::StreamExt;
-    let phonebook = AppSetting::get("welcome_sms_phone_sync_enabled").await
-        .ok()
-        .flatten()
-        .as_deref() == Some("true");
-    let targets: Vec<_> = list_sims(&mm).await.into_iter()
-        .filter(|sim| sim.phone_number.is_none())
-        .filter(|sim| com_ports.is_empty() || com_ports.iter().any(|port| port.eq_ignore_ascii_case(&sim.com_port)))
-        .collect();
-    {
-        let mut state = task.write().await;
-        state.running = true;
-        state.task_type = "welcome_sms".to_string();
-        state.total = targets.len();
-        state.done = 0;
-        state.current = format!("正在读取 {} 个端口的欢迎短信", targets.len());
-        state.errors.clear();
-        state.results.clear();
-    }
-    let mut results = futures::stream::iter(targets.into_iter().map(|info| {
-        let mm = mm.clone();
-        let task = task.clone();
-        async move {
-            if task.read().await.cancel_requested {
-                return PhoneResult {
-                    com_port: info.com_port, sim_id: info.sim_id, phone_number: None,
-                    status: PhoneResultStatus::Skipped, message: "已停止".to_string(),
-                };
-            }
-            match mm.read_welcome_sms_on_lte(&info.sim_id).await {
-                Err(message) => PhoneResult {
-                    com_port: info.com_port, sim_id: info.sim_id, phone_number: None,
-                    status: PhoneResultStatus::Failed, message,
-                },
-                Ok(read) => welcome_result(mm, info, read, phonebook).await,
-            }
-        }
-    }))
-    .buffer_unordered(NUMBER_LOOKUP_CONCURRENCY);
-    while let Some(result) = results.next().await {
-        log::info!("[welcome_sms] {} {:?}: number={:?} {}", result.com_port, result.status, result.phone_number, result.message);
-        let mut state = task.write().await;
-        if result.status == PhoneResultStatus::Failed {
-            state.errors.push(format!("{}: {}", result.com_port, result.message));
-        }
-        state.current = format!("{} 完成", result.com_port);
-        state.results.push(result);
-        state.done += 1;
-    }
-    let mut state = task.write().await;
-    state.running = false;
-    state.cancel_requested = false;
-    state.current = "取号完成".to_string();
-}
-
-async fn welcome_result(
-    mm: Arc<ModemManager>,
-    info: SimInfo,
-    read: crate::modem::core::LteWelcomeRead,
-    phonebook: bool,
-) -> PhoneResult {
-    let restore = if read.mode_restored { "" } else { "；网络模式未能恢复" };
-    let Some(phone) = read.phone_number else {
-        return PhoneResult {
-            com_port: info.com_port,
-            sim_id: info.sim_id,
-            phone_number: None,
-            status: PhoneResultStatus::Skipped,
-            message: format!("LTE 已注册，IMS 1,1，欢迎短信 {} 条，SIM 上还没有号码短信{}", read.welcome_count, restore),
-        };
-    };
-    match save_welcome_number(&mm, &info.sim_id, &phone, phonebook).await {
-        Ok(note) => PhoneResult {
-            com_port: info.com_port,
-            sim_id: info.sim_id,
-            phone_number: Some(phone),
-            status: PhoneResultStatus::Success,
-            message: format!("LTE 已注册，IMS 1,1，欢迎短信 {} 条，{}{}", read.welcome_count, note, restore),
-        },
-        Err(error) => PhoneResult {
-            com_port: info.com_port,
-            sim_id: info.sim_id,
-            phone_number: Some(phone),
-            status: PhoneResultStatus::Failed,
-            message: format!("LTE 已注册，IMS 1,1，获取到号码但保存失败: {}{}", error, restore),
-        },
-    }
-}
-
-async fn save_welcome_number(mm: &ModemManager, sim_id: &str, phone: &str, phonebook: bool) -> Result<String, String> {
-    let Some(card) = SimCard::find_by_conditions(Some(sim_id), None, None, None)
-        .await
-        .map_err(|error| format!("{}", error))?
-        .into_iter()
-        .next()
-    else {
-        return Err("SIM 不在数据库中".to_string());
-    };
-    if card.accepts_welcome_sms_number(phone) {
-        card.save_welcome_sms_identity(phone, "Three").await.map_err(|error| format!("{}", error))?;
-        mm.refresh_sim_cache(&[sim_id.to_string()]).await;
-    }
-    if phonebook {
-        if let Err(error) = mm.write_own_number_phonebook(sim_id, phone).await {
-            return Ok(format!("号码已保存，SIM 电话簿写入失败: {}", error));
-        }
-        return Ok("已获取并保存号码，已写入 SIM 电话簿".to_string());
-    }
-    Ok("已获取并保存号码".to_string())
 }
 
 /// Send a USSD code on 2G/3G to SIMs without a phone number, then return them to 4G.

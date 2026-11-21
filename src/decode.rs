@@ -49,22 +49,11 @@ impl IncompleteMultipart {
     }
 }
 
-/// Three sends each welcome text once, as several PDUs. Those texts stay on the SIM.
-pub(crate) fn is_three_welcome_text(message: &str) -> bool {
-    let text = message.to_ascii_lowercase();
-    text.contains("welcome to three")
-        && (text.contains("your number for this sim")
-            || text.contains("pay as you go")
-            || text.contains("setting up a three account")
-            || text.contains("contract summary"))
-}
-
 /// Result of parsing one `AT+CMGL` listing.
 pub struct ParsedSmsBatch {
     pub messages: Vec<ModemSMS>,
     pub mms_candidates: Vec<MmsNotificationCandidate>,
-    /// Storage indices that were stored and may be deleted.
-    /// Three welcome texts, undecoded PDUs, and incomplete parts are omitted.
+    /// Storage indices that were fully handled and may be deleted.
     pub consumed_indices: Vec<u32>,
     /// Multipart messages still missing parts; their indices must be kept.
     pub incomplete: Vec<IncompleteMultipart>,
@@ -185,7 +174,8 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> ParsedSmsBatch {
         let pdu = match hex::decode(cap[3].to_uppercase().as_str()) {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("跳过短信 #{}, PDU hex解码失败，保留在 SIM: {}", index, e);
+                log::warn!("跳过短信 #{}, PDU hex解码失败: {}", index, e);
+                consumed_indices.push(index);
                 continue;
             }
         };
@@ -195,7 +185,8 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> ParsedSmsBatch {
         let mut pos = 1 + smsc_len;
 
         if pos >= pdu.len() {
-            log::warn!("跳过短信 #{}, PDU太短 (SMSC之后无数据)，保留在 SIM", index);
+            log::warn!("跳过短信 #{}, PDU太短 (SMSC之后无数据)", index);
+            consumed_indices.push(index);
             continue;
         }
 
@@ -217,7 +208,8 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> ParsedSmsBatch {
         pos += 1; // Skip protocol identifier
 
         if pos + 8 > pdu.len() {
-            log::warn!("跳过短信 #{}, PDU太短 (无DCS/时间戳字段)，保留在 SIM", index);
+            log::warn!("跳过短信 #{}, PDU太短 (无DCS/时间戳字段)", index);
+            consumed_indices.push(index);
             continue;
         }
 
@@ -252,7 +244,8 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> ParsedSmsBatch {
                     content.len()
                 );
                 if current == 0 || current > total {
-                    log::warn!("跳过多段短信 #{}, 分段序号无效: {}/{}，保留在 SIM", index, current, total);
+                    log::warn!("跳过多段短信 #{}, 分段序号无效: {}/{}", index, current, total);
+                    consumed_indices.push(index);
                     continue;
                 }
                 if let Some((sms, indices)) = handler.add_part(
@@ -266,21 +259,13 @@ pub fn parse_pdu_sms(cmgl_entries: &str, sim_id: &str) -> ParsedSmsBatch {
                     String::from(sim_id),
                 ) {
                     log::info!("多段短信完整，添加到消息列表");
-                    if is_three_welcome_text(&sms.message) {
-                        log::info!("保留 Three 欢迎短信，不从 SIM 删除 ({} 段)", indices.len());
-                    } else {
-                        consumed_indices.extend(indices);
-                    }
                     messages.push(sms);
+                    consumed_indices.extend(indices);
                 }
             }
             MessageContent::Single(content) => {
                 log::debug!("解析到单条短信: 索引{}, 内容长度: {}", index, content.len());
-                if is_three_welcome_text(&content) {
-                    log::info!("保留 Three 欢迎短信 #{}，不从 SIM 删除", index);
-                } else {
-                    consumed_indices.push(index);
-                }
+                consumed_indices.push(index);
                 messages.push(ModemSMS {
                     contact: sender,
                     timestamp,
@@ -753,38 +738,5 @@ mod multipart_storage_tests {
         assert_eq!(consumed, vec![5, 9]);
         assert_eq!(batch.incomplete.len(), 1);
         assert_eq!(batch.incomplete[0].indices, vec![7]);
-    }
-
-    fn ucs2_deliver(text: &str) -> String {
-        let encoded: String = text.encode_utf16().map(|unit| format!("{unit:04X}")).collect();
-        format!("000404812143000862111111500000{:02X}{}", encoded.len() / 2, encoded)
-    }
-
-    #[test]
-    fn three_welcome_text_and_undecoded_pdus_stay_on_the_sim() {
-        assert!(is_three_welcome_text(
-            "Hi there, welcome to Three. Your number for this SIM is 07848998171."
-        ));
-        assert!(is_three_welcome_text(
-            "Hi there, welcome to Three. By using your SIM, you're agreeing to our Pay As You Go terms."
-        ));
-        assert!(is_three_welcome_text(
-            "Hi there, welcome to Three. Setting up a Three account makes staying on top of things simple."
-        ));
-        assert!(!is_three_welcome_text("You have 5 new Voicemail(s)."));
-
-        let welcome = parse_pdu_sms(
-            &listing(&[(2, ucs2_deliver("welcome to Three your number for this sim"))]),
-            "sim",
-        );
-        assert_eq!(welcome.messages.len(), 1);
-        assert!(welcome.consumed_indices.is_empty());
-
-        let ordinary = parse_pdu_sms(&listing(&[(8, ucs2_deliver("Hello"))]), "sim");
-        assert_eq!(ordinary.consumed_indices, vec![8]);
-
-        let broken = parse_pdu_sms("+CMGL: 4,1,,1\r\nZZ\r\n\r\nOK\r\n", "sim");
-        assert!(broken.messages.is_empty());
-        assert!(broken.consumed_indices.is_empty());
     }
 }

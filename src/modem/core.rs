@@ -13,7 +13,7 @@ use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use crate::api::SseManager;
 use crate::config::SmsStorage;
 use crate::db::{Contact, ModemSMS, SimCard, Sms};
-use crate::decode::{is_three_welcome_text, parse_pdu_sms};
+use crate::decode::parse_pdu_sms;
 use crate::webhook;
 
 use super::ftp_uploader;
@@ -72,37 +72,6 @@ const MAX_LINE_BUF: usize = 64 * 1024;
 struct ReaderState {
     response_tx: Option<tokio::sync::oneshot::Sender<io::Result<String>>>,
     raw_response_tx: Option<tokio::sync::oneshot::Sender<io::Result<Vec<u8>>>>,
-}
-
-/// Result of reading Three welcome SMS while the module is locked to LTE.
-pub struct LteWelcomeRead {
-    pub phone_number: Option<String>,
-    pub welcome_count: usize,
-    pub mode_restored: bool,
-}
-
-/// `AT+QCFG="ims"` answers `+QCFG: "ims",1,1` when VoLTE and IMS SMS are both on.
-pub(crate) fn parse_qcfg_ims(response: &str) -> Option<(u8, u8)> {
-    for line in response.lines() {
-        let line = line.trim();
-        if !line.to_ascii_lowercase().contains("ims") {
-            continue;
-        }
-        let nums: Vec<u8> = line
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .filter_map(|part| part.parse().ok())
-            .collect();
-        if nums.len() >= 2 {
-            return Some((nums[nums.len() - 2], nums[nums.len() - 1]));
-        }
-    }
-    None
-}
-
-fn is_sms_memory_not_ready(error: &impl std::fmt::Display) -> bool {
-    let text = error.to_string();
-    text.contains("CMS ERROR: 350") || text.contains("CMS ERROR:350")
 }
 
 pub struct Modem {
@@ -2136,9 +2105,11 @@ impl Modem {
     }
 
     /// Reads all SMS from modem storage. Returns the regular SMS list plus the
-    /// storage indices that were saved and may be deleted. Three welcome texts,
-    /// PDUs that could not be decoded, and incomplete multipart fragments are
-    /// not included: a one-shot welcome text must stay on the SIM.
+    /// storage indices that were fully handled (SMS, completed multipart SMS,
+    /// MMS WAP-push notifications, unparseable PDUs). Callers must delete only
+    /// those indices (`delete_sms_indices`): fragments of a multipart SMS whose
+    /// other parts have not arrived yet are left in storage so the next poll can
+    /// complete them, and SMS arriving after this listing are not wiped unread.
     pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<(Vec<ModemSMS>, Vec<u32>)> {
         let command = format!("AT+CMGL={}\r\n", sms_type.to_at_command_pdu());
         let response = self.send_command_with_ok(&command).await?;
@@ -2150,17 +2121,18 @@ impl Modem {
         }
         let batch = parse_pdu_sms(&response, &sim_id);
         let mut sms_list = batch.messages;
-        let consumed = batch.consumed_indices;
+        let mut consumed = batch.consumed_indices;
         let expired = self.take_expired_incomplete(batch.incomplete, Instant::now());
         for partial in expired {
             log::warn!(
-                "[{}] Multipart SMS from {} (ref {}, {} parts) still incomplete after {} min; copying received parts and leaving the fragments on the SIM",
+                "[{}] Multipart SMS from {} (ref {}, {} parts) still incomplete after {} min; storing received parts",
                 sim_id,
                 partial.sender,
                 partial.reference,
                 partial.total,
                 INCOMPLETE_MULTIPART_TIMEOUT.as_secs() / 60
             );
+            consumed.extend(partial.indices.iter().copied());
             sms_list.push(partial.into_partial_sms(&sim_id));
         }
         // Capture MMS WAP-push notifications *before* the caller deletes SMS from
@@ -2540,25 +2512,12 @@ impl Modem {
         if !card.accepts_welcome_sms_number(&identity.phone_number) {
             return Ok(());
         }
-        if card.save_welcome_sms_identity(&identity.phone_number, identity.operator).await? {
-            log::info!("[{}] Welcome SMS identity saved: operator={}", self.com_port, identity.operator);
-        }
-        if let Err(error) = self.write_welcome_phonebook(&identity.phone_number).await {
-            log::warn!("[{}] Welcome number is saved; SIM phonebook write failed: {}", self.com_port, error);
-        }
-        Ok(())
-    }
-
-    async fn write_welcome_phonebook(&self, phone_number: &str) -> anyhow::Result<()> {
         let command_guard = self.command_lock.lock().await;
         let type_reply = self.send_command_exclusive("ath?\r\n", &command_guard).await?;
         let machine_type = MachineType::from_type_reply(&type_reply);
         let iccid_reply = self.send_command_exclusive("AT+CCID\r\n", &command_guard).await?;
         let current_iccid = Self::parse_iccid(&iccid_reply)
             .ok_or_else(|| anyhow::anyhow!("Cannot verify receiving SIM ICCID"))?;
-        let Some(sim_id) = self.sim_id.read().await.clone() else {
-            anyhow::bail!("SIM identity is gone");
-        };
         if crate::esim::normalize_iccid(&current_iccid) != crate::esim::normalize_iccid(&sim_id) {
             anyhow::bail!("Receiving SIM identity changed; no SIM write performed");
         }
@@ -2567,18 +2526,22 @@ impl Modem {
                 for command in [
                     "AT$QCPBMPREF=1\r\n".to_string(),
                     "AT+CPBS=\"ON\"\r\n".to_string(),
-                    format!("AT+CPBW=1,\"+{}\",145\r\n", phone_number),
+                    format!("AT+CPBW=1,\"+{}\",145\r\n", identity.phone_number),
                 ] {
                     let response = self.send_command_exclusive(&command, &command_guard).await?;
                     if !response.contains("OK\r\n") {
-                        anyhow::bail!("Welcome SMS phonebook command rejected");
+                        anyhow::bail!("Welcome SMS phonebook command rejected; identity not saved");
                     }
                 }
-                Ok(())
             }
-            MachineType::Esim => Ok(()),
+            MachineType::Esim => {}
             MachineType::Unknown => anyhow::bail!("Cannot verify machine type; no SIM write performed"),
         }
+        drop(command_guard);
+        if card.save_welcome_sms_identity(&identity.phone_number, identity.operator).await? {
+            log::info!("[{}] Welcome SMS identity saved: operator={}", self.com_port, identity.operator);
+        }
+        Ok(())
     }
 
     /// Re-applies a stored welcome SMS when the first sync was skipped or failed
@@ -2966,7 +2929,7 @@ impl Modem {
         let restore = if matches!(original, 1 | 2) { 0 } else { original };
         // An open USSD dialogue can keep the module on 2G; close it before switching back.
         let _ = self.send_command("AT+CUSD=2\r\n").await;
-        let mode_restored = self.restore_nwscanmode(restore, "USSD").await;
+        let mode_restored = self.restore_nwscanmode(restore).await;
         // Prefer 4G; SIMs without a 4G plan only come back on CREG.
         let restored = if mode_restored {
             match self.wait_registered(&[true], Duration::from_secs(45)).await {
@@ -2993,82 +2956,21 @@ impl Modem {
     }
 
     /// Sets nwscanmode and reads it back: the module can answer OK yet keep the old mode.
-    async fn restore_nwscanmode(&self, mode: u8, label: &str) -> bool {
+    async fn restore_nwscanmode(&self, mode: u8) -> bool {
         for attempt in 1..=3 {
             if let Err(e) = self.set_nwscanmode(mode).await {
-                warn!("[{} {}] restore nwscanmode {} attempt {}/3 failed: {}", label, self.com_port, mode, attempt, e);
+                warn!("[USSD {}] restore nwscanmode {} attempt {}/3 failed: {}", self.com_port, mode, attempt, e);
             } else {
                 match self.nwscanmode().await {
                     Ok(current) if current == mode => return true,
-                    Ok(current) => warn!("[{} {}] nwscanmode is still {} after setting {} (attempt {}/3)", label, self.com_port, current, mode, attempt),
-                    Err(e) => warn!("[{} {}] cannot read nwscanmode after restore (attempt {}/3): {}", label, self.com_port, attempt, e),
+                    Ok(current) => warn!("[USSD {}] nwscanmode is still {} after setting {} (attempt {}/3)", self.com_port, current, mode, attempt),
+                    Err(e) => warn!("[USSD {}] cannot read nwscanmode after restore (attempt {}/3): {}", self.com_port, attempt, e),
                 }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        error!("[{} {}] nwscanmode could not be restored to {}", label, self.com_port, mode);
+        error!("[USSD {}] nwscanmode could not be restored to {}; the port stays on 2G/3G", self.com_port, mode);
         false
-    }
-
-    /// Lock the module to LTE, require EPS and IMS registration, then read SMS.
-    /// Welcome texts are left on the SIM. The previous network mode is restored.
-    pub async fn read_welcome_sms_on_lte(&self) -> Result<LteWelcomeRead, String> {
-        let original = self.nwscanmode().await.map_err(|e| format!("读取网络模式失败: {}", e))?;
-        let outcome = self.read_welcome_sms_while_on_lte().await;
-        let mode_restored = self.restore_nwscanmode(original, "WelcomeSMS").await;
-        if mode_restored {
-            match self.wait_registered(&[true], Duration::from_secs(45)).await {
-                Some(_) => info!("[WelcomeSMS {}] restored nwscanmode {} and registered on 4G", self.com_port, original),
-                None => {
-                    let _ = self.wait_registered(&[false], Duration::from_secs(15)).await;
-                    warn!("[WelcomeSMS {}] restored nwscanmode {} but LTE is not registered yet", self.com_port, original);
-                }
-            }
-        }
-        match outcome {
-            Ok(mut read) => {
-                read.mode_restored = mode_restored;
-                Ok(read)
-            }
-            Err(error) if mode_restored => Err(error),
-            Err(error) => Err(format!("{}；网络模式未能恢复为 {}", error, original)),
-        }
-    }
-
-    async fn read_welcome_sms_while_on_lte(&self) -> Result<LteWelcomeRead, String> {
-        self.set_nwscanmode(3).await.map_err(|e| format!("切换到 LTE 失败: {}", e))?;
-        if self.wait_registered(&[true], Duration::from_secs(45)).await.is_none() {
-            return Err("未注册到 LTE".to_string());
-        }
-        let ims = self.query_ims().await.map_err(|e| format!("读取 IMS 失败: {}", e))?;
-        if ims != (1, 1) {
-            return Err(format!("IMS 未注册 ({},{})", ims.0, ims.1));
-        }
-        let sms_list = self.read_stored_sms_retrying_memory().await?;
-        let welcome_count = sms_list.iter().filter(|sms| is_three_welcome_text(&sms.message)).count();
-        let phone_number = sms_list.iter().find_map(|sms| {
-            crate::phone_number::parse_welcome_sms(&sms.message).map(|identity| identity.phone_number)
-        });
-        Ok(LteWelcomeRead { phone_number, welcome_count, mode_restored: true })
-    }
-
-    async fn query_ims(&self) -> io::Result<(u8, u8)> {
-        let response = self.send_command_with_ok("AT+QCFG=\"ims\"\r\n").await?;
-        parse_qcfg_ims(&response).ok_or_else(|| io::Error::other(format!("Module did not report IMS: {}", response.trim())))
-    }
-
-    async fn read_stored_sms_retrying_memory(&self) -> Result<Vec<crate::db::ModemSMS>, String> {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            match self.take_stored_sms().await {
-                Ok((list, _)) => return Ok(list),
-                Err(error) if is_sms_memory_not_ready(&error) && Instant::now() < deadline => {
-                    warn!("[{}] SMS read returned +CMS ERROR: 350; retrying without deleting", self.com_port);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                Err(error) => return Err(format!("读取短信失败: {}", error)),
-            }
-        }
     }
 
     /// Service provider name from the SIM (AT+CSPN?), e.g. "giffgaff".
@@ -4485,15 +4387,6 @@ impl Modem {
 #[cfg(test)]
 mod tests {
     use super::Modem;
-
-    #[test]
-    fn ims_query_requires_both_values() {
-        assert_eq!(super::parse_qcfg_ims("+QCFG: \"ims\",1,1\r\n\r\nOK"), Some((1, 1)));
-        assert_eq!(super::parse_qcfg_ims("ims:1,1"), Some((1, 1)));
-        assert_eq!(super::parse_qcfg_ims("+QCFG: \"ims\",1,0"), Some((1, 0)));
-        assert_eq!(super::parse_qcfg_ims("+QCFG: \"ims\",0,0"), Some((0, 0)));
-        assert_eq!(super::parse_qcfg_ims("OK"), None);
-    }
 
     #[test]
     fn sim_busy_is_transient_not_recoverable() {

@@ -3568,22 +3568,6 @@ impl ModemManager {
         Ok(())
     }
 
-    pub async fn read_welcome_sms_on_lte(&self, sim_id: &str) -> std::result::Result<crate::modem::core::LteWelcomeRead, String> {
-        let modem = self
-            .get_modem(sim_id)
-            .await
-            .ok_or_else(|| format!("Modem not found for SIM ID: {}", sim_id))?;
-        modem.read_welcome_sms_on_lte().await
-    }
-
-    pub async fn write_own_number_phonebook(&self, sim_id: &str, phone_number: &str) -> anyhow::Result<()> {
-        let modem = self
-            .get_modem(sim_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
-        modem.write_phone_number(phone_number).await.map_err(Into::into)
-    }
-
     pub async fn send_ussd(&self, sim_id: &str, code: &str) -> anyhow::Result<String> {
         let modem = self
             .get_modem(sim_id)

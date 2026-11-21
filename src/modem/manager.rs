@@ -149,6 +149,14 @@ const SIM_DEMOTION_COOLDOWN_SECS: u64 = 20;
 mod recovery_capacity_tests {
     use super::*;
 
+    #[test]
+    fn a_restart_is_not_registered_until_the_module_has_rebooted() {
+        assert!(!ModemManager::module_back_after_reset(4, 2));
+        assert!(!ModemManager::module_back_after_reset(34, 2));
+        assert!(!ModemManager::module_back_after_reset(40, 1));
+        assert!(ModemManager::module_back_after_reset(40, 2));
+    }
+
     #[tokio::test]
     async fn voice_otp_tools_are_ready_before_modem_discovery() {
         let path = std::env::temp_dir().join(format!("voice-tools-{}", uuid::Uuid::new_v4()));
@@ -525,6 +533,12 @@ impl ModemManager {
         self.manual_restarting_ports.read().await.clone()
     }
 
+    /// Mark a port before the restart task runs, so the dashboard does not keep
+    /// showing the pre-reset "registered" row.
+    pub async fn manual_restarting_ports_insert(&self, com_port: &str) {
+        self.manual_restarting_ports.write().await.insert(com_port.to_string());
+    }
+
     pub async fn get_identity_revalidating_ports(&self) -> HashSet<String> {
         self.identity_revalidating_ports.read().await.clone()
     }
@@ -719,65 +733,7 @@ impl ModemManager {
         };
 
         log::warn!("[manual-restart] Restart requested for {}", device.com_port);
-
-        self.manual_restarting_ports
-            .write()
-            .await
-            .insert(device.com_port.clone());
-        self.msim_managed_ports.write().await.remove(&device.com_port);
-
-        self.stop_unavailable_port_worker(&device.com_port).await;
-
-        if let Some(task) = self.urc_tasks.write().await.remove(&device.com_port) {
-            task.abort();
-        }
-
-        let modem = self.modems.write().await.remove(&device.com_port);
-        let old_sim_id = if let Some(modem) = modem.as_ref() {
-            modem.sim_id.read().await.clone()
-        } else {
-            None
-        };
-
-        if let Some(sim_id) = old_sim_id.as_deref() {
-            if let Some((_task_id, task)) = self
-                .post_register_recovery_tasks
-                .write()
-                .await
-                .remove(sim_id)
-            {
-                task.abort();
-            }
-        }
-
-        if let Some(modem) = modem {
-            modem.shutdown().await;
-        }
-
-        self.last_known_sim_ids_by_port
-            .write()
-            .await
-            .remove(&device.com_port);
-        self.sim_probe_fail_counts.write().await.remove(&device.com_port);
-        self.sim_swap_confirm_streaks.write().await.remove(&device.com_port);
-        self.recent_ready_at.write().await.remove(&device.com_port);
-        self.sim_probe_cooldown_until
-            .write()
-            .await
-            .remove(&device.com_port);
-
-        let generation = self.port_runtime_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.port_runtime.write().await.insert(
-            device.com_port.clone(),
-            PortRuntimeState {
-                generation,
-                lifecycle: PortLifecycle::Probing,
-                active_sim_id: None,
-                last_sim_id: None,
-                module_connected: false,
-                last_imei: None,
-            },
-        );
+        self.detach_live_port(&device.com_port).await;
 
         self.clone()
             .add_unavailable_port(
@@ -2352,6 +2308,25 @@ impl ModemManager {
                         })
                         .unwrap_or(false);
 
+                    // A welcome-SMS read or phonebook write holds the only AT lane.
+                    // CPIN then times out even though the SIM is still there. Demoting
+                    // that port hides the number and the recovery init wedges the module.
+                    if !explicit_absent && (modem.commands_pending() || status_error.as_deref().is_some_and(|error| {
+                        let lower = error.to_ascii_lowercase();
+                        lower.contains("backlogged") || Modem::is_sim_busy_error(&std::io::Error::other(error.to_string()))
+                    })) {
+                        log::info!(
+                            "SIM probe on {} stayed active: command queue is busy (was {}, status={:?}, status_err={:?})",
+                            modem.com_port, iccid, status, status_error
+                        );
+                        return ProbeOutcome::TransientIssue {
+                            iccid,
+                            com_port: modem.com_port.clone(),
+                            hide_identity: false,
+                            sim_unreadable: false,
+                        };
+                    }
+
                     let imsi_probe = tokio::time::timeout(Duration::from_secs(10), modem.get_sim_imsi()).await;
                     let mut imsi_value: Option<String> = None;
                     let mut imsi_error: Option<String> = None;
@@ -2840,6 +2815,7 @@ impl ModemManager {
                     hide_identity,
                     sim_unreadable,
                 } => {
+                    self.sim_probe_fail_counts.write().await.remove(&com_port);
                     if hide_identity {
                         self.identity_revalidating_ports
                             .write()
@@ -3186,7 +3162,84 @@ impl ModemManager {
         None
     }
 
-    /// Operator restart: reset the module (AT+CFUN=1,1), re-initialise the port and report the outcome.
+    /// AT+CFUN=1,1 leaves the old session answering for a few seconds, then the
+    /// module drops the USB port for at least half a minute. A CPIN READY /
+    /// registered result before that gap is the session that is about to die.
+    pub(crate) fn module_back_after_reset(elapsed_secs: u64, consecutive_answers: u8) -> bool {
+        const MIN_REBOOT_SECS: u64 = 35;
+        elapsed_secs >= MIN_REBOOT_SECS && consecutive_answers >= 2
+    }
+
+    /// Drop the live handle and recovery worker without opening the port again.
+    async fn detach_live_port(&self, com_port: &str) {
+        self.manual_restarting_ports
+            .write()
+            .await
+            .insert(com_port.to_string());
+        self.msim_managed_ports.write().await.remove(com_port);
+        self.stop_unavailable_port_worker(com_port).await;
+
+        if let Some(task) = self.urc_tasks.write().await.remove(com_port) {
+            task.abort();
+        }
+
+        let modem = self.modems.write().await.remove(com_port);
+        let old_sim_id = if let Some(modem) = modem.as_ref() {
+            modem.sim_id.read().await.clone()
+        } else {
+            None
+        };
+        if let Some(sim_id) = old_sim_id.as_deref() {
+            if let Some((_task_id, task)) = self.post_register_recovery_tasks.write().await.remove(sim_id) {
+                task.abort();
+            }
+        }
+        if let Some(modem) = modem {
+            modem.shutdown().await;
+        }
+
+        self.last_known_sim_ids_by_port.write().await.remove(com_port);
+        self.sim_probe_fail_counts.write().await.remove(com_port);
+        self.sim_swap_confirm_streaks.write().await.remove(com_port);
+        self.recent_ready_at.write().await.remove(com_port);
+        self.sim_probe_cooldown_until.write().await.remove(com_port);
+
+        let kept_sim = self.port_runtime.read().await.get(com_port).and_then(|state| {
+            state.active_sim_id.clone().or(state.last_sim_id.clone())
+        });
+        let generation = self.port_runtime_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.port_runtime.write().await.insert(
+            com_port.to_string(),
+            PortRuntimeState {
+                generation,
+                lifecycle: PortLifecycle::Probing,
+                active_sim_id: None,
+                last_sim_id: kept_sim,
+                module_connected: false,
+                last_imei: None,
+            },
+        );
+    }
+
+    /// Open the port once the previous handle has been released, then write AT+CFUN=1,1.
+    async fn send_reset_when_port_free(&self, com_port: &str, baud_rate: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let port_lock = self.port_open_lock(com_port).await;
+            let _guard = port_lock.lock().await;
+            if Modem::send_reset_on_port(com_port, baud_rate).await {
+                return true;
+            }
+            drop(_guard);
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Operator restart: reset the module (AT+CFUN=1,1), wait until it has
+    /// actually rebooted, then re-initialise the port and report the outcome.
     pub async fn manual_restart_port(
         self: Arc<Self>,
         com_port: String,
@@ -3195,24 +3248,58 @@ impl ModemManager {
     ) {
         const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
         const NETWORK_TIMEOUT: Duration = Duration::from_secs(40);
+        const REBOOT_QUIET: Duration = Duration::from_secs(35);
         let Some(device) = self.devices.iter().find(|device| device.com_port.eq_ignore_ascii_case(&com_port)).cloned() else {
             return;
         };
         let port = device.com_port.clone();
+        self.manual_restarting_ports.write().await.insert(port.clone());
         self.set_restart_status(&port, "resetting", "Sending AT+CFUN=1,1".into()).await;
-        if let Some(modem) = self.get_modem_by_com_port(&port).await {
+        let live = self.get_modem_by_com_port(&port).await;
+        if let Some(modem) = live {
             let reply = modem.reset_module().await;
             log::info!("[manual-restart {}] reset reply: {}", port, reply);
+            self.detach_live_port(&port).await;
         } else {
-            self.stop_unavailable_port_worker(&port).await;
-            let port_lock = self.port_open_lock(&port).await;
-            let _guard = port_lock.lock().await;
-            if !Modem::send_reset_on_port(&port, device.baud_rate).await {
-                log::warn!("[manual-restart {}] module did not acknowledge reset; re-initialising anyway", port);
+            self.detach_live_port(&port).await;
+            if !self.send_reset_when_port_free(&port, device.baud_rate).await {
+                log::warn!("[manual-restart {}] could not open the port to send AT+CFUN=1,1; waiting for it to settle", port);
             }
         }
-        if let Err(error) = self.clone().restart_port(&port, sse_manager, transcribe_cfg).await {
+        self.set_restart_status(&port, "initializing", "Module is rebooting; it stays offline for at least 35 seconds".into()).await;
+
+        // Leave the COM port closed. Opening it while the module re-enumerates,
+        // or trusting CPIN/registration from the session that has not reset yet,
+        // is what left COM74/COM77 answering "registered" and then dead.
+        tokio::time::sleep(REBOOT_QUIET).await;
+
+        let started = Instant::now();
+        let mut consecutive_answers: u8 = 0;
+        loop {
+            let elapsed = REBOOT_QUIET.as_secs().saturating_add(started.elapsed().as_secs());
+            if Self::module_back_after_reset(elapsed, consecutive_answers) {
+                break;
+            }
+            if elapsed >= RECOVERY_TIMEOUT.as_secs() {
+                self.set_restart_status(&port, "no_response", format!("Module did not respond within {}s", RECOVERY_TIMEOUT.as_secs())).await;
+                let _ = self.clone().restart_port(&port, sse_manager, transcribe_cfg).await;
+                return;
+            }
+            let port_lock = self.port_open_lock(&port).await;
+            let _guard = port_lock.lock().await;
+            let answering = Modem::quick_probe_port(&port, device.baud_rate).await;
+            drop(_guard);
+            if answering {
+                consecutive_answers = consecutive_answers.saturating_add(1);
+            } else {
+                consecutive_answers = 0;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        if let Err(error) = self.clone().restart_port(&port, sse_manager.clone(), transcribe_cfg.clone()).await {
             self.set_restart_status(&port, "no_response", error).await;
+            self.manual_restarting_ports.write().await.remove(&port);
             return;
         }
         self.set_restart_status(&port, "initializing", "Waiting for the module to come back".into()).await;

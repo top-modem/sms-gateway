@@ -1276,7 +1276,8 @@ impl Modem {
     }
 
     /// Send AT+CFUN=1,1 on a port that has no live modem handle. Returns false if the
-    /// port cannot be opened or nothing answers.
+    /// port cannot be opened or the module rejects the command. Silence after a
+    /// successful write counts as sent: the module often reboots before OK.
     pub async fn send_reset_on_port(com_port: &str, baud_rate: u32) -> bool {
         let open_result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1313,12 +1314,26 @@ impl Modem {
             }
         }
         info!("[manual-restart {}] reset reply without live handle: {:?}", com_port, response.trim());
-        response.contains("OK")
+        // OK, silence, or a dropped link all mean the reset was written. Quectel
+        // modules often reboot before they can send OK. An explicit ERROR means
+        // the module refused the command and is still the old session.
+        let upper = response.to_ascii_uppercase();
+        !(upper.contains("ERROR") && !upper.contains("OK"))
     }
 
-    /// Quick liveness probe. A modem that sent bytes recently is alive even when its command
-    /// queue is too busy (e.g. reading a new SIM's SMS) to answer a fresh AT within 3 s.
+    /// True while this modem still has AT commands queued or executing.
+    /// A busy queue is a live port, not a USB unplug.
+    pub fn commands_pending(&self) -> bool {
+        self.pending_commands.load(Ordering::SeqCst) > 0
+    }
+
+    /// Quick liveness probe. A modem that sent bytes recently, or that still has
+    /// a command in flight, is alive even when a fresh AT cannot be answered
+    /// within 3 s (a new SIM's AT+CMGL, or a welcome-SMS phonebook write).
     pub async fn probe_alive(&self) -> bool {
+        if self.commands_pending() {
+            return true;
+        }
         // A fresh SIM can keep the module silent for >10 s inside one long AT+CMGL.
         if self.last_rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).elapsed() < Duration::from_secs(30) {
             return true;

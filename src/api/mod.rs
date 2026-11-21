@@ -720,6 +720,7 @@ async fn get_all_sim_info(
         .filter(|snapshot| {
             snapshot.active_sim_id.is_some()
                 && !identity_revalidating_ports.contains(&snapshot.com_port)
+                && !manual_restarting_ports.contains(&snapshot.com_port)
         })
         .map(|snapshot| {
             let sim_id = snapshot.active_sim_id.clone().unwrap_or_default();
@@ -1087,9 +1088,9 @@ async fn get_all_sim_info(
 
         details.push(json!({
             "available": available,
-            "sim_id": if available { snapshot.active_sim_id.clone() } else { None },
+            "sim_id": if available { snapshot.active_sim_id.clone() } else { snapshot.last_sim_id.clone() },
             "has_sim": available,
-            "name": if available { snapshot.active_sim_id.clone() } else { None },
+            "name": if available { snapshot.active_sim_id.clone() } else { snapshot.last_sim_id.clone() },
             "com_port": snapshot.com_port,
             "baud_rate": snapshot.baud_rate,
             "signal_quality": null,
@@ -1257,6 +1258,7 @@ async fn restart_ports(
             "message": "Restart accepted",
         }));
 
+        state.mm.manual_restarting_ports_insert(&com_port).await;
         let mm = state.mm.clone();
         let sse = state.sse.clone();
         let transcribe_cfg = state.transcribe_cfg.clone();

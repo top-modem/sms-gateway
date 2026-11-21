@@ -667,11 +667,7 @@
                 <td class="px-3 py-2.5 whitespace-nowrap">
                   <div class="flex items-center gap-2">
                     <span class="font-mono text-gray-700 dark:text-gray-200">
-                      {#if info.available === false}
-                        —
-                      {:else}
-                        {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
-                      {/if}
+                      {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
                     </span>
                     {#if hasSim}
                       <button

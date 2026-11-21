@@ -7,7 +7,7 @@
   let { onBack = () => {}, onNavigateEsim = () => {}, onNavigateMsim = () => {} } = $props();
 
   // ── State ──────────────────────────────────────────────────────────────────
-  let activeTab = $state('barcode'); // 'barcode' | 'import' | 'call' | 'sms' | 'ussd'
+  let activeTab = $state('barcode'); // 'barcode' | 'import' | 'call' | 'sms' | 'ussd' | 'welcome_sms'
   let sims = $state([]);
   let simCards = $state([]);
   let loading = $state(true);
@@ -39,6 +39,9 @@
   let stopping = $state(false);
   let emptySims = $derived(sims.filter(s => !String(s.phone_number ?? '').trim()));
   let ussdTargets = $derived(emptySims.filter(s => ussdSelected.includes(s.com_port)).map(s => s.com_port));
+  let welcomeRunning = $state(false);
+  let welcomeSelected = $state([]);
+  let welcomeTargets = $derived(emptySims.filter(s => welcomeSelected.includes(s.com_port)).map(s => s.com_port));
   let freeSmsRunning = $state(false);
 
   // Export tab
@@ -113,6 +116,7 @@
       if (activeTab === 'call') exchangeRunning = running && taskStatus.task_type === 'call';
       if (activeTab === 'sms') exchangeRunning = running && taskStatus.task_type === 'sms';
       if (activeTab === 'ussd') ussdRunning = running && taskStatus.task_type === 'ussd';
+      if (activeTab === 'welcome_sms') welcomeRunning = running && taskStatus.task_type === 'welcome_sms';
       if (activeTab === 'free_sms') freeSmsRunning = running && taskStatus.task_type === 'free_sms';
 
       if (running) {
@@ -362,6 +366,24 @@
     ussdSelected = checked ? [...ussdSelected.filter(p => p !== port), port] : ussdSelected.filter(p => p !== port);
   }
 
+  function toggleWelcomePort(port, checked) {
+    welcomeSelected = checked ? [...welcomeSelected.filter(p => p !== port), port] : welcomeSelected.filter(p => p !== port);
+  }
+
+  async function startWelcomeSms() {
+    if (welcomeTargets.length === 0) return;
+    welcomeRunning = true;
+    error = '';
+    try {
+      await apiClient.startWelcomeSms(welcomeTargets);
+      startPolling();
+    } catch (e) {
+      error = e?.data?.error ?? e?.message ?? $t('err_upload_failed');
+      welcomeRunning = false;
+      startPolling();
+    }
+  }
+
   async function startFreeSms() {
     freeSmsRunning = true;
     error = '';
@@ -531,6 +553,7 @@
         {$t('msim_title')}
       </button>
       {#each [
+        { id: 'welcome_sms', label: $t('phone_tab_welcome_sms'), icon: 'carbon:chat' },
         { id: 'ussd', label: $t('phone_tab_ussd'), icon: 'carbon:keyboard' },
         { id: 'free_sms', label: $t('btn_free_sms_number'), icon: 'carbon:chat' },
         { id: 'export', label: $t('btn_export_numbers'), icon: 'carbon:document-export' },
@@ -808,6 +831,71 @@
                 {activeTab === 'call' ? $t('btn_start_call_exchange') : $t('btn_start_sms_exchange')}
               </button>
             </div>
+          </div>
+
+        <!-- Welcome SMS number -->
+        {:else if activeTab === 'welcome_sms'}
+          <div class="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-800 p-4 sm:p-6 shadow-sm space-y-4">
+            <div class="flex justify-end">
+              <button
+                onclick={startWelcomeSms}
+                disabled={welcomeRunning || taskStatus.running || welcomeTargets.length === 0}
+                class="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                {#if welcomeRunning}
+                  <Icon icon="carbon:loading" class="w-4 h-4 animate-spin" />
+                {:else}
+                  <Icon icon="carbon:chat" class="w-4 h-4" />
+                {/if}
+                {$t('btn_welcome_sms_start')}
+              </button>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400">{$t('welcome_sms_hint')}</p>
+
+            {#if emptySims.length === 0}
+              <p class="text-sm text-gray-500 dark:text-gray-400">{$t('ussd_no_empty_ports')}</p>
+            {:else}
+              <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-zinc-800 max-h-[45vh] overflow-y-auto">
+                <table class="min-w-full text-sm">
+                  <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 sticky top-0">
+                    <tr>
+                      <th class="px-3 py-2 text-left font-medium w-10">
+                        <input type="checkbox" class="accent-blue-600" aria-label={$t('export_select_all')}
+                          checked={welcomeTargets.length === emptySims.length}
+                          onchange={(event) => (welcomeSelected = event.currentTarget.checked ? emptySims.map(s => s.com_port) : [])} />
+                      </th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_com')}</th>
+                      <th class="px-3 py-2 text-left font-medium">{$t('phone_col_iccid')}</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
+                    {#each emptySims as sim (sim.sim_id)}
+                      <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
+                        <td class="px-3 py-2">
+                          <input type="checkbox" class="accent-blue-600" aria-label={sim.com_port}
+                            checked={welcomeSelected.includes(sim.com_port)}
+                            onchange={(event) => toggleWelcomePort(sim.com_port, event.currentTarget.checked)} />
+                        </td>
+                        <td class="px-3 py-2 font-medium">{sim.com_port}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{sim.sim_id}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+              <span class="text-sm text-gray-500 dark:text-gray-400">{$t('export_selected_count', { n: welcomeTargets.length })}</span>
+            {/if}
+
+            {#if taskStatus.running && taskStatus.task_type === 'welcome_sms'}
+              <div class="p-3 rounded-lg bg-gray-100 dark:bg-zinc-800 text-sm text-gray-700 dark:text-gray-300 flex items-center justify-between gap-3">
+                <span>{$t('phone_task_running', { type: taskStatus.task_type, done: taskStatus.done, total: taskStatus.total })} · {taskStatus.current}</span>
+                <button onclick={stopTask} disabled={stopping}
+                  class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 transition">
+                  <Icon icon="carbon:stop-filled" class="w-4 h-4" />
+                  {$t('btn_stop_task')}
+                </button>
+              </div>
+            {/if}
           </div>
 
         <!-- USSD -->

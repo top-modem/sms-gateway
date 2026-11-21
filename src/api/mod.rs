@@ -24,7 +24,7 @@ use crate::{
     firefox_api,
     modem::manager::TranscribeConfig,
     modem::{ModemInfo as ModemModel, NetworkRegistrationStatus, OperatorInfo, SignalQuality, SmsType},
-    phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, PhoneNumberTask, TaskHandle},
+    phone_number::{import_phone_numbers, new_task_handle, call_exchange, sms_exchange, ussd_batch, welcome_sms_batch, PhoneNumberTask, TaskHandle},
     service_control,
     ModemManagerRef,
 };
@@ -333,6 +333,10 @@ pub async fn run_api(
         .route(
             "/phone-numbers/ussd",
             post(phone_numbers_ussd).with_state(modem_manager.clone()),
+        )
+        .route(
+            "/phone-numbers/welcome-sms",
+            post(phone_numbers_welcome_sms).with_state(modem_manager.clone()),
         )
         .route(
             "/phone-numbers/free-sms",
@@ -1410,6 +1414,13 @@ struct PhoneNumberUssdRequest {
     com_ports: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct PhoneNumberWelcomeSmsRequest {
+    /// Empty means every port without a number.
+    #[serde(default)]
+    com_ports: Vec<String>,
+}
+
 fn get_phone_number_task() -> &'static TaskHandle {
     PHONE_NUMBER_TASK.get_or_init(new_task_handle)
 }
@@ -1780,6 +1791,18 @@ async fn phone_numbers_ussd(
         return (StatusCode::CONFLICT, Json(json!({"error": "Another phone-number task is running"}))).into_response();
     }
     tokio::spawn(ussd_batch(mm, task, code, payload.com_ports));
+    (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
+}
+
+async fn phone_numbers_welcome_sms(
+    State(mm): State<ModemManagerRef>,
+    Json(payload): Json<PhoneNumberWelcomeSmsRequest>,
+) -> Response {
+    let task = get_phone_number_task().clone();
+    if !claim_phone_number_task(&task, "welcome_sms").await {
+        return (StatusCode::CONFLICT, Json(json!({"error": "Another phone-number task is running"}))).into_response();
+    }
+    tokio::spawn(welcome_sms_batch(mm, task, payload.com_ports));
     (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response()
 }
 

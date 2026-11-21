@@ -338,6 +338,10 @@ class ApiClient {
         return FetchApi.post('/api/phone-numbers/ussd', { code, com_ports: comPorts });
     }
 
+    async startWelcomeSms(comPorts = []) {
+        return FetchApi.post('/api/phone-numbers/welcome-sms', { com_ports: comPorts });
+    }
+
     async cancelPhoneNumberTask() {
         return FetchApi.post('/api/phone-numbers/cancel', {});
     }

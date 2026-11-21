@@ -431,7 +431,7 @@ where
     t.current = "取号完成".to_string();
 }
 
-/// Read the Three UK welcome SMS on LTE. The number text is kept on the SIM.
+/// Read the Three UK welcome SMS without changing nwscanmode. The number text is kept on the SIM.
 pub async fn welcome_sms_batch(mm: Arc<ModemManager>, task: TaskHandle, com_ports: Vec<String>) {
     use futures::StreamExt;
     let phonebook = AppSetting::get("welcome_sms_phone_sync_enabled").await

@@ -74,7 +74,7 @@ struct ReaderState {
     raw_response_tx: Option<tokio::sync::oneshot::Sender<io::Result<Vec<u8>>>>,
 }
 
-/// Result of reading Three welcome SMS while the module is locked to LTE.
+/// Result of reading Three welcome SMS. The module is left on nwscanmode 0.
 pub struct LteWelcomeRead {
     pub phone_number: Option<String>,
     pub welcome_count: usize,
@@ -3010,33 +3010,10 @@ impl Modem {
         false
     }
 
-    /// Lock the module to LTE, require EPS and IMS registration, then read SMS.
-    /// Welcome texts are left on the SIM. The previous network mode is restored.
+    /// Require EPS and IMS registration, then read SMS.
+    /// The module stays on automatic network mode (`AT+QCFG="nwscanmode",0,1`).
+    /// Welcome texts are left on the SIM.
     pub async fn read_welcome_sms_on_lte(&self) -> Result<LteWelcomeRead, String> {
-        let original = self.nwscanmode().await.map_err(|e| format!("读取网络模式失败: {}", e))?;
-        let outcome = self.read_welcome_sms_while_on_lte().await;
-        let mode_restored = self.restore_nwscanmode(original, "WelcomeSMS").await;
-        if mode_restored {
-            match self.wait_registered(&[true], Duration::from_secs(45)).await {
-                Some(_) => info!("[WelcomeSMS {}] restored nwscanmode {} and registered on 4G", self.com_port, original),
-                None => {
-                    let _ = self.wait_registered(&[false], Duration::from_secs(15)).await;
-                    warn!("[WelcomeSMS {}] restored nwscanmode {} but LTE is not registered yet", self.com_port, original);
-                }
-            }
-        }
-        match outcome {
-            Ok(mut read) => {
-                read.mode_restored = mode_restored;
-                Ok(read)
-            }
-            Err(error) if mode_restored => Err(error),
-            Err(error) => Err(format!("{}；网络模式未能恢复为 {}", error, original)),
-        }
-    }
-
-    async fn read_welcome_sms_while_on_lte(&self) -> Result<LteWelcomeRead, String> {
-        self.set_nwscanmode(3).await.map_err(|e| format!("切换到 LTE 失败: {}", e))?;
         if self.wait_registered(&[true], Duration::from_secs(45)).await.is_none() {
             return Err("未注册到 LTE".to_string());
         }

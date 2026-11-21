@@ -2179,23 +2179,11 @@ impl ModemManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Modem not found for SIM ID: {}", sim_id))?;
 
-        let (sms_list, consumed) = modem.read_sms(crate::modem::SmsType::All).await?;
-
-        if consumed.is_empty() {
-            return Ok(None);
-        }
-
-        // Delete only handled entries (SMS, completed multipart, MMS
-        // notifications) so incomplete multipart fragments stay in storage.
-        if let Err(e) = modem.delete_sms_indices(&consumed).await {
-            log::warn!("Failed to delete SMS from modem after reading: {}", e);
-        }
+        let (sms_list, _) = modem.take_stored_sms().await?;
 
         if sms_list.is_empty() {
             return Ok(None);
         }
-
-        ModemSMS::bulk_insert(&sms_list).await?;
 
         if let Err(error) = modem.sync_welcome_sms_identity(&sms_list).await {
             log::warn!("[{}] Welcome SMS SIM sync failed: {}", modem.com_port, error);

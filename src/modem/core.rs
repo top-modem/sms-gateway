@@ -126,6 +126,11 @@ pub struct Modem {
     pub voice_otp_dtmf_sent: std::sync::atomic::AtomicBool,
     /// Set by a +CME 10/13/50 CPIN reply, cleared by CPIN READY; stale SIM rows must not be shown meanwhile.
     pub sim_absence_suspected: std::sync::atomic::AtomicBool,
+    /// Last time any byte arrived from the serial port.
+    last_rx: Arc<std::sync::Mutex<Instant>>,
+    /// Held from AT+CMGL to AT+CMGD: a second reader deleting by index could remove an SMS
+    /// that arrived in a freed slot in between.
+    sms_read_lock: tokio::sync::Mutex<()>,
     /// Receives the `+CUSD:` URC, which arrives after the AT+CUSD command's OK.
     pub ussd_reply_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
     /// Reader task handle so we can abort and release COM resources on drop.
@@ -200,6 +205,7 @@ impl Modem {
         }));
 
         // Spawn background reader task — owns ReadHalf, routes bytes to commands or URC channel
+        let last_rx = Arc::new(std::sync::Mutex::new(Instant::now()));
         let reader_task = tokio::spawn({
             let reader_state = reader_state.clone();
             let urc_tx = urc_tx.clone();
@@ -207,6 +213,7 @@ impl Modem {
             let connection_state = connection_state.clone();
             let name_c = name.to_string();
             let com_port_c = com_port.to_string();
+            let last_rx = last_rx.clone();
             async move {
                 Self::reader_task_main(
                     read_half,
@@ -217,6 +224,7 @@ impl Modem {
                     com_port_c,
                     baud_rate,
                     connection_state,
+                    last_rx,
                 )
                 .await;
             }
@@ -264,6 +272,8 @@ impl Modem {
             voice_otp_finishing: std::sync::atomic::AtomicBool::new(false),
             voice_otp_dtmf_sent: std::sync::atomic::AtomicBool::new(false),
             sim_absence_suspected: std::sync::atomic::AtomicBool::new(false),
+            last_rx,
+            sms_read_lock: tokio::sync::Mutex::new(()),
             ussd_reply_tx: tokio::sync::Mutex::new(None),
             reader_task: Mutex::new(Some(reader_task)),
             command_task: Mutex::new(Some(command_task)),
@@ -678,6 +688,7 @@ impl Modem {
         com_port: String,
         baud_rate: u32,
         connection_state: Arc<RwLock<ConnectionState>>,
+        last_rx: Arc<std::sync::Mutex<Instant>>,
     ) {
         let mut read_half = Some(read_half);
         let mut raw_buf = [0u8; 256];
@@ -702,6 +713,7 @@ impl Modem {
                     }
                 }
                 Ok(n) => {
+                    *last_rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
                     line_buf.extend_from_slice(&raw_buf[..n]);
                     // Raw-byte transfers (AT+QFDWL: MMS content, call recordings) can
                     // legitimately exceed MAX_LINE_BUF -- they're bounded by their own
@@ -1304,8 +1316,12 @@ impl Modem {
         response.contains("OK")
     }
 
-    /// Quick liveness probe: send AT with a short timeout and expect OK.
+    /// Quick liveness probe. A modem that sent bytes recently is alive even when its command
+    /// queue is too busy (e.g. reading a new SIM's SMS) to answer a fresh AT within 3 s.
     pub async fn probe_alive(&self) -> bool {
+        if self.last_rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).elapsed() < Duration::from_secs(10) {
+            return true;
+        }
         matches!(
             self.send_command_outer_timeout("AT\r\n", 3).await,
             Ok(resp) if resp.contains("OK")
@@ -1529,55 +1545,23 @@ impl Modem {
         webhook_manager: Option<webhook::WebhookManager>,
     ) -> anyhow::Result<()> {
         // Always read ALL messages so previously-read messages aren't missed
-        let (sms_list, consumed) = self.read_sms(SmsType::All).await?;
-
-        if consumed.is_empty() {
-            return Ok(());
-        }
-
-        // Delete handled entries from modem FIRST so storage doesn't fill up.
-        // Only the consumed indices are deleted: incomplete multipart fragments
-        // and SMS that arrived after the listing stay for the next poll.
-        if let Err(e) = self.delete_sms_indices(&consumed).await {
-            log::warn!("Failed to delete SMS from modem after reading: {}", e);
-        }
-
+        let (sms_list, contact_ids) = self.take_stored_sms().await?;
         if sms_list.is_empty() {
             return Ok(());
         }
 
-        let webhook_future = async {
-            if let Some(webhook_mgr) = webhook_manager {
-                for sms in &sms_list {
-                    if let Err(e) = webhook_mgr.send(sms.clone()) {
-                        log::error!("Failed to send webhook: {}", e);
-                    }
+        if let Some(webhook_mgr) = webhook_manager {
+            for sms in &sms_list {
+                if let Err(e) = webhook_mgr.send(sms.clone()) {
+                    log::error!("Failed to send webhook: {}", e);
                 }
             }
-        };
-
-        let db_future = async {
-            match ModemSMS::bulk_insert(&sms_list).await {
-                Ok(contact_ids) => {
-                    if let Ok(conversations) =
-                        crate::db::Conversation::query_by_contact_ids(&contact_ids).await
-                    {
-                        sse_manager.send(conversations);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Insert SMS error: {}", e);
-                    return false;
-                }
-            }
-            true
-        };
-
-        let (_, sms_saved) = tokio::join!(webhook_future, db_future);
-        if sms_saved {
-            if let Err(error) = self.sync_welcome_sms_identity(&sms_list).await {
-                log::warn!("[{}] Welcome SMS SIM sync failed: {}", self.com_port, error);
-            }
+        }
+        if let Ok(conversations) = crate::db::Conversation::query_by_contact_ids(&contact_ids).await {
+            sse_manager.send(conversations);
+        }
+        if let Err(error) = self.sync_welcome_sms_identity(&sms_list).await {
+            log::warn!("[{}] Welcome SMS SIM sync failed: {}", self.com_port, error);
         }
 
         self.upload_incoming_sms(&sms_list).await;
@@ -2072,6 +2056,38 @@ impl Modem {
         }
     }
 
+    /// Lists all stored SMS, saves them to the database and only then deletes the handled
+    /// storage entries (incomplete multipart fragments stay). If saving fails the SMS stay
+    /// on the SIM for the next poll. Only one caller per modem runs this at a time.
+    pub async fn take_stored_sms(&self) -> anyhow::Result<(Vec<ModemSMS>, Vec<String>)> {
+        let _reading = self.sms_read_lock.lock().await;
+        let (sms_list, consumed) = self.read_sms(SmsType::All).await?;
+        let mut contact_ids = Vec::new();
+        if !sms_list.is_empty() {
+            let mut attempt = 0;
+            contact_ids = loop {
+                attempt += 1;
+                match ModemSMS::bulk_insert(&sms_list).await {
+                    Ok(ids) => break ids,
+                    Err(error) if attempt < 3 => {
+                        log::warn!("[{}] Insert SMS failed (attempt {}/3), retrying: {}", self.com_port, attempt, error);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Err(error) => {
+                        log::error!("[{}] Insert SMS error; leaving {} SMS on the SIM for the next poll: {}", self.com_port, sms_list.len(), error);
+                        return Err(error);
+                    }
+                }
+            };
+        }
+        if !consumed.is_empty() {
+            if let Err(e) = self.delete_sms_indices(&consumed).await {
+                log::warn!("Failed to delete SMS from modem after reading: {}", e);
+            }
+        }
+        Ok((sms_list, contact_ids))
+    }
+
     /// Reads all SMS from modem storage. Returns the regular SMS list plus the
     /// storage indices that were fully handled (SMS, completed multipart SMS,
     /// MMS WAP-push notifications, unparseable PDUs). Callers must delete only
@@ -2555,14 +2571,8 @@ impl Modem {
     }
 
     pub async fn read_sms_sync_insert(&self, _sms_type: SmsType) -> anyhow::Result<()> {
-        let (sms_list, consumed) = self.read_sms(SmsType::All).await?;
-        if !consumed.is_empty() {
-            if let Err(e) = self.delete_sms_indices(&consumed).await {
-                log::warn!("Failed to delete SMS from modem after reading: {}", e);
-            }
-        }
+        let (sms_list, _) = self.take_stored_sms().await?;
         if !sms_list.is_empty() {
-            ModemSMS::bulk_insert(&sms_list).await?;
             if let Err(error) = self.sync_welcome_sms_identity(&sms_list).await {
                 log::warn!("[{}] Welcome SMS SIM sync failed: {}", self.com_port, error);
             }

@@ -1319,7 +1319,8 @@ impl Modem {
     /// Quick liveness probe. A modem that sent bytes recently is alive even when its command
     /// queue is too busy (e.g. reading a new SIM's SMS) to answer a fresh AT within 3 s.
     pub async fn probe_alive(&self) -> bool {
-        if self.last_rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).elapsed() < Duration::from_secs(10) {
+        // A fresh SIM can keep the module silent for >10 s inside one long AT+CMGL.
+        if self.last_rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).elapsed() < Duration::from_secs(30) {
             return true;
         }
         matches!(

@@ -1,12 +1,28 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "FRONTEND=%ROOT%\frontend"
 set "DRY_RUN=0"
+set "FULL_OPT=0"
+set "NO_ZIP=0"
+set "PROFILE=fast-release"
+set "PROFILE_DIR=fast-release"
+
+:parse_args
+if "%~1"=="" goto args_done
 if /I "%~1"=="--dry-run" set "DRY_RUN=1"
+if /I "%~1"=="--full" (
+  set "FULL_OPT=1"
+  set "PROFILE=release"
+  set "PROFILE_DIR=release"
+)
+if /I "%~1"=="--no-zip" set "NO_ZIP=1"
+shift
+goto parse_args
+:args_done
 
 where pnpm >nul 2>nul || (
   echo pnpm not found in PATH.
@@ -23,11 +39,24 @@ where powershell >nul 2>nul || (
   exit /b 1
 )
 
+rem Use every logical CPU for rustc codegen / LLVM work inside crates.
+if not defined CARGO_BUILD_JOBS (
+  if defined NUMBER_OF_PROCESSORS (
+    set "CARGO_BUILD_JOBS=%NUMBER_OF_PROCESSORS%"
+  ) else (
+    set "CARGO_BUILD_JOBS=8"
+  )
+)
+
 rem Build app name from Unicode code points to avoid mojibake in non-UTF8 editors.
 for /f "delims=" %%I in ('powershell -NoProfile -Command "[char]0x5C0F+[char]0x725B+[char]0x667A+[char]0x5361"') do set "APP_NAME=%%I"
 
 set "NEWDIR=%ROOT%\release\%APP_NAME%-windows-portable-v5"
 set "ZIPPATH=%ROOT%\release\%APP_NAME%-windows-portable-v5.zip"
+set "FE_LOG=%ROOT%\target\build_frontend.log"
+set "FE_EXIT=%ROOT%\target\build_frontend.exit"
+set "BE_LOG=%ROOT%\target\build_backend.log"
+set "BE_EXIT=%ROOT%\target\build_backend.exit"
 
 if "%DRY_RUN%"=="1" (
   echo [DRY RUN]
@@ -36,35 +65,66 @@ if "%DRY_RUN%"=="1" (
   echo APP_NAME=%APP_NAME%
   echo NEWDIR=%NEWDIR%
   echo ZIPPATH=%ZIPPATH%
+  echo PROFILE=%PROFILE%
+  echo CARGO_BUILD_JOBS=%CARGO_BUILD_JOBS%
+  echo FULL_OPT=%FULL_OPT%
+  echo NO_ZIP=%NO_ZIP%
   exit /b 0
 )
 
-echo [1/6] Go to project root
+echo [1/5] Go to project root
 cd /d "%ROOT%" || (
   echo Failed to enter project root: %ROOT%
   exit /b 1
 )
+if not exist "%ROOT%\target" mkdir "%ROOT%\target"
 
-echo [2/6] Build frontend
-cd /d "%FRONTEND%" || (
-  echo Failed to enter frontend folder: %FRONTEND%
-  exit /b 1
-)
-call pnpm run build
-if errorlevel 1 (
-  echo Frontend build failed.
-  exit /b 1
+echo [2/5] Build frontend + backend in parallel ^(profile=%PROFILE%, jobs=%CARGO_BUILD_JOBS%^)
+if "%FULL_OPT%"=="1" (
+  echo Using full release LTO. For everyday rebuilds omit --full ^(uses fast-release^).
+) else (
+  echo Using fast-release ^(no fat LTO, incremental^). Pass --full for maximum optimisation.
 )
 
-echo [3/6] Build backend release exe
-cd /d "%ROOT%"
-call cargo build --release
-if errorlevel 1 (
-  echo Backend release build failed.
+del /f /q "%FE_LOG%" "%FE_EXIT%" "%BE_LOG%" "%BE_EXIT%" >nul 2>nul
+
+rem Frontend and Rust share almost no work, so run them together.
+start "sms-gateway-frontend" /b cmd /c "\"%ROOT%\scripts\run_frontend_build.cmd\" \"%FRONTEND%\" \"%FE_LOG%\" \"%FE_EXIT%\""
+start "sms-gateway-backend" /b cmd /c "\"%ROOT%\scripts\run_backend_build.cmd\" \"%ROOT%\" \"%BE_LOG%\" \"%BE_EXIT%\" \"%CARGO_BUILD_JOBS%\" \"%PROFILE%\""
+
+:wait_builds
+if exist "%FE_EXIT%" if exist "%BE_EXIT%" goto builds_done
+timeout /t 2 /nobreak >nul
+goto wait_builds
+:builds_done
+
+set /p FE_CODE=<"%FE_EXIT%"
+set /p BE_CODE=<"%BE_EXIT%"
+set "FE_CODE=!FE_CODE: =!"
+set "BE_CODE=!BE_CODE: =!"
+
+echo ----- frontend -----
+type "%FE_LOG%"
+if not "!FE_CODE!"=="0" (
+  echo Frontend build failed. exit=!FE_CODE!
   exit /b 1
 )
 
-echo [4/6] Recreate portable folder
+echo.
+echo ----- backend -----
+type "%BE_LOG%"
+if not "!BE_CODE!"=="0" (
+  echo Backend release build failed. exit=!BE_CODE!
+  exit /b 1
+)
+
+set "EXE_SRC=%ROOT%\target\%PROFILE_DIR%\sms-gateway.exe"
+if not exist "%EXE_SRC%" (
+  echo Missing built exe: %EXE_SRC%
+  exit /b 1
+)
+
+echo [3/5] Recreate portable folder
 rem Preserve existing data\ and logs\ (they hold the live sqlite database and
 rem log history) across rebuilds instead of wiping them along with the folder.
 rem Backup dir must live on the same drive as NEWDIR: "move" across drives fails.
@@ -84,7 +144,7 @@ if exist "%DATA_BACKUP%\data" move /y "%DATA_BACKUP%\data" "%NEWDIR%\data" >nul
 if exist "%DATA_BACKUP%\logs" move /y "%DATA_BACKUP%\logs" "%NEWDIR%\logs" >nul
 if exist "%DATA_BACKUP%" rmdir /s /q "%DATA_BACKUP%"
 
-copy /y "%ROOT%\target\release\sms-gateway.exe" "%NEWDIR%\%APP_NAME%.exe" >nul || (
+copy /y "%EXE_SRC%" "%NEWDIR%\%APP_NAME%.exe" >nul || (
   echo Failed to copy release exe.
   exit /b 1
 )
@@ -141,24 +201,31 @@ for %%F in (
   if exist "%ROOT%\%%F" copy /y "%ROOT%\%%F" "%NEWDIR%\" >nul
 )
 
-echo [5/6] Create zip package
-if exist "%ZIPPATH%" del /f /q "%ZIPPATH%"
-powershell -NoProfile -Command "Compress-Archive -Path '%NEWDIR%\*' -DestinationPath '%ZIPPATH%'"
-if errorlevel 1 (
-  echo Failed to create zip package.
-  exit /b 1
+if "%NO_ZIP%"=="1" (
+  echo [4/5] Skip zip ^(--no-zip^)
+) else (
+  echo [4/5] Create zip package
+  if exist "%ZIPPATH%" del /f /q "%ZIPPATH%"
+  rem .NET ZipFile is much faster than Compress-Archive on large trees.
+  powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; if (Test-Path -LiteralPath '%ZIPPATH%') { Remove-Item -LiteralPath '%ZIPPATH%' -Force }; [System.IO.Compression.ZipFile]::CreateFromDirectory('%NEWDIR%', '%ZIPPATH%', [System.IO.Compression.CompressionLevel]::Optimal, $false)"
+  if errorlevel 1 (
+    echo Failed to create zip package.
+    exit /b 1
+  )
 )
 
-echo [6/6] Done
+echo [5/5] Done
 
 echo Portable folder:
 echo %NEWDIR%
-echo Zip package:
-echo %ZIPPATH%
+if "%NO_ZIP%"=="0" (
+  echo Zip package:
+  echo %ZIPPATH%
+)
 
 dir "%NEWDIR%"
-dir "%ZIPPATH%"
+if "%NO_ZIP%"=="0" dir "%ZIPPATH%"
 
 echo.
-echo Build package completed successfully.
+echo Build package completed successfully. profile=%PROFILE% jobs=%CARGO_BUILD_JOBS%
 exit /b 0

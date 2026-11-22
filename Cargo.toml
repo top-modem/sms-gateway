@@ -8,12 +8,15 @@ default = []
 mock-data = []
 
 [profile.release]
-strip = true       
-lto = true        
-codegen-units = 1 
-panic = "abort"   
+strip = true
+# Thin LTO keeps most of the runtime win of fat LTO while using many cores.
+# Fat LTO + codegen-units=1 made portable builds take ~8-10 minutes on this box.
+lto = "thin"
+codegen-units = 8
+panic = "abort"
 
-# Optimized but fast to rebuild; use for test deployments, not final distribution.
+# Everyday portable rebuilds (build_portable_v5.bat default). Skip LTO, keep
+# incremental caches. Pass --full to that bat for this release profile instead.
 [profile.fast-release]
 inherits = "release"
 lto = false

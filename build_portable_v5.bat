@@ -53,11 +53,6 @@ for /f "delims=" %%I in ('powershell -NoProfile -Command "[char]0x5C0F+[char]0x7
 
 set "NEWDIR=%ROOT%\release\%APP_NAME%-windows-portable-v5"
 set "ZIPPATH=%ROOT%\release\%APP_NAME%-windows-portable-v5.zip"
-set "FE_LOG=%ROOT%\target\build_frontend.log"
-set "FE_EXIT=%ROOT%\target\build_frontend.exit"
-set "BE_LOG=%ROOT%\target\build_backend.log"
-set "BE_EXIT=%ROOT%\target\build_backend.exit"
-
 if "%DRY_RUN%"=="1" (
   echo [DRY RUN]
   echo ROOT=%ROOT%
@@ -86,35 +81,10 @@ if "%FULL_OPT%"=="1" (
   echo Using fast-release ^(no fat LTO, incremental^). Pass --full for maximum optimisation.
 )
 
-del /f /q "%FE_LOG%" "%FE_EXIT%" "%BE_LOG%" "%BE_EXIT%" >nul 2>nul
-
 rem Frontend and Rust share almost no work, so run them together.
-start "sms-gateway-frontend" /b cmd /c "\"%ROOT%\scripts\run_frontend_build.cmd\" \"%FRONTEND%\" \"%FE_LOG%\" \"%FE_EXIT%\""
-start "sms-gateway-backend" /b cmd /c "\"%ROOT%\scripts\run_backend_build.cmd\" \"%ROOT%\" \"%BE_LOG%\" \"%BE_EXIT%\" \"%CARGO_BUILD_JOBS%\" \"%PROFILE%\""
-
-:wait_builds
-if exist "%FE_EXIT%" if exist "%BE_EXIT%" goto builds_done
-timeout /t 2 /nobreak >nul
-goto wait_builds
-:builds_done
-
-set /p FE_CODE=<"%FE_EXIT%"
-set /p BE_CODE=<"%BE_EXIT%"
-set "FE_CODE=!FE_CODE: =!"
-set "BE_CODE=!BE_CODE: =!"
-
-echo ----- frontend -----
-type "%FE_LOG%"
-if not "!FE_CODE!"=="0" (
-  echo Frontend build failed. exit=!FE_CODE!
-  exit /b 1
-)
-
-echo.
-echo ----- backend -----
-type "%BE_LOG%"
-if not "!BE_CODE!"=="0" (
-  echo Backend release build failed. exit=!BE_CODE!
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\parallel_build.ps1" -Root "%ROOT%" -Frontend "%FRONTEND%" -Profile "%PROFILE%" -Jobs "%CARGO_BUILD_JOBS%"
+if errorlevel 1 (
+  echo Build failed. Logs: %ROOT%\target\build_frontend*.log and %ROOT%\target\build_backend*.log
   exit /b 1
 )
 

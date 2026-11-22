@@ -155,20 +155,35 @@
   });
 
   // ── Import tab ─────────────────────────────────────────────────────────────
+  function digitsOnly(value) {
+    return String(value ?? '').replace(/\D/g, '');
+  }
+
+  function looksLikeIccid(value) {
+    const digits = digitsOnly(value);
+    return digits.length >= 18 && digits.startsWith('89');
+  }
+
   function parseImportText(text) {
     const lines = text.split(/\r?\n/).filter(l => l.trim());
     return lines.map(line => {
       const parts = line.split(',').map(s => s.trim());
+      let msisdnRaw = parts[0] ?? '';
+      let iccidRaw = parts[1] ?? '';
+      // Older files were ICCID,MSISDN. A 19-20 digit field starting with 89 is an ICCID.
+      if (looksLikeIccid(msisdnRaw) && !looksLikeIccid(iccidRaw)) {
+        [msisdnRaw, iccidRaw] = [iccidRaw, msisdnRaw];
+      }
       return {
-        iccid: parts[0] ?? '',
-        msisdn: normalizeMsisdn(parts[1] ?? ''),
+        iccid: digitsOnly(iccidRaw),
+        msisdn: normalizeMsisdn(msisdnRaw),
       };
     }).filter(e => e.iccid && e.msisdn);
   }
 
   function updatePreview() {
     importPreview = parseImportText(importText).map(entry => {
-      const matched = sims.find(s => s.sim_id === entry.iccid);
+      const matched = sims.find(s => digitsOnly(s.sim_id) === entry.iccid);
       return {
         ...entry,
         com_port: matched?.com_port ?? '-',
@@ -398,7 +413,7 @@
   function exportNumbers() {
     const numbers = numberedSims
       .filter(s => exportSelected.includes(s.sim_id))
-      .map(s => String(s.phone_number).trim());
+      .map(s => `${String(s.phone_number).trim()},${digitsOnly(s.sim_id)}`);
     if (numbers.length === 0) return;
     let name = exportFileName.trim().replace(/[\\/:*?"<>|]/g, '_') || 'phone_numbers';
     if (!/\.txt$/i.test(name)) name += '.txt';
@@ -587,7 +602,7 @@
             <textarea
               bind:value={importText}
               oninput={updatePreview}
-              placeholder="89441000304692509546,07770065802&#10;89441000304698110844,07770065803"
+              placeholder="7883172203,8944200205596061923&#10;07770065802,89441000304692509546"
               rows="6"
               class="w-full rounded-lg border border-gray-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
             ></textarea>
@@ -599,8 +614,8 @@
                   <table class="min-w-full text-sm">
                     <thead class="bg-gray-50 dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
                       <tr>
-                        <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_iccid')}</th>
                         <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_msisdn')}</th>
+                        <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_iccid')}</th>
                         <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_com')}</th>
                         <th class="px-3 py-2 text-left font-medium">{$t('phone_import_col_status')}</th>
                       </tr>
@@ -608,8 +623,8 @@
                     <tbody class="divide-y divide-gray-200 dark:divide-zinc-800">
                       {#each importPreview as row}
                         <tr class="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
-                          <td class="px-3 py-2 font-mono text-xs">{row.iccid}</td>
                           <td class="px-3 py-2 font-mono text-xs">{row.msisdn}</td>
+                          <td class="px-3 py-2 font-mono text-xs">{row.iccid}</td>
                           <td class="px-3 py-2">{row.com_port}</td>
                           <td class="px-3 py-2">{row.status}</td>
                         </tr>

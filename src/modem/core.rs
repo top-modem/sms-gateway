@@ -2781,7 +2781,7 @@ impl Modem {
     }
 
     /// CME 14 longer than this is a wedged SIM, not a slow one; only a reboot clears it.
-    pub(crate) const SIM_BUSY_STUCK: Duration = Duration::from_secs(60);
+    pub(crate) const SIM_BUSY_STUCK: Duration = Duration::from_secs(45);
 
     async fn read_sim_status(&self) -> io::Result<Option<String>> {
         // CME 14 is normal while a fresh SIM or a rebooting module initialises.

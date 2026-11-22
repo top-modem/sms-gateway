@@ -797,6 +797,13 @@ impl ModemManager {
                 break;
             }
 
+            // Opening the port while a CME 13 recovery reboot re-enumerates USB
+            // fails or catches the dying session.
+            if let Some(left) = Modem::sim_recovery_reboot_pending(&com_port) {
+                tokio::time::sleep(left).await;
+                continue;
+            }
+
             let generation = self.begin_port_probe_cycle(&com_port).await;
 
             // Quick probe: empty ports fail fast. Acquire the shared probe semaphore
@@ -1027,6 +1034,15 @@ impl ModemManager {
                     );
                     let e_raw = e.to_string();
                     let e_text = e_raw.to_ascii_lowercase();
+                    if Modem::is_sim_recovery_reboot(&e_raw) {
+                        self.set_port_module_connected(&com_port, true).await;
+                        if let Some(imei) = Self::extract_imei_from_text(&e_raw) {
+                            self.set_port_last_imei(&com_port, Some(imei)).await;
+                        }
+                        self.mark_port_unavailable(&com_port, None).await;
+                        consecutive_init_failures = 0;
+                        continue;
+                    }
                     let sim_not_ready = e_raw.contains("SIM_NOT_READY")
                         || e_raw.contains("No SIM detected")
                         || e_raw.contains("Failed to read SIM ICCID")
@@ -1675,6 +1691,9 @@ impl ModemManager {
                     last_cpin = Some("<empty>".to_string());
                 }
                 Err(e) => {
+                    if Modem::is_sim_recovery_reboot(&e.to_string()) {
+                        return Err(anyhow::anyhow!("{} imei={:?}", e, last_imei));
+                    }
                     last_cpin = Some(format!("error: {}", e));
                 }
             }
@@ -1695,9 +1714,7 @@ impl ModemManager {
         // Retry quickly here so hot-inserted cards do not wait for the next worker cycle.
         const ICCID_READ_ATTEMPTS: u8 = 8;
         const ICCID_RETRY_DELAY_MS: u64 = 500;
-        const ICCID_MAX_RECOVERIES: u8 = 2;
         let mut pre_sim_id = None;
-        let mut sim_error_recoveries: u8 = 0;
         for attempt in 1..=ICCID_READ_ATTEMPTS {
             match modem.get_sim_iccid().await {
                 Ok(Some(id)) => {
@@ -1713,37 +1730,9 @@ impl ModemManager {
                     return Err(anyhow::anyhow!("No SIM detected"));
                 }
                 Err(e) => {
-                    if Modem::is_recoverable_sim_error(&e)
-                        && sim_error_recoveries < ICCID_MAX_RECOVERIES
-                        && attempt < ICCID_READ_ATTEMPTS
-                        && modem.sim_recovery_allowed().await
-                    {
-                        sim_error_recoveries = sim_error_recoveries.saturating_add(1);
-                        log::warn!(
-                            "[USB_REPLUG_RECOVERY] {} ICCID read failed: {} (recovery {}/{}). Sending AT+CFUN=1,1 and retrying initialization.",
-                            port,
-                            e,
-                            sim_error_recoveries,
-                            ICCID_MAX_RECOVERIES
-                        );
-                        modem.reboot().await;
-
-                        // Give the modem time to come back after CFUN reset.
-                        let mut alive = false;
-                        for _ in 0..10 {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            if modem.probe_alive().await {
-                                alive = true;
-                                break;
-                            }
-                        }
-                        if !alive {
-                            log::warn!(
-                                "[USB_REPLUG_RECOVERY] {} did not respond after ICCID-stage CFUN reset yet; continuing retries.",
-                                port
-                            );
-                        }
-                        continue;
+                    if Modem::is_recoverable_sim_error(&e) && modem.sim_recovery_allowed().await {
+                        let reboot = modem.start_sim_recovery_reboot(&e).await;
+                        return Err(anyhow::anyhow!("{} imei={:?}", reboot, last_imei));
                     }
 
                     if attempt < ICCID_READ_ATTEMPTS {
@@ -2274,6 +2263,17 @@ impl ModemManager {
                     .as_deref()
                     .map(|s| s.trim().eq_ignore_ascii_case("READY"))
                     .unwrap_or(false);
+                if status_error.as_deref().is_some_and(Modem::is_sim_recovery_reboot) {
+                    log::warn!(
+                        "SIM {} on {} hit a SIM failure; AT+CFUN=1,1 sent, re-initialising after the reboot.",
+                        iccid, modem.com_port
+                    );
+                    return ProbeOutcome::ConfirmedAbsent {
+                        iccid,
+                        com_port: modem.com_port.clone(),
+                        modem,
+                    };
+                }
                 if !status_ready {
                     let active_on_other_port = mgr
                         .is_iccid_active_on_other_port(&iccid, &modem.com_port)
@@ -2772,6 +2772,11 @@ impl ModemManager {
                         .insert(com_port.clone());
                     self.sim_unreadable_ports.write().await.insert(com_port.clone());
                     self.sim_swap_confirm_streaks.write().await.remove(&com_port);
+                    if Modem::sim_recovery_reboot_pending(&com_port).is_some() {
+                        self.sim_probe_fail_counts.write().await.remove(&com_port);
+                        demotions.push((iccid, com_port, modem));
+                        continue;
+                    }
                     let in_cooldown = self
                         .sim_probe_cooldown_until
                         .read()

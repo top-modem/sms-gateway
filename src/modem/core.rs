@@ -2492,30 +2492,76 @@ impl Modem {
         Self::cme_code(err).as_deref() == Some("14")
     }
 
-    /// Whether an `AT+CFUN=1,1` SIM recovery may run now. eSIM machines recover with
-    /// `ath0` instead, and a port is rebooted at most once per cooldown so a chip
-    /// with no SIM (e.g. an eSIM without an enabled profile) is not rebooted in a loop.
-    pub(crate) async fn sim_recovery_allowed(&self) -> bool {
-        const COOLDOWN: Duration = Duration::from_secs(600);
-        static LAST_RECOVERY: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, Instant>>,
-        > = std::sync::OnceLock::new();
+    /// Marker carried by the error returned once a CME 13/50 recovery reboot was sent.
+    pub(crate) const SIM_RECOVERY_REBOOT_MARKER: &'static str = "SIM_RECOVERY_REBOOT";
+    /// After AT+CFUN=1,1 the module drops off USB for at least this long.
+    pub(crate) const SIM_RECOVERY_REBOOT_QUIET: Duration = Duration::from_secs(35);
 
+    fn sim_recoveries() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, (Instant, u32)>> {
+        static RECOVERIES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, (Instant, u32)>>,
+        > = std::sync::OnceLock::new();
+        RECOVERIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Back-off between recovery reboots of one port: 2, 4, 8, then every 10 minutes.
+    pub(crate) fn sim_recovery_cooldown(consecutive: u32) -> Duration {
+        const BASE_SECS: u64 = 120;
+        const MAX_SECS: u64 = 600;
+        let factor = 1_u64 << consecutive.saturating_sub(1).min(3);
+        Duration::from_secs((BASE_SECS * factor).min(MAX_SECS))
+    }
+
+    /// True while a recovery reboot sent on this port is still inside its quiet window.
+    pub(crate) fn sim_recovery_reboot_pending(com_port: &str) -> Option<Duration> {
+        let recoveries = Self::sim_recoveries();
+        let (at, _) = recoveries.get(com_port)?;
+        Self::SIM_RECOVERY_REBOOT_QUIET.checked_sub(at.elapsed()).filter(|left| !left.is_zero())
+    }
+
+    pub(crate) fn is_sim_recovery_reboot(err: &str) -> bool {
+        err.contains(Self::SIM_RECOVERY_REBOOT_MARKER)
+    }
+
+    fn clear_sim_recovery_backoff(&self) {
+        Self::sim_recoveries().remove(&self.com_port);
+    }
+
+    /// Whether an `AT+CFUN=1,1` SIM recovery may run now. eSIM machines recover with
+    /// `ath0` instead, and repeat reboots back off so a dead SIM is not rebooted in a
+    /// tight loop. The counter resets once the port reads CPIN READY.
+    pub(crate) async fn sim_recovery_allowed(&self) -> bool {
         if *self.machine_type.read().await == Some(MachineType::Esim) || self.is_esim_mode().await {
             return false;
         }
-        let mut last = LAST_RECOVERY
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut recoveries = Self::sim_recoveries();
         let now = Instant::now();
-        match last.get(&self.com_port) {
-            Some(at) if now.duration_since(*at) < COOLDOWN => false,
-            _ => {
-                last.insert(self.com_port.clone(), now);
+        match recoveries.get(&self.com_port).copied() {
+            Some((at, count)) if now.duration_since(at) < Self::sim_recovery_cooldown(count) => false,
+            previous => {
+                let count = previous.map_or(1, |(_, count)| count.saturating_add(1));
+                recoveries.insert(self.com_port.clone(), (now, count));
                 true
             }
         }
+    }
+
+    /// Send AT+CFUN=1,1 for a CME 13/50 SIM failure and return at once. The caller
+    /// must drop this handle and re-initialise after `SIM_RECOVERY_REBOOT_QUIET`:
+    /// waiting inside a timeout-wrapped SIM query got cancelled before the module was back.
+    pub(crate) async fn start_sim_recovery_reboot(&self, cause: &io::Error) -> io::Error {
+        warn!(
+            "[CPIN恢复] 端口 {} (设备 {}) 检测到可恢复错误 {}，发送 AT+CFUN=1,1；{} 秒后重新初始化",
+            self.com_port,
+            self.name,
+            cause,
+            Self::SIM_RECOVERY_REBOOT_QUIET.as_secs()
+        );
+        self.reboot().await;
+        io::Error::other(format!("{}: {} ({})", Self::SIM_RECOVERY_REBOOT_MARKER, self.com_port, cause))
     }
 
     pub async fn send_sms_text(
@@ -2706,6 +2752,7 @@ impl Modem {
         let result = self.read_sim_status().await;
         if result.as_ref().is_ok_and(|status| status.as_deref().is_some_and(|value| value.trim().eq_ignore_ascii_case("READY"))) {
             self.sim_absence_suspected.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.clear_sim_recovery_backoff();
         }
         result
     }
@@ -2721,10 +2768,6 @@ impl Modem {
     }
 
     async fn read_sim_status(&self) -> io::Result<Option<String>> {
-        // After AT+CFUN=1,1 the module is silent for at least ~35s (same as 重启端口).
-        const REBOOT_QUIET_SECS: u64 = 35;
-        const CPIN_RECOVERY_RETRY_ATTEMPTS: u8 = 15;
-        const CPIN_RECOVERY_RETRY_DELAY_SECS: u64 = 2;
         // CME 14 is normal while a fresh SIM or a rebooting module initialises.
         const SIM_BUSY_RETRIES: u8 = 15;
         const SIM_BUSY_DELAY_SECS: u64 = 2;
@@ -2762,57 +2805,17 @@ impl Modem {
             self.sim_absence_suspected.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
-        if !Self::is_recoverable_sim_error(&first_err) || !self.sim_recovery_allowed().await {
+        if !Self::is_recoverable_sim_error(&first_err) {
             return Err(first_err);
         }
-
-        warn!(
-            "[CPIN恢复] 端口 {} (设备 {}) 检测到可恢复错误 {}，触发 AT+CFUN=1,1 重启恢复",
-            self.com_port,
-            self.name,
-            first_err
-        );
-        info!(
-            "[CPIN恢复] 端口 {} 正在发送恢复命令 AT+CFUN=1,1；模块至少 {} 秒内不会应答",
-            self.com_port, REBOOT_QUIET_SECS
-        );
-        self.reboot().await;
-        tokio::time::sleep(Duration::from_secs(REBOOT_QUIET_SECS)).await;
-
-        let mut last_err = first_err;
-        for attempt in 1..=CPIN_RECOVERY_RETRY_ATTEMPTS {
-            match self.query_cpin().await {
-                Ok(status) => {
-                    info!(
-                        "[CPIN恢复] 端口 {} AT+CPIN? 已恢复成功（安静 {} 秒后第 {}/{} 次）",
-                        self.com_port, REBOOT_QUIET_SECS, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS
-                    );
-                    return Ok(status);
-                }
-                Err(e) if Self::is_sim_busy_error(&e) || Self::is_recoverable_sim_error(&e) => {
-                    info!(
-                        "[CPIN恢复] 端口 {} 第 {}/{} 次仍在启动 ({})，{} 秒后再试",
-                        self.com_port, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS, e, CPIN_RECOVERY_RETRY_DELAY_SECS
-                    );
-                    last_err = e;
-                    tokio::time::sleep(Duration::from_secs(CPIN_RECOVERY_RETRY_DELAY_SECS)).await;
-                }
-                Err(e) => {
-                    warn!(
-                        "[CPIN恢复] 端口 {} 第 {}/{} 次 AT+CPIN? 重试失败: {}",
-                        self.com_port, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS, e
-                    );
-                    last_err = e;
-                    tokio::time::sleep(Duration::from_secs(CPIN_RECOVERY_RETRY_DELAY_SECS)).await;
-                }
-            }
+        if !self.sim_recovery_allowed().await {
+            info!(
+                "[CPIN恢复] 端口 {} 仍为 {}，恢复重启处于退避期，稍后再发 AT+CFUN=1,1",
+                self.com_port, first_err
+            );
+            return Err(first_err);
         }
-
-        warn!(
-            "[CPIN恢复] 端口 {} 安静 {} 秒并重试 {} 次后仍未恢复 AT+CPIN?，返回: {}",
-            self.com_port, REBOOT_QUIET_SECS, CPIN_RECOVERY_RETRY_ATTEMPTS, last_err
-        );
-        Err(last_err)
+        Err(self.start_sim_recovery_reboot(&first_err).await)
     }
 
     pub async fn get_memory_status(&self) -> io::Result<Option<String>> {
@@ -4509,6 +4512,19 @@ mod tests {
         for response in ["+CME ERROR: 13", "+CME ERROR:50", "+CME: ERROR 50", "+cme error 13", "Command failed: \\r\\n+CME ERROR: 50\\r\\n"] {
             assert!(Modem::is_recoverable_sim_error(&std::io::Error::other(response)), "{}", response);
         }
+    }
+
+    #[test]
+    fn sim_recovery_reboot_backs_off_and_is_detectable() {
+        use std::time::Duration;
+        assert_eq!(Modem::sim_recovery_cooldown(1), Duration::from_secs(120));
+        assert_eq!(Modem::sim_recovery_cooldown(2), Duration::from_secs(240));
+        assert_eq!(Modem::sim_recovery_cooldown(3), Duration::from_secs(480));
+        assert_eq!(Modem::sim_recovery_cooldown(9), Duration::from_secs(600));
+        assert!(Modem::sim_recovery_cooldown(1) > Modem::SIM_RECOVERY_REBOOT_QUIET);
+        assert!(Modem::is_sim_recovery_reboot("SIM_RECOVERY_REBOOT: COM18 (Command failed: +CME ERROR: 13)"));
+        assert!(!Modem::is_sim_recovery_reboot("Command failed: +CME ERROR: 13"));
+        assert!(Modem::sim_recovery_reboot_pending("COM_NEVER_REBOOTED").is_none());
     }
 
     #[test]

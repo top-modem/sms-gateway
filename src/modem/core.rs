@@ -2767,39 +2767,75 @@ impl Modem {
         .await
     }
 
+    /// How long this port has answered CPIN with nothing but CME 14. Kept per
+    /// COM port, not per handle, because each init attempt opens a new handle.
+    fn sim_busy_streak(com_port: &str, busy: bool) -> Duration {
+        static SINCE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+            std::sync::OnceLock::new();
+        let mut since = SINCE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if !busy {
+            since.remove(com_port);
+            return Duration::ZERO;
+        }
+        since.entry(com_port.to_string()).or_insert_with(Instant::now).elapsed()
+    }
+
+    /// CME 14 longer than this is a wedged SIM, not a slow one; only a reboot clears it.
+    pub(crate) const SIM_BUSY_STUCK: Duration = Duration::from_secs(60);
+
     async fn read_sim_status(&self) -> io::Result<Option<String>> {
         // CME 14 is normal while a fresh SIM or a rebooting module initialises.
-        const SIM_BUSY_RETRIES: u8 = 15;
+        // The retry budget must fit inside the 20s init timeout, otherwise the
+        // caller is cancelled before it can act on a SIM that stays busy.
+        const SIM_BUSY_RETRIES: u8 = 6;
         const SIM_BUSY_DELAY_SECS: u64 = 2;
 
         let mut first_err = match self.query_cpin().await {
-            Ok(status) => return Ok(status),
+            Ok(status) => {
+                Self::sim_busy_streak(&self.com_port, false);
+                return Ok(status);
+            }
             Err(e) => e,
         };
 
+        let mut busy_for = Duration::ZERO;
         for attempt in 1..=SIM_BUSY_RETRIES {
             if !Self::is_sim_busy_error(&first_err) {
                 break;
             }
+            busy_for = Self::sim_busy_streak(&self.com_port, true);
+            if busy_for >= Self::SIM_BUSY_STUCK {
+                break;
+            }
             info!(
-                "[CPIN] {} SIM busy (+CME ERROR: 14), retry {}/{} in {}s",
-                self.com_port, attempt, SIM_BUSY_RETRIES, SIM_BUSY_DELAY_SECS
+                "[CPIN] {} SIM busy (+CME ERROR: 14) for {}s, retry {}/{} in {}s",
+                self.com_port, busy_for.as_secs(), attempt, SIM_BUSY_RETRIES, SIM_BUSY_DELAY_SECS
             );
             tokio::time::sleep(Duration::from_secs(SIM_BUSY_DELAY_SECS)).await;
             match self.query_cpin().await {
-                Ok(status) => return Ok(status),
+                Ok(status) => {
+                    Self::sim_busy_streak(&self.com_port, false);
+                    return Ok(status);
+                }
                 Err(e) => first_err = e,
             }
         }
         if Self::is_sim_busy_error(&first_err) {
-            warn!(
-                "[CPIN] {} SIM still busy after {} retries ({}s)",
-                self.com_port,
-                SIM_BUSY_RETRIES,
-                SIM_BUSY_RETRIES as u64 * SIM_BUSY_DELAY_SECS
-            );
-            return Err(first_err);
+            busy_for = busy_for.max(Self::sim_busy_streak(&self.com_port, true));
+            if busy_for < Self::SIM_BUSY_STUCK {
+                return Err(first_err);
+            }
+            if !self.sim_recovery_allowed().await {
+                info!(
+                    "[CPIN恢复] 端口 {} +CME ERROR: 14 已持续 {} 秒，恢复重启处于退避期",
+                    self.com_port, busy_for.as_secs()
+                );
+                return Err(first_err);
+            }
+            Self::sim_busy_streak(&self.com_port, false);
+            return Err(self.start_sim_recovery_reboot(&first_err).await);
         }
+        Self::sim_busy_streak(&self.com_port, false);
         // Only "not inserted" blanks the dashboard. CME 13/50 keep the last SIM identity.
         if matches!(Self::cme_code(&first_err).as_deref(), Some("10")) {
             self.sim_absence_suspected.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4525,6 +4561,18 @@ mod tests {
         assert!(Modem::is_sim_recovery_reboot("SIM_RECOVERY_REBOOT: COM18 (Command failed: +CME ERROR: 13)"));
         assert!(!Modem::is_sim_recovery_reboot("Command failed: +CME ERROR: 13"));
         assert!(Modem::sim_recovery_reboot_pending("COM_NEVER_REBOOTED").is_none());
+    }
+
+    #[test]
+    fn sim_busy_streak_spans_handles_and_resets_on_other_answers() {
+        use std::time::Duration;
+        let port = "COM_BUSY_STREAK_TEST";
+        assert!(Modem::sim_busy_streak(port, true) < Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(Modem::sim_busy_streak(port, true) >= Duration::from_millis(20));
+        assert_eq!(Modem::sim_busy_streak(port, false), Duration::ZERO);
+        assert!(Modem::sim_busy_streak(port, true) < Duration::from_millis(20));
+        assert!(Modem::SIM_BUSY_STUCK > Duration::from_secs(12));
     }
 
     #[test]

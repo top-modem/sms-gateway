@@ -667,9 +667,13 @@
                 <td class="px-3 py-2.5 whitespace-nowrap">
                   <div class="flex items-center gap-2">
                     <span class="font-mono text-gray-700 dark:text-gray-200">
-                      {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
+                      {#if hasSim && info.available !== false}
+                        {normalizePhoneForDisplay(card.phone_number ?? info.phone_number) || '—'}
+                      {:else}
+                        —
+                      {/if}
                     </span>
-                    {#if hasSim}
+                    {#if hasSim && info.available !== false}
                       <button
                         onclick={(e) => { e.stopPropagation(); onNavigateSetPhone(info.sim_id); }}
                         class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium

@@ -177,8 +177,6 @@ pub struct Modem {
     /// was seen in storage. Its fragments are kept until all parts arrive or
     /// `INCOMPLETE_MULTIPART_TIMEOUT` passes.
     incomplete_multipart_seen: std::sync::Mutex<std::collections::HashMap<(String, u16, u8), Instant>>,
-    /// Storage selected by `AT+CPMS`. A read is not sent until this selection succeeds.
-    sms_storage: std::sync::Mutex<Option<SmsStorage>>,
 }
 
 /// How long to wait for the missing parts of a multipart SMS before storing
@@ -297,7 +295,6 @@ impl Modem {
             esim_mode: RwLock::new(false),
             pending_commands,
             incomplete_multipart_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
-            sms_storage: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1053,7 +1050,15 @@ impl Modem {
             }
         }
 
-        *self.sms_storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = sms_storage;
+        if let Some(storage) = sms_storage {
+            if let Err(e) = self.configure_sms_storage(storage).await {
+                log::warn!(
+                    "Failed to configure SMS storage for device {} (no SIM inserted?): {}",
+                    self.name,
+                    e
+                );
+            }
+        }
 
         if let Err(e) = self.init_sim_info().await {
             log::warn!(
@@ -1063,52 +1068,7 @@ impl Modem {
             );
         }
 
-        if sms_storage.is_some() {
-            if let Err(e) = self.select_sms_storage().await {
-                log::warn!(
-                    "Failed to configure SMS storage for device {} after the SIM answered: {}",
-                    self.name,
-                    e
-                );
-            }
-        }
-
         Ok(())
-    }
-
-    /// `+CMS ERROR: 314` means the SIM is busy. `+CMS ERROR: 350` is an outgoing-SMS
-    /// rejection; a list command only receives it when SMS storage was not selected.
-    fn sms_service_not_ready(error: &std::io::Error) -> bool {
-        let text = error.to_string();
-        text.contains("CMS ERROR: 314")
-            || text.contains("CMS ERROR:314")
-            || text.contains("CMS ERROR: 350")
-            || text.contains("CMS ERROR:350")
-    }
-
-    /// Select the configured SMS storage, retrying while the SIM is busy.
-    async fn select_sms_storage(&self) -> io::Result<()> {
-        let Some(storage) = *self.sms_storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) else {
-            return Ok(());
-        };
-        let mut last_error = None;
-        for attempt in 1..=5 {
-            match self.configure_sms_storage(storage).await {
-                Ok(()) => return Ok(()),
-                Err(error) if Self::sms_service_not_ready(&error) && attempt < 5 => {
-                    log::warn!(
-                        "[{}] SMS storage is not ready ({}); retry {}/5",
-                        self.com_port,
-                        error,
-                        attempt
-                    );
-                    last_error = Some(error);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| io::Error::other("SMS storage was not selected")))
     }
 
     async fn configure_sms_storage(&self, storage: SmsStorage) -> io::Result<()> {
@@ -2152,20 +2112,7 @@ impl Modem {
     /// complete them, and SMS arriving after this listing are not wiped unread.
     pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<(Vec<ModemSMS>, Vec<u32>)> {
         let command = format!("AT+CMGL={}\r\n", sms_type.to_at_command_pdu());
-        let response = match self.send_command_with_ok(&command).await {
-            Ok(response) => response,
-            Err(error) if Self::sms_service_not_ready(&error) => {
-                log::warn!(
-                    "[{}] AT+CMGL was rejected ({}); selecting SMS storage before reading again",
-                    self.com_port,
-                    error
-                );
-                let _ = self.send_command_with_ok("AT+CMGF=0\r\n").await;
-                self.select_sms_storage().await?;
-                self.send_command_with_ok(&command).await?
-            }
-            Err(error) => return Err(error),
-        };
+        let response = self.send_command_with_ok(&command).await?;
 
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
         let trimmed = response.trim();
@@ -4449,19 +4396,6 @@ mod tests {
         for response in ["+CME ERROR: 13", "+CME ERROR: 140", "+CMS ERROR: 14", "timeout"] {
             assert!(!Modem::is_sim_busy_error(&std::io::Error::other(response)), "{}", response);
         }
-    }
-
-    #[test]
-    fn a_list_is_retried_when_storage_was_not_selected() {
-        assert!(Modem::sms_service_not_ready(&std::io::Error::other(
-            "Command failed: \\r\\n+CMS ERROR: 314\\r\\n"
-        )));
-        assert!(Modem::sms_service_not_ready(&std::io::Error::other(
-            "Command failed: \\r\\n+CMS ERROR: 350\\r\\n"
-        )));
-        assert!(!Modem::sms_service_not_ready(&std::io::Error::other(
-            "Command failed: \\r\\n+CMS ERROR: 322\\r\\n"
-        )));
     }
 
     #[test]

@@ -1161,18 +1161,38 @@ impl SimCard {
         imsi: Option<String>,
         phone_number: Option<String>,
     ) -> Result<Self> {
-        let existing = Self::find_by_conditions(Some(id), None, None, None).await?;
+        let id = crate::esim::normalize_iccid(id);
+        let existing = Self::find_by_conditions(Some(&id), None, None, None).await?;
 
         if !existing.is_empty() {
-            Self::backfill_identity_in_pool(get_pool()?, id, imsi.as_deref(), phone_number.as_deref()).await?;
-            return Self::find_by_conditions(Some(id), None, None, None).await?
+            Self::backfill_identity_in_pool(get_pool()?, &id, imsi.as_deref(), phone_number.as_deref()).await?;
+            return Self::find_by_conditions(Some(&id), None, None, None).await?
                 .into_iter().next().ok_or_else(|| anyhow::anyhow!("SIM card disappeared during identity refresh"));
+        }
+
+        // Older builds stored the modem's trailing F padding in the primary key.
+        let padded = format!("{}F", id);
+        if let Some(_old) = Self::find_by_conditions(Some(&padded), None, None, None).await?.into_iter().next() {
+            let pool = get_pool()?;
+            sqlx::query("UPDATE sms SET sim_id = ? WHERE sim_id = ?")
+                .bind(&id)
+                .bind(&padded)
+                .execute(pool)
+                .await?;
+            sqlx::query("UPDATE sim_cards SET id = ? WHERE id = ?")
+                .bind(&id)
+                .bind(&padded)
+                .execute(pool)
+                .await?;
+            Self::backfill_identity_in_pool(pool, &id, imsi.as_deref(), phone_number.as_deref()).await?;
+            return Self::find_by_conditions(Some(&id), None, None, None).await?
+                .into_iter().next().ok_or_else(|| anyhow::anyhow!("SIM card disappeared while removing ICCID padding"));
         }
 
         // Only create new SIM card with baseband phone_number on first initialization
         let now = chrono::Utc::now().naive_utc();
         let sim_card = SimCard {
-            id: id.to_string(),
+            id: id.clone(),
             imsi,
             phone_number_source: phone_number.as_deref().filter(|phone| !phone.is_empty()).map(|_| "sim_read".to_string()),
             phone_number,
@@ -1185,7 +1205,7 @@ impl SimCard {
         sim_card.insert().await?;
         if sim_card.phone_number.as_deref().is_some_and(|phone| !phone.is_empty()) {
             sqlx::query("UPDATE sim_cards SET phone_number_source = COALESCE(phone_number_source, 'sim_read') WHERE id = ?")
-                .bind(id).execute(get_pool()?).await?;
+                .bind(&id).execute(get_pool()?).await?;
         }
         Ok(sim_card)
     }

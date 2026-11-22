@@ -177,6 +177,8 @@ pub struct Modem {
     /// was seen in storage. Its fragments are kept until all parts arrive or
     /// `INCOMPLETE_MULTIPART_TIMEOUT` passes.
     incomplete_multipart_seen: std::sync::Mutex<std::collections::HashMap<(String, u16, u8), Instant>>,
+    /// Storage selected by `AT+CPMS`. A list is retried after this selection succeeds.
+    sms_storage: std::sync::Mutex<Option<SmsStorage>>,
 }
 
 /// How long to wait for the missing parts of a multipart SMS before storing
@@ -295,6 +297,7 @@ impl Modem {
             esim_mode: RwLock::new(false),
             pending_commands,
             incomplete_multipart_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sms_storage: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1050,15 +1053,7 @@ impl Modem {
             }
         }
 
-        if let Some(storage) = sms_storage {
-            if let Err(e) = self.configure_sms_storage(storage).await {
-                log::warn!(
-                    "Failed to configure SMS storage for device {} (no SIM inserted?): {}",
-                    self.name,
-                    e
-                );
-            }
-        }
+        *self.sms_storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = sms_storage;
 
         if let Err(e) = self.init_sim_info().await {
             log::warn!(
@@ -1068,7 +1063,53 @@ impl Modem {
             );
         }
 
+        // Select storage only after the SIM has answered. Selecting earlier returns
+        // +CMS ERROR: 314 (SIM busy); a following AT+CMGL then fails with +CMS ERROR: 350.
+        if sms_storage.is_some() {
+            if let Err(e) = self.select_sms_storage().await {
+                log::warn!(
+                    "Failed to configure SMS storage for device {} after the SIM answered: {}",
+                    self.name,
+                    e
+                );
+            }
+        }
+
         Ok(())
+    }
+
+    /// SIM SMS storage is not ready yet (314) or a list was rejected because storage
+    /// was never selected (modem answers with the send-side code 350).
+    fn sms_service_not_ready(error: &std::io::Error) -> bool {
+        let text = error.to_string();
+        text.contains("CMS ERROR: 314")
+            || text.contains("CMS ERROR:314")
+            || text.contains("CMS ERROR: 350")
+            || text.contains("CMS ERROR:350")
+    }
+
+    async fn select_sms_storage(&self) -> io::Result<()> {
+        let Some(storage) = *self.sms_storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) else {
+            return Ok(());
+        };
+        let mut last_error = None;
+        for attempt in 1..=5 {
+            match self.configure_sms_storage(storage).await {
+                Ok(()) => return Ok(()),
+                Err(error) if Self::sms_service_not_ready(&error) && attempt < 5 => {
+                    log::warn!(
+                        "[{}] SMS storage is not ready ({}); retry {}/5",
+                        self.com_port,
+                        error,
+                        attempt
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("SMS storage was not selected")))
     }
 
     async fn configure_sms_storage(&self, storage: SmsStorage) -> io::Result<()> {
@@ -2112,7 +2153,20 @@ impl Modem {
     /// complete them, and SMS arriving after this listing are not wiped unread.
     pub async fn read_sms(&self, sms_type: SmsType) -> io::Result<(Vec<ModemSMS>, Vec<u32>)> {
         let command = format!("AT+CMGL={}\r\n", sms_type.to_at_command_pdu());
-        let response = self.send_command_with_ok(&command).await?;
+        let response = match self.send_command_with_ok(&command).await {
+            Ok(response) => response,
+            Err(error) if Self::sms_service_not_ready(&error) => {
+                log::warn!(
+                    "[{}] AT+CMGL was rejected ({}); selecting SMS storage before reading again",
+                    self.com_port,
+                    error
+                );
+                let _ = self.send_command_with_ok("AT+CMGF=0\r\n").await;
+                self.select_sms_storage().await?;
+                self.send_command_with_ok(&command).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         let sim_id = self.sim_id.read().await.clone().unwrap_or_default();
         let trimmed = response.trim();
@@ -2309,15 +2363,18 @@ impl Modem {
                             && line.trim().chars().all(|c| c.is_ascii_hexdigit()))
                 })
                 .map(|line| {
-                    if line.contains("CCID:") {
+                    let raw = if line.contains("CCID:") {
                         line.split("CCID:")
                             .nth(1)
                             .map(|s| s.trim().to_string())
                             .unwrap_or_else(|| line.trim().to_string())
                     } else {
                         line.trim().to_string()
-                    }
+                    };
+                    // AT+CCID pads an odd last nibble with F. That is not part of the ICCID.
+                    crate::esim::normalize_iccid(&raw)
                 })
+                .filter(|id| !id.is_empty())
     }
 
     pub async fn get_sim_imsi(&self) -> io::Result<Option<String>> {
@@ -2629,50 +2686,55 @@ impl Modem {
         result
     }
 
+    async fn query_cpin(&self) -> io::Result<Option<String>> {
+        self.get_modem_info("AT+CPIN?\r\n", |response| {
+            response
+                .lines()
+                .find(|line| line.starts_with("+CPIN:"))
+                .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
+        })
+        .await
+    }
+
     async fn read_sim_status(&self) -> io::Result<Option<String>> {
-        const CPIN_RECOVERY_RETRY_ATTEMPTS: u8 = 3;
-        const CPIN_RECOVERY_RETRY_DELAY_SECS: u64 = 3;
+        // After AT+CFUN=1,1 the module is silent for at least ~35s (same as 重启端口).
+        const REBOOT_QUIET_SECS: u64 = 35;
+        const CPIN_RECOVERY_RETRY_ATTEMPTS: u8 = 15;
+        const CPIN_RECOVERY_RETRY_DELAY_SECS: u64 = 2;
+        // CME 14 is normal while a fresh SIM or a rebooting module initialises.
+        const SIM_BUSY_RETRIES: u8 = 15;
+        const SIM_BUSY_DELAY_SECS: u64 = 2;
 
-        let first_try = self
-            .get_modem_info("AT+CPIN?\r\n", |response| {
-                response
-                    .lines()
-                    .find(|line| line.starts_with("+CPIN:"))
-                    .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
-            })
-            .await;
-
-        let mut first_err = match first_try {
+        let mut first_err = match self.query_cpin().await {
             Ok(status) => return Ok(status),
             Err(e) => e,
         };
 
-        const SIM_BUSY_RETRIES: u8 = 5;
         for attempt in 1..=SIM_BUSY_RETRIES {
             if !Self::is_sim_busy_error(&first_err) {
                 break;
             }
-            info!("[CPIN] {} SIM busy (+CME ERROR: 14), retry {}/{} in 1s", self.com_port, attempt, SIM_BUSY_RETRIES);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            match self
-                .get_modem_info("AT+CPIN?\r\n", |response| {
-                    response
-                        .lines()
-                        .find(|line| line.starts_with("+CPIN:"))
-                        .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
-                })
-                .await
-            {
+            info!(
+                "[CPIN] {} SIM busy (+CME ERROR: 14), retry {}/{} in {}s",
+                self.com_port, attempt, SIM_BUSY_RETRIES, SIM_BUSY_DELAY_SECS
+            );
+            tokio::time::sleep(Duration::from_secs(SIM_BUSY_DELAY_SECS)).await;
+            match self.query_cpin().await {
                 Ok(status) => return Ok(status),
                 Err(e) => first_err = e,
             }
         }
         if Self::is_sim_busy_error(&first_err) {
-            warn!("[CPIN] {} SIM still busy after {} retries", self.com_port, SIM_BUSY_RETRIES);
+            warn!(
+                "[CPIN] {} SIM still busy after {} retries ({}s)",
+                self.com_port,
+                SIM_BUSY_RETRIES,
+                SIM_BUSY_RETRIES as u64 * SIM_BUSY_DELAY_SECS
+            );
             return Err(first_err);
         }
-        if matches!(Self::cme_code(&first_err).as_deref(), Some("10" | "13" | "50")) {
-            // Set before the slow restart recovery; callers often time out and drop this future.
+        // Only "not inserted" blanks the dashboard. CME 13/50 keep the last SIM identity.
+        if matches!(Self::cme_code(&first_err).as_deref(), Some("10")) {
             self.sim_absence_suspected.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -2687,59 +2749,45 @@ impl Modem {
             first_err
         );
         info!(
-            "[CPIN恢复] 端口 {} 正在发送恢复命令 AT+CFUN=1,1",
-            self.com_port
+            "[CPIN恢复] 端口 {} 正在发送恢复命令 AT+CFUN=1,1；模块至少 {} 秒内不会应答",
+            self.com_port, REBOOT_QUIET_SECS
         );
         self.reboot().await;
+        tokio::time::sleep(Duration::from_secs(REBOOT_QUIET_SECS)).await;
 
         let mut last_err = first_err;
         for attempt in 1..=CPIN_RECOVERY_RETRY_ATTEMPTS {
-            info!(
-                "[CPIN恢复] 端口 {} 等待 {} 秒后进行第 {}/{} 次 AT+CPIN? 重试",
-                self.com_port,
-                CPIN_RECOVERY_RETRY_DELAY_SECS,
-                attempt,
-                CPIN_RECOVERY_RETRY_ATTEMPTS
-            );
-            tokio::time::sleep(Duration::from_secs(CPIN_RECOVERY_RETRY_DELAY_SECS)).await;
-
-            match self
-                .get_modem_info("AT+CPIN?\r\n", |response| {
-                    response
-                        .lines()
-                        .find(|line| line.starts_with("+CPIN:"))
-                        .and_then(|line| line.split(':').nth(1).map(|s| s.trim().to_string()))
-                })
-                .await
-            {
+            match self.query_cpin().await {
                 Ok(status) => {
                     info!(
-                        "[CPIN恢复] 端口 {} AT+CPIN? 已恢复成功（第 {}/{} 次重试）",
-                        self.com_port, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS
+                        "[CPIN恢复] 端口 {} AT+CPIN? 已恢复成功（安静 {} 秒后第 {}/{} 次）",
+                        self.com_port, REBOOT_QUIET_SECS, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS
                     );
                     return Ok(status);
+                }
+                Err(e) if Self::is_sim_busy_error(&e) || Self::is_recoverable_sim_error(&e) => {
+                    info!(
+                        "[CPIN恢复] 端口 {} 第 {}/{} 次仍在启动 ({})，{} 秒后再试",
+                        self.com_port, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS, e, CPIN_RECOVERY_RETRY_DELAY_SECS
+                    );
+                    last_err = e;
+                    tokio::time::sleep(Duration::from_secs(CPIN_RECOVERY_RETRY_DELAY_SECS)).await;
                 }
                 Err(e) => {
                     warn!(
                         "[CPIN恢复] 端口 {} 第 {}/{} 次 AT+CPIN? 重试失败: {}",
-                        self.com_port,
-                        attempt,
-                        CPIN_RECOVERY_RETRY_ATTEMPTS,
-                        e
+                        self.com_port, attempt, CPIN_RECOVERY_RETRY_ATTEMPTS, e
                     );
                     last_err = e;
+                    tokio::time::sleep(Duration::from_secs(CPIN_RECOVERY_RETRY_DELAY_SECS)).await;
                 }
             }
         }
 
         warn!(
-            "[CPIN恢复] 端口 {} 已完成 {}/{} 次重试，仍未恢复 AT+CPIN?，返回最后错误: {}",
-            self.com_port,
-            CPIN_RECOVERY_RETRY_ATTEMPTS,
-            CPIN_RECOVERY_RETRY_ATTEMPTS,
-            last_err
+            "[CPIN恢复] 端口 {} 安静 {} 秒并重试 {} 次后仍未恢复 AT+CPIN?，返回: {}",
+            self.com_port, REBOOT_QUIET_SECS, CPIN_RECOVERY_RETRY_ATTEMPTS, last_err
         );
-
         Err(last_err)
     }
 
@@ -4396,6 +4444,31 @@ mod tests {
         for response in ["+CME ERROR: 13", "+CME ERROR: 140", "+CMS ERROR: 14", "timeout"] {
             assert!(!Modem::is_sim_busy_error(&std::io::Error::other(response)), "{}", response);
         }
+    }
+
+    #[test]
+    fn a_list_is_retried_when_storage_was_not_selected() {
+        assert!(Modem::sms_service_not_ready(&std::io::Error::other(
+            "Command failed: \\r\\n+CMS ERROR: 314\\r\\n"
+        )));
+        assert!(Modem::sms_service_not_ready(&std::io::Error::other(
+            "Command failed: \\r\\n+CMS ERROR: 350\\r\\n"
+        )));
+        assert!(!Modem::sms_service_not_ready(&std::io::Error::other(
+            "Command failed: \\r\\n+CMS ERROR: 322\\r\\n"
+        )));
+    }
+
+    #[test]
+    fn iccid_drops_the_modem_padding_nibble() {
+        assert_eq!(
+            Modem::parse_iccid("+CCID: 8944200205596061923F\r\nOK\r\n").as_deref(),
+            Some("8944200205596061923")
+        );
+        assert_eq!(
+            Modem::parse_iccid("+CCID: 8944200205596061923\r\nOK\r\n").as_deref(),
+            Some("8944200205596061923")
+        );
     }
 
     #[test]

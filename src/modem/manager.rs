@@ -295,15 +295,16 @@ mod msim_slot_tests {
 
     #[test]
     fn sim_absent_errors_are_classified_as_explicit_absence() {
+        // CME 10 = not inserted. CME 13 = SIM failure: recoverable, not absence.
         for error in [
             "Command failed: \r\n+CME ERROR: 10\r\n",
-            "Command failed: \r\n+CME ERROR: 13\r\n",
             "+CME ERROR: SIM not inserted",
-            "+CME ERROR: SIM failure",
         ] {
             assert!(ModemManager::is_sim_absent_error(error), "{error:?}");
         }
         for error in [
+            "Command failed: \r\n+CME ERROR: 13\r\n",
+            "+CME ERROR: SIM failure",
             "Command failed: \r\n+CME ERROR: 14\r\n",
             "Command failed: \r\n+CME ERROR: 3\r\n",
             "Command failed: \r\n+CME ERROR: 100\r\n",
@@ -553,7 +554,9 @@ impl ModemManager {
     /// consecutive samples, so a single glitch does not drop the port.
     fn is_sim_absent_error(error: &str) -> bool {
         let lower = error.to_ascii_lowercase();
-        if lower.contains("sim not inserted") || lower.contains("sim failure") {
+        // CME 10 / "not inserted" only. CME 13 is SIM failure: the module still
+        // has a SIM and must be recovered with AT+CFUN=1,1, not demoted as removed.
+        if lower.contains("sim not inserted") {
             return true;
         }
         lower
@@ -565,7 +568,7 @@ impl ModemManager {
                     .take_while(|c| c.is_ascii_digit())
                     .collect::<String>()
             })
-            .is_some_and(|code| code == "10" || code == "13")
+            .is_some_and(|code| code == "10")
     }
 
     async fn set_last_known_sim_port(&self, com_port: &str, sim_id: &str) {

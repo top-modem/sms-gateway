@@ -157,6 +157,16 @@ mod recovery_capacity_tests {
         assert!(ModemManager::module_back_after_reset(40, 2));
     }
 
+    #[test]
+    fn post_reset_liveness_accepts_at_ok_and_cme_error() {
+        // After CFUN reboot the UART answers AT while CPIN is still CME ERROR.
+        assert!(Modem::modem_answered_at("\r\nOK\r\n"));
+        assert!(Modem::modem_answered_at("\r\n+CME ERROR: 13\r\n"));
+        assert!(Modem::modem_answered_at("\r\n+CME ERROR: 14\r\n"));
+        assert!(!Modem::modem_answered_at(""));
+        assert!(!Modem::modem_answered_at("noise only"));
+    }
+
     #[tokio::test]
     async fn voice_otp_tools_are_ready_before_modem_discovery() {
         let path = std::env::temp_dir().join(format!("voice-tools-{}", uuid::Uuid::new_v4()));
@@ -3284,13 +3294,26 @@ impl ModemManager {
                 break;
             }
             if elapsed >= RECOVERY_TIMEOUT.as_secs() {
-                self.set_restart_status(&port, "no_response", format!("Module did not respond within {}s", RECOVERY_TIMEOUT.as_secs())).await;
+                // Hand off to the unavailable worker, then drop the sticky
+                // RECONNECTING flag. Leaving it set after no_response made the
+                // dashboard look dead forever even when an external AT tool
+                // could talk to the COM port normally.
+                self.set_restart_status(
+                    &port,
+                    "no_response",
+                    format!("Module did not respond within {}s; queued for background recovery", RECOVERY_TIMEOUT.as_secs()),
+                )
+                .await;
                 let _ = self.clone().restart_port(&port, sse_manager, transcribe_cfg).await;
+                self.manual_restarting_ports.write().await.remove(&port);
                 return;
             }
             let port_lock = self.port_open_lock(&port).await;
             let _guard = port_lock.lock().await;
-            let answering = Modem::quick_probe_port(&port, device.baud_rate).await;
+            // Plain AT, not AT+CPIN?: after CFUN reboot the UART answers while
+            // CPIN still returns CME 10/13/14 (ERROR, no OK) — that used to look
+            // like "module never came back" even though serial tools worked.
+            let answering = Modem::quick_probe_alive(&port, device.baud_rate).await;
             drop(_guard);
             if answering {
                 consecutive_answers = consecutive_answers.saturating_add(1);
@@ -3321,6 +3344,7 @@ impl ModemManager {
                     ("no_response", format!("Module did not respond within {}s", RECOVERY_TIMEOUT.as_secs()))
                 };
                 self.set_restart_status(&port, state, message).await;
+                self.manual_restarting_ports.write().await.remove(&port);
                 return;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3336,6 +3360,7 @@ impl ModemManager {
             Ok(Some(status)) if status.trim().eq_ignore_ascii_case("READY") => {}
             other => {
                 self.set_restart_status(&port, "no_sim", format!("SIM not ready: {:?}, IMEI {:?}", other, imei)).await;
+                self.manual_restarting_ports.write().await.remove(&port);
                 return;
             }
         }
@@ -3347,11 +3372,13 @@ impl ModemManager {
                 let roaming = code.as_deref() == Some("5");
                 self.set_restart_status(&port, "ok", format!("SIM READY, IMEI {}, network registered{}",
                     imei.as_deref().unwrap_or("-"), if roaming { " (roaming)" } else { "" })).await;
+                self.manual_restarting_ports.write().await.remove(&port);
                 return;
             }
             if network_started.elapsed() > NETWORK_TIMEOUT {
                 self.set_restart_status(&port, "no_network", format!("SIM READY, IMEI {}, but not registered (stat {:?})",
                     imei.as_deref().unwrap_or("-"), code)).await;
+                self.manual_restarting_ports.write().await.remove(&port);
                 return;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;

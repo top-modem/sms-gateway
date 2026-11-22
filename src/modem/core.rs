@@ -606,11 +606,8 @@ impl Modem {
         }
     }
 
-    /// Quick probe used by the reconnection worker: open a port with a short
-    /// timeout, send AT+CPIN?, and report whether a SIM (or at least a modem
-    /// responding to CPIN) is present. This avoids the ~10-20 second cost of a
-    /// full modem initialization on every empty port.
-    pub async fn quick_probe_port(com_port: &str, baud_rate: u32) -> bool {
+    /// Open briefly, send one AT line, return the raw response (or None on open/IO failure).
+    async fn quick_probe_exchange(com_port: &str, baud_rate: u32, command: &[u8]) -> Option<String> {
         const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
         const READ_TIMEOUT: Duration = Duration::from_millis(300);
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -632,7 +629,7 @@ impl Modem {
 
         let mut stream = match open_result {
             Ok(Ok(Ok(stream))) => stream,
-            _ => return false,
+            _ => return None,
         };
 
         // Drain any stale bytes that may be sitting in the port buffer.
@@ -645,11 +642,11 @@ impl Modem {
             }
         }
 
-        if stream.write_all(b"AT+CPIN?\r\n").await.is_err() {
-            return false;
+        if stream.write_all(command).await.is_err() {
+            return None;
         }
         if stream.flush().await.is_err() {
-            return false;
+            return None;
         }
 
         let mut buf = [0u8; 512];
@@ -666,6 +663,33 @@ impl Modem {
                 _ => break,
             }
         }
+        Some(response)
+    }
+
+    /// True when a bare AT exchange proves the module is answering. Used after
+    /// AT+CFUN=1,1: SIM may still return CME 10/13/14 on CPIN while the UART is fine.
+    pub(crate) fn modem_answered_at(response: &str) -> bool {
+        let upper = response.to_uppercase();
+        upper.contains("OK") || upper.contains("ERROR")
+    }
+
+    /// Post-reset / exclusive-handle liveness: plain AT. External serial tools
+    /// also use AT, so this matches what operators observe when "the COM is normal".
+    pub async fn quick_probe_alive(com_port: &str, baud_rate: u32) -> bool {
+        Self::quick_probe_exchange(com_port, baud_rate, b"AT\r\n")
+            .await
+            .is_some_and(|response| Self::modem_answered_at(&response))
+    }
+
+    /// Quick probe used by the reconnection worker: open a port with a short
+    /// timeout, send AT+CPIN?, and report whether a SIM (or at least a modem
+    /// responding to CPIN) is present. This avoids the ~10-20 second cost of a
+    /// full modem initialization on every empty port.
+    pub async fn quick_probe_port(com_port: &str, baud_rate: u32) -> bool {
+        let Some(response) = Self::quick_probe_exchange(com_port, baud_rate, b"AT+CPIN?\r\n").await
+        else {
+            return false;
+        };
 
         let upper = response.to_uppercase();
         if upper.contains("+CPIN:") && !upper.contains("REMOVED") && !upper.contains("NOT INSERTED")
